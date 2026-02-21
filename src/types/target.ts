@@ -57,19 +57,11 @@ export interface WorkingDirectory {
  * Target interface contract.
  * All target types (synthetic, generated, external) must implement this.
  * PRD Section FR-TGT-004.
+ *
+ * @see ITestTarget in src/targets/target.interface.ts for the full documented interface
  */
-export interface Target {
-  /** Set up the target and return an isolated working directory */
-  setup(): Promise<WorkingDirectory>;
-  /** Validate the target is in a usable state */
-  validate(): Promise<ValidationResult>;
-  /** Get the ground truth architectural manifest */
-  getGroundTruth(): ArchitecturalManifest;
-  /** Reset the target to its initial state */
-  reset(): Promise<void>;
-  /** Clean up all resources */
-  teardown(): Promise<void>;
-}
+export type { ITestTarget } from '../targets/target.interface.js';
+export type { ITestTarget as Target } from '../targets/target.interface.js';
 
 /**
  * Configuration for the programmatic repo generator (FR-TGT-002).
