@@ -1,0 +1,151 @@
+/**
+ * Confidence level for a scoring dimension.
+ */
+export type ScoreConfidence = 'low' | 'medium' | 'high';
+
+/**
+ * Method used to produce a score.
+ */
+export type ScoreMethod = 'automated' | 'llm-judge' | 'hybrid';
+
+/**
+ * A single scoring dimension result.
+ */
+export interface DimensionScore {
+  /** Score value from 0-100 */
+  value: number;
+  /** Confidence in this score */
+  confidence: ScoreConfidence;
+  /** How the score was produced */
+  method: ScoreMethod;
+  /** Human-readable justification for the score */
+  justification: string;
+}
+
+/**
+ * Git churn metrics for a run.
+ */
+export interface GitChurnMetrics {
+  linesAdded: number;
+  linesRemoved: number;
+  filesChanged: number;
+  /** Number of reverts detected */
+  reverts: number;
+}
+
+/**
+ * Aggregate metrics for a single run iteration.
+ */
+export interface RunMetrics {
+  totalTokens: number;
+  wallTimeMs: number;
+  agentSessions: number;
+  gitChurn: GitChurnMetrics;
+  testsPass: number;
+  testsFail: number;
+  compiles: boolean;
+}
+
+/**
+ * Scored results for a single iteration of a scenario/condition pair.
+ * PRD Section 7.2.
+ */
+export interface ScoredResults {
+  runId: string;
+  scenario: string;
+  condition: string;
+  iteration: number;
+  /** Scores keyed by dimension name (e.g., "consistency", "rework", "completion") */
+  scores: Record<string, DimensionScore>;
+  /** Quantitative metrics */
+  metrics: RunMetrics;
+  /** Weighted composite score (0-100) */
+  composite: number;
+}
+
+/**
+ * Statistical summary for a metric across multiple runs.
+ * PRD Section FR-ANL-003.
+ */
+export interface StatisticalSummary {
+  mean: number;
+  median: number;
+  standardDeviation: number;
+  min: number;
+  max: number;
+  /** 95% confidence interval [lower, upper] */
+  confidenceInterval: [number, number];
+  /** Number of samples */
+  n: number;
+  /** Whether variance exceeds 20% of mean (flagged as high variance) */
+  highVariance: boolean;
+}
+
+/**
+ * Pairwise comparison between two conditions.
+ */
+export interface PairwiseComparison {
+  conditionA: string;
+  conditionB: string;
+  metric: string;
+  deltaPercent: number;
+  /** p-value from statistical significance test */
+  pValue: number;
+  /** Significance level interpretation */
+  significance: 'significant' | 'suggestive' | 'not-distinguishable';
+}
+
+/**
+ * Aggregated results across all iterations for a scenario/condition pair.
+ */
+export interface AggregatedResults {
+  scenario: string;
+  condition: string;
+  iterations: number;
+  /** Statistical summaries keyed by dimension/metric name */
+  scoreSummaries: Record<string, StatisticalSummary>;
+  metricSummaries: {
+    totalTokens: StatisticalSummary;
+    wallTimeMs: StatisticalSummary;
+    gitChurn: {
+      linesAdded: StatisticalSummary;
+      linesRemoved: StatisticalSummary;
+      filesChanged: StatisticalSummary;
+      reverts: StatisticalSummary;
+    };
+    testsPass: StatisticalSummary;
+    testsFail: StatisticalSummary;
+  };
+  compositeScore: StatisticalSummary;
+}
+
+/**
+ * Overall benchmark report for a complete suite run.
+ */
+export interface BenchmarkReport {
+  runId: string;
+  timestamp: string;
+  /** All aggregated results */
+  aggregated: AggregatedResults[];
+  /** Pairwise comparisons between conditions */
+  comparisons: PairwiseComparison[];
+  /** Condition ranking by composite effectiveness score */
+  ranking: ConditionRanking[];
+  /** Overall Twining efficacy score */
+  efficacyScore: number;
+  /** Auto-generated key findings */
+  keyFindings: string[];
+}
+
+/**
+ * A single condition's ranking in the results.
+ */
+export interface ConditionRanking {
+  rank: number;
+  condition: string;
+  compositeScore: number;
+  /** Delta vs. best condition (negative means behind) */
+  deltaVsBest: number;
+  /** Significance indicator vs. next-best */
+  significance: 'significant' | 'suggestive' | 'not-distinguishable';
+}
