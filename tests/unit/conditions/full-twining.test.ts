@@ -96,15 +96,12 @@ describe('FullTwiningCondition', () => {
     expect(config.allowedTools).toContain('mcp__twining__twining_verify');
   });
 
-  it('system prompt instructs Twining usage', async () => {
+  it('system prompt references Twining and CLAUDE.md', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.systemPrompt).toContain('twining_assemble');
-    expect(config.systemPrompt).toContain('twining_decide');
-    expect(config.systemPrompt).toContain('twining_verify');
-    expect(config.systemPrompt).toContain('Before starting work');
-    expect(config.systemPrompt).toContain('After making significant changes');
+    expect(config.systemPrompt).toContain('Twining');
+    expect(config.systemPrompt).toContain('CLAUDE.md');
   });
 
   it('Twining data directory is isolated in the working directory', async () => {
