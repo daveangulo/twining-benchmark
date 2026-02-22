@@ -188,4 +188,83 @@ describe('DataCollector', () => {
     const state = await collector.loadPartialRunState('nonexistent-run');
     expect(state).toBeNull();
   });
+
+  it('filters infrastructure paths from fileChanges into infrastructureFileChanges', async () => {
+    const collector = new DataCollector({ outputDir, runId: 'run-1' });
+    const transcript = makeTranscript();
+    const condition = makeMockCondition({
+      preSessionState: {},
+      postSessionState: {},
+      changes: [],
+    });
+
+    const beforeHash = await collector.capturePreSessionGitState(repoDir);
+
+    // Create both code files and infrastructure files
+    await writeFile(join(repoDir, 'src-file.ts'), 'export const a = 1;\n', 'utf-8');
+    await mkdir(join(repoDir, '.twining'), { recursive: true });
+    await writeFile(join(repoDir, '.twining', 'state.json'), '{}', 'utf-8');
+    await mkdir(join(repoDir, 'node_modules', '.vite'), { recursive: true });
+    await writeFile(join(repoDir, 'node_modules', '.vite', 'cache.json'), '{}', 'utf-8');
+
+    const git = simpleGit(repoDir);
+    await git.add('.');
+    await git.commit('add code and infra files');
+
+    const collected = await collector.enrichAndSave(transcript, repoDir, beforeHash, condition);
+
+    // Code file should be in fileChanges
+    const codeFiles = collected.transcript.fileChanges;
+    expect(codeFiles.some(fc => fc.path === 'src-file.ts')).toBe(true);
+    expect(codeFiles.some(fc => fc.path.startsWith('.twining/'))).toBe(false);
+    expect(codeFiles.some(fc => fc.path.startsWith('node_modules/'))).toBe(false);
+
+    // Infrastructure files should be in infrastructureFileChanges
+    const infraFiles = collected.transcript.infrastructureFileChanges ?? [];
+    expect(infraFiles.some(fc => fc.path.startsWith('.twining/'))).toBe(true);
+    expect(infraFiles.some(fc => fc.path.startsWith('node_modules/'))).toBe(true);
+  });
+
+  it('commitSessionSnapshot creates a new commit and returns its hash', async () => {
+    const collector = new DataCollector({ outputDir, runId: 'run-1' });
+
+    // Make a change in the working directory
+    await writeFile(join(repoDir, 'session-work.ts'), 'export const s = 1;\n', 'utf-8');
+
+    const hash = await collector.commitSessionSnapshot(repoDir, 'sess-1');
+
+    expect(hash).toMatch(/^[0-9a-f]{40}$/);
+
+    // Verify the commit message
+    const git = simpleGit(repoDir);
+    const log = await git.log({ maxCount: 1 });
+    expect(log.latest?.message).toContain('session sess-1 checkpoint');
+  });
+
+  it('session 2 diff only shows session 2 changes after checkpoint', async () => {
+    const collector = new DataCollector({ outputDir, runId: 'run-1' });
+
+    // Session 1: create a file
+    const hash1 = await collector.capturePreSessionGitState(repoDir);
+    await writeFile(join(repoDir, 'session1.ts'), 'export const s1 = 1;\n', 'utf-8');
+
+    const git = simpleGit(repoDir);
+    await git.add('.');
+    await git.commit('session 1 work');
+
+    // Checkpoint between sessions
+    await collector.commitSessionSnapshot(repoDir, 'sess-1');
+
+    // Session 2: create a different file
+    const hash2 = await collector.capturePreSessionGitState(repoDir);
+    await writeFile(join(repoDir, 'session2.ts'), 'export const s2 = 2;\n', 'utf-8');
+    await git.add('.');
+    await git.commit('session 2 work');
+
+    const session2Changes = await collector.computeFileChanges(repoDir, hash2);
+
+    // Session 2 should only see session2.ts, not session1.ts
+    expect(session2Changes.some(fc => fc.path === 'session2.ts')).toBe(true);
+    expect(session2Changes.some(fc => fc.path === 'session1.ts')).toBe(false);
+  });
 });

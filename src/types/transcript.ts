@@ -82,8 +82,10 @@ export interface AgentTranscript {
   prompt: string;
   /** All tool invocations made during the session */
   toolCalls: ToolCall[];
-  /** All file modifications made during the session */
+  /** All file modifications made during the session (code files only) */
   fileChanges: FileChange[];
+  /** Infrastructure file changes filtered out of fileChanges (.twining/, node_modules/, etc.) */
+  infrastructureFileChanges?: FileChange[];
   /** Token usage breakdown */
   tokenUsage: TokenUsage;
   /** Timing data */

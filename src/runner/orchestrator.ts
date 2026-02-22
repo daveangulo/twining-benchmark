@@ -318,6 +318,15 @@ export class RunOrchestrator {
             );
             sessions.push(collected);
 
+            // Commit checkpoint between sessions so the next session's
+            // diff is isolated from this one's changes
+            if (i < tasks.length - 1) {
+              await collector.commitSessionSnapshot(
+                workingDir.path,
+                retryResult.result.sessionId,
+              );
+            }
+
             if (!retryResult.success) {
               allCompleted = false;
               for (const failure of retryResult.failures) {

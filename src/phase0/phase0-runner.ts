@@ -243,6 +243,15 @@ async function runSingleIteration(
           collectedSessions.push(collected);
           sessions.push(summarizeSession(retryResult.result));
 
+          // Commit checkpoint between sessions so the next session's
+          // diff is isolated from this one's changes
+          if (i < tasks.length - 1) {
+            await collector.commitSessionSnapshot(
+              workingDir.path,
+              retryResult.result.sessionId,
+            );
+          }
+
           log.info(`Task ${i + 1} completed`, {
             exit: retryResult.result.exitReason,
             tokens: retryResult.result.tokenUsage.total,

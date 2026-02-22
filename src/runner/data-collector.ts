@@ -9,6 +9,19 @@ import type {
 } from '../types/index.js';
 
 /**
+ * Path prefixes for infrastructure files that should be filtered
+ * out of code-level file change metrics.
+ */
+const INFRASTRUCTURE_PATH_PREFIXES = ['.twining/', 'node_modules/'];
+
+/**
+ * Check whether a file path belongs to infrastructure (not agent code).
+ */
+function isInfrastructurePath(filePath: string): boolean {
+  return INFRASTRUCTURE_PATH_PREFIXES.some(prefix => filePath.startsWith(prefix));
+}
+
+/**
  * Collected session data bundle.
  * Includes transcript + enrichment data from git and coordination artifacts.
  */
@@ -63,18 +76,37 @@ export class DataCollector {
   }
 
   /**
+   * Stage all working directory changes so git diffs capture agent
+   * Write/Edit modifications that were never committed.
+   * Returns the diff base ref to use.
+   */
+  private async stageAllChanges(git: ReturnType<typeof simpleGit>, beforeHash: string): Promise<string> {
+    await git.add(['-A']);
+    return beforeHash === 'initial' ? 'HEAD' : beforeHash;
+  }
+
+  /**
+   * Unstage everything so the working directory index is clean for
+   * subsequent operations.
+   */
+  private async unstageAll(git: ReturnType<typeof simpleGit>): Promise<void> {
+    await git.reset(['HEAD']);
+  }
+
+  /**
    * Compute file changes from git diff between two states.
+   *
+   * Expects changes to already be staged (call stageAllChanges first).
+   * Uses --cached to diff the staged index against the baseline commit.
    */
   async computeFileChanges(workingDir: string, beforeHash: string): Promise<FileChange[]> {
     const git = simpleGit(workingDir);
     const fileChanges: FileChange[] = [];
 
     try {
-      const numstatArgs = beforeHash === 'initial'
-        ? ['--numstat', 'HEAD']
-        : ['--numstat', `${beforeHash}..HEAD`];
+      const diffBase = await this.stageAllChanges(git, beforeHash);
 
-      const numstat = await git.diff(numstatArgs);
+      const numstat = await git.diff(['--cached', '--numstat', diffBase]);
       const lines = numstat.trim().split('\n').filter(Boolean);
 
       for (const line of lines) {
@@ -85,15 +117,9 @@ export class DataCollector {
         const removed = parts[1] === '-' ? 0 : parseInt(parts[1] ?? '0', 10);
         const filePath = parts[2] ?? '';
 
-        let changeType: FileChange['changeType'] = 'modified';
-        if (removed === 0 && added > 0) {
-          // Could be new file - check with diff-tree
-          changeType = 'added';
-        }
-
         fileChanges.push({
           path: filePath,
-          changeType,
+          changeType: 'modified', // refined below via --name-status
           linesAdded: added,
           linesRemoved: removed,
         });
@@ -102,36 +128,30 @@ export class DataCollector {
       // Get the full diff for each file
       for (const fc of fileChanges) {
         try {
-          const patchArgs = beforeHash === 'initial'
-            ? ['HEAD', '--', fc.path]
-            : [`${beforeHash}..HEAD`, '--', fc.path];
-          fc.diff = await git.diff(patchArgs);
+          fc.diff = await git.diff(['--cached', diffBase, '--', fc.path]);
         } catch {
           // Diff unavailable for this file
         }
       }
 
-      // Detect deleted files using diff --name-status
-      const nameStatusArgs = beforeHash === 'initial'
-        ? ['--name-status', 'HEAD']
-        : ['--name-status', `${beforeHash}..HEAD`];
-      const nameStatus = await git.diff(nameStatusArgs);
+      // Detect change types (added/deleted/modified) using --name-status
+      const nameStatus = await git.diff(['--cached', '--name-status', diffBase]);
       const statusLines = nameStatus.trim().split('\n').filter(Boolean);
 
       for (const line of statusLines) {
         const [status, filePath] = line.split('\t');
-        if (status === 'D' && filePath) {
-          const existing = fileChanges.find(fc => fc.path === filePath);
-          if (existing) {
+        if (!filePath) continue;
+        const existing = fileChanges.find(fc => fc.path === filePath);
+        if (existing) {
+          if (status === 'D') {
             existing.changeType = 'deleted';
-          }
-        } else if (status === 'A' && filePath) {
-          const existing = fileChanges.find(fc => fc.path === filePath);
-          if (existing) {
+          } else if (status === 'A') {
             existing.changeType = 'added';
           }
         }
       }
+
+      await this.unstageAll(git);
     } catch {
       // Git operations failed — return empty
     }
@@ -141,14 +161,17 @@ export class DataCollector {
 
   /**
    * Get the full git diff as a string.
+   *
+   * Expects changes to already be staged (call stageAllChanges first).
+   * Uses --cached to diff the staged index against the baseline commit.
    */
   async getFullDiff(workingDir: string, beforeHash: string): Promise<string> {
     const git = simpleGit(workingDir);
     try {
-      if (beforeHash === 'initial') {
-        return await git.diff(['HEAD']);
-      }
-      return await git.diff([`${beforeHash}..HEAD`]);
+      const diffBase = await this.stageAllChanges(git, beforeHash);
+      const diff = await git.diff(['--cached', diffBase]);
+      await this.unstageAll(git);
+      return diff;
     } catch {
       return '';
     }
@@ -170,9 +193,13 @@ export class DataCollector {
     beforeHash: string,
     condition: Condition,
   ): Promise<CollectedSessionData> {
-    // Compute file changes from git
-    const fileChanges = await this.computeFileChanges(workingDir, beforeHash);
-    transcript.fileChanges = fileChanges;
+    // Compute file changes from git, splitting infrastructure from code
+    const allFileChanges = await this.computeFileChanges(workingDir, beforeHash);
+    transcript.fileChanges = allFileChanges.filter(fc => !isInfrastructurePath(fc.path));
+    const infraChanges = allFileChanges.filter(fc => isInfrastructurePath(fc.path));
+    if (infraChanges.length > 0) {
+      transcript.infrastructureFileChanges = infraChanges;
+    }
 
     // Get full diff
     const gitDiff = await this.getFullDiff(workingDir, beforeHash);
@@ -190,6 +217,21 @@ export class DataCollector {
     await this.saveSessionData(collected);
 
     return collected;
+  }
+
+  /**
+   * Commit all current working-directory changes as a checkpoint between
+   * agent sessions.  The next session's `capturePreSessionGitState` will
+   * return this new hash, isolating its diff from previous sessions.
+   *
+   * Returns the new commit hash.
+   */
+  async commitSessionSnapshot(workingDir: string, sessionId: string): Promise<string> {
+    const git = simpleGit(workingDir);
+    await git.add(['-A']);
+    await git.commit(`benchmark: session ${sessionId} checkpoint`);
+    const log = await git.log({ maxCount: 1 });
+    return log.latest?.hash ?? 'unknown';
   }
 
   /**
