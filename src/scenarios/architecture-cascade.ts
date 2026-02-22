@@ -523,14 +523,33 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
   private extractMetrics(rawResults: RawResults) {
     let totalTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
+    let costUsd = 0;
     let wallTimeMs = 0;
+    let numTurns = 0;
+    let compactionCount = 0;
     let linesAdded = 0;
     let linesRemoved = 0;
+    let maxContextUtilization = 0;
     const changedFiles = new Set<string>();
 
     for (const transcript of rawResults.transcripts) {
       totalTokens += transcript.tokenUsage.total;
+      inputTokens += transcript.tokenUsage.input;
+      outputTokens += transcript.tokenUsage.output;
+      cacheReadTokens += transcript.tokenUsage.cacheRead;
+      cacheCreationTokens += transcript.tokenUsage.cacheCreation;
+      costUsd += transcript.tokenUsage.costUsd;
       wallTimeMs += transcript.timing.durationMs;
+      numTurns += transcript.numTurns;
+      compactionCount += transcript.compactionCount;
+      if (transcript.contextWindowSize > 0) {
+        const utilization = transcript.tokenUsage.total / transcript.contextWindowSize;
+        maxContextUtilization = Math.max(maxContextUtilization, utilization);
+      }
       for (const change of transcript.fileChanges) {
         linesAdded += change.linesAdded;
         linesRemoved += change.linesRemoved;
@@ -540,8 +559,16 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
     return {
       totalTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      costUsd,
       wallTimeMs,
       agentSessions: rawResults.transcripts.length,
+      numTurns,
+      compactionCount,
+      contextUtilization: maxContextUtilization,
       gitChurn: {
         linesAdded,
         linesRemoved,

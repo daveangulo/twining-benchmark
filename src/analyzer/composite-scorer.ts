@@ -169,7 +169,15 @@ export function aggregateResults(
   // Aggregate quantitative metrics
   const metricSummaries = {
     totalTokens: computeSummary(results.map((r) => r.metrics.totalTokens)),
+    inputTokens: computeSummary(results.map((r) => r.metrics.inputTokens)),
+    outputTokens: computeSummary(results.map((r) => r.metrics.outputTokens)),
+    cacheReadTokens: computeSummary(results.map((r) => r.metrics.cacheReadTokens)),
+    cacheCreationTokens: computeSummary(results.map((r) => r.metrics.cacheCreationTokens)),
+    costUsd: computeSummary(results.map((r) => r.metrics.costUsd)),
     wallTimeMs: computeSummary(results.map((r) => r.metrics.wallTimeMs)),
+    numTurns: computeSummary(results.map((r) => r.metrics.numTurns)),
+    compactionCount: computeSummary(results.map((r) => r.metrics.compactionCount)),
+    contextUtilization: computeSummary(results.map((r) => r.metrics.contextUtilization)),
     gitChurn: {
       linesAdded: computeSummary(
         results.map((r) => r.metrics.gitChurn.linesAdded),

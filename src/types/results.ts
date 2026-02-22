@@ -38,8 +38,23 @@ export interface GitChurnMetrics {
  */
 export interface RunMetrics {
   totalTokens: number;
+  /** Non-cached input tokens */
+  inputTokens: number;
+  outputTokens: number;
+  /** Cache read tokens (priced at 90% discount) */
+  cacheReadTokens: number;
+  /** Cache creation tokens */
+  cacheCreationTokens: number;
+  /** SDK-reported cost in USD (ground truth) */
+  costUsd: number;
   wallTimeMs: number;
   agentSessions: number;
+  /** Total agentic turns across all sessions */
+  numTurns: number;
+  /** Total context compactions across all sessions */
+  compactionCount: number;
+  /** Peak input tokens / context window size (0-1) */
+  contextUtilization: number;
   gitChurn: GitChurnMetrics;
   testsPass: number;
   testsFail: number;
@@ -106,7 +121,15 @@ export interface AggregatedResults {
   scoreSummaries: Record<string, StatisticalSummary>;
   metricSummaries: {
     totalTokens: StatisticalSummary;
+    inputTokens: StatisticalSummary;
+    outputTokens: StatisticalSummary;
+    cacheReadTokens: StatisticalSummary;
+    cacheCreationTokens: StatisticalSummary;
+    costUsd: StatisticalSummary;
     wallTimeMs: StatisticalSummary;
+    numTurns: StatisticalSummary;
+    compactionCount: StatisticalSummary;
+    contextUtilization: StatisticalSummary;
     gitChurn: {
       linesAdded: StatisticalSummary;
       linesRemoved: StatisticalSummary;

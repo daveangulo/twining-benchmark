@@ -44,9 +44,29 @@ export interface FileChange {
  * Token usage breakdown for a session.
  */
 export interface TokenUsage {
+  /** Non-cached input tokens */
   input: number;
   output: number;
+  /** Cache read input tokens (priced at 90% discount) */
+  cacheRead: number;
+  /** Cache creation input tokens */
+  cacheCreation: number;
+  /** input + output + cacheRead + cacheCreation */
   total: number;
+  /** SDK-reported total_cost_usd (ground truth cost) */
+  costUsd: number;
+}
+
+/**
+ * Per-turn token usage for context health tracking.
+ */
+export interface TurnUsage {
+  turnIndex: number;
+  type: 'message' | 'compaction';
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
 }
 
 /**
@@ -94,6 +114,16 @@ export interface AgentTranscript {
   exitReason: SessionExitReason;
   /** Error message if session failed */
   error?: string;
+  /** Total number of agentic turns in this session */
+  numTurns: number;
+  /** SDK stop reason */
+  stopReason: string | null;
+  /** Context window size from modelUsage */
+  contextWindowSize: number;
+  /** Number of context compaction events */
+  compactionCount: number;
+  /** Per-turn token usage breakdown */
+  turnUsage: TurnUsage[];
 }
 
 /**

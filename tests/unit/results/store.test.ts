@@ -54,8 +54,16 @@ function makeScores(overrides: Partial<ScoredResults> = {}): ScoredResults {
     },
     metrics: {
       totalTokens: 10000,
+      inputTokens: 6000,
+      outputTokens: 3000,
+      cacheReadTokens: 1000,
+      cacheCreationTokens: 0,
+      costUsd: 0.05,
       wallTimeMs: 60000,
       agentSessions: 2,
+      numTurns: 10,
+      compactionCount: 0,
+      contextUtilization: 0.4,
       gitChurn: { linesAdded: 100, linesRemoved: 20, filesChanged: 5, reverts: 0 },
       testsPass: 10,
       testsFail: 1,
@@ -76,7 +84,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Refactor the user service',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 5000, output: 3000, total: 8000 },
+    tokenUsage: { input: 5000, output: 3000, cacheRead: 0, cacheCreation: 0, total: 8000, costUsd: 0.04 },
     timing: {
       startTime: '2026-02-20T14:30:52.000Z',
       endTime: '2026-02-20T14:35:52.000Z',
@@ -84,6 +92,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: 5000,
     },
     exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }

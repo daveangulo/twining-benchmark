@@ -47,7 +47,7 @@ vi.mock('../../../src/runner/agent-session.js', () => {
           fileChanges: [
             { path: 'test.ts', changeType: 'modified', linesAdded: 5, linesRemoved: 2 },
           ],
-          tokenUsage: { input: 500, output: 200, total: 700 },
+          tokenUsage: { input: 500, output: 200, cacheRead: 0, cacheCreation: 0, total: 700, costUsd: 0 },
           timing: {
             startTime: new Date().toISOString(),
             endTime: new Date().toISOString(),
@@ -55,6 +55,11 @@ vi.mock('../../../src/runner/agent-session.js', () => {
             timeToFirstActionMs: 2000,
           },
           exitReason: 'completed',
+          numTurns: 1,
+          stopReason: 'success',
+          contextWindowSize: 200000,
+          compactionCount: 0,
+          turnUsage: [],
         };
       }
     },
@@ -183,7 +188,7 @@ function makeMockScenario(): Scenario {
     score: async () => ({
       runId: 'run-test', scenario: 'refactoring-handoff', condition: 'baseline', iteration: 0,
       scores: {},
-      metrics: { totalTokens: 700, wallTimeMs: 5000, agentSessions: 2, gitChurn: { linesAdded: 10, linesRemoved: 5, filesChanged: 2, reverts: 0 }, testsPass: 5, testsFail: 0, compiles: true },
+      metrics: { totalTokens: 700, inputTokens: 500, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0, wallTimeMs: 5000, agentSessions: 2, numTurns: 2, compactionCount: 0, contextUtilization: 0, gitChurn: { linesAdded: 10, linesRemoved: 5, filesChanged: 2, reverts: 0 }, testsPass: 5, testsFail: 0, compiles: true },
       composite: 85,
     }),
     teardown: async () => {},

@@ -43,8 +43,16 @@ interface Phase0RunResult {
     scores: Record<string, { value: number; confidence: string; method: string; justification: string }>;
     metrics: {
       totalTokens: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheCreationTokens: number;
+      costUsd: number;
       wallTimeMs: number;
       agentSessions: number;
+      numTurns: number;
+      compactionCount: number;
+      contextUtilization: number;
       gitChurn: { linesAdded: number; linesRemoved: number; filesChanged: number; reverts: number };
       testsPass: number;
       testsFail: number;
@@ -61,10 +69,20 @@ interface Phase0SessionResult {
   taskIndex: number;
   prompt: string;
   exitReason: string;
-  tokenUsage: { input: number; output: number; total: number };
+  tokenUsage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheCreation: number;
+    total: number;
+    costUsd: number;
+  };
   timing: { durationMs: number; timeToFirstActionMs: number };
   toolCallCount: number;
   fileChanges: Array<{ path: string; changeType: string; linesAdded: number; linesRemoved: number }>;
+  numTurns: number;
+  compactionCount: number;
+  contextWindowSize: number;
   error?: string;
 }
 
@@ -76,12 +94,19 @@ interface ConditionAnalysis {
   rework: StatisticalSummary;
   completion: StatisticalSummary;
   totalTokens: StatisticalSummary;
+  inputTokens: StatisticalSummary;
+  outputTokens: StatisticalSummary;
+  cacheReadTokens: StatisticalSummary;
+  cacheCreationTokens: StatisticalSummary;
+  costPerRun: StatisticalSummary;
   wallTimeMs: StatisticalSummary;
+  numTurns: StatisticalSummary;
+  compactionCount: StatisticalSummary;
+  contextUtilization: StatisticalSummary;
   linesAdded: StatisticalSummary;
   linesRemoved: StatisticalSummary;
   filesChanged: StatisticalSummary;
   testsPass: StatisticalSummary;
-  costPerRun: StatisticalSummary;
 }
 
 interface PairwiseEffectSize {
@@ -127,12 +152,24 @@ function analyzeCondition(
   const reworks = results.map(r => r.scoredResults.scores['rework']?.value ?? 0);
   const completions = results.map(r => r.scoredResults.scores['completion']?.value ?? 0);
   const tokens = results.map(r => r.scoredResults.metrics.totalTokens);
+  const inputToks = results.map(r => r.scoredResults.metrics.inputTokens ?? 0);
+  const outputToks = results.map(r => r.scoredResults.metrics.outputTokens ?? 0);
+  const cacheReadToks = results.map(r => r.scoredResults.metrics.cacheReadTokens ?? 0);
+  const cacheCreateToks = results.map(r => r.scoredResults.metrics.cacheCreationTokens ?? 0);
+  // Use SDK-reported cost when available, fall back to estimate
+  const costs = results.map(r =>
+    r.scoredResults.metrics.costUsd > 0
+      ? r.scoredResults.metrics.costUsd
+      : estimateCost(r.scoredResults.metrics.totalTokens),
+  );
   const wallTimes = results.map(r => r.wallTimeMs);
+  const turns = results.map(r => r.scoredResults.metrics.numTurns ?? 0);
+  const compactions = results.map(r => r.scoredResults.metrics.compactionCount ?? 0);
+  const ctxUtils = results.map(r => r.scoredResults.metrics.contextUtilization ?? 0);
   const added = results.map(r => r.scoredResults.metrics.gitChurn.linesAdded);
   const removed = results.map(r => r.scoredResults.metrics.gitChurn.linesRemoved);
   const files = results.map(r => r.scoredResults.metrics.gitChurn.filesChanged);
   const tests = results.map(r => r.scoredResults.metrics.testsPass);
-  const costs = tokens.map(t => estimateCost(t));
 
   return {
     condition,
@@ -142,12 +179,19 @@ function analyzeCondition(
     rework: computeSummary(reworks),
     completion: computeSummary(completions),
     totalTokens: computeSummary(tokens),
+    inputTokens: computeSummary(inputToks),
+    outputTokens: computeSummary(outputToks),
+    cacheReadTokens: computeSummary(cacheReadToks),
+    cacheCreationTokens: computeSummary(cacheCreateToks),
+    costPerRun: computeSummary(costs),
     wallTimeMs: computeSummary(wallTimes),
+    numTurns: computeSummary(turns),
+    compactionCount: computeSummary(compactions),
+    contextUtilization: computeSummary(ctxUtils),
     linesAdded: computeSummary(added),
     linesRemoved: computeSummary(removed),
     filesChanged: computeSummary(files),
     testsPass: computeSummary(tests),
-    costPerRun: computeSummary(costs),
   };
 }
 
@@ -383,13 +427,14 @@ function generateReport(
   lines.push('');
   lines.push('## Resource Usage');
   lines.push('');
-  lines.push('| Condition | Avg Tokens | Avg Wall Time | Avg Cost/Run | Lines Added | Lines Removed |');
-  lines.push('|-----------|-----------|--------------|-------------|-------------|---------------|');
+  lines.push('| Condition | Input Tokens | Output Tokens | Cache Read | Cache Create | Cost (SDK) | Avg Wall Time | Turns | Compactions | Context Util |');
+  lines.push('|-----------|-------------|--------------|-----------|-------------|-----------|--------------|-------|-------------|-------------|');
 
   for (const [condition, analysis] of ranked) {
     const wallTimeMin = (analysis.wallTimeMs.mean / 60000).toFixed(1);
+    const ctxUtil = (analysis.contextUtilization.mean * 100).toFixed(0);
     lines.push(
-      `| ${condition} | ${Math.round(analysis.totalTokens.mean).toLocaleString()} | ${wallTimeMin}m | $${analysis.costPerRun.mean.toFixed(2)} | ${Math.round(analysis.linesAdded.mean)} | ${Math.round(analysis.linesRemoved.mean)} |`,
+      `| ${condition} | ${Math.round(analysis.inputTokens.mean).toLocaleString()} | ${Math.round(analysis.outputTokens.mean).toLocaleString()} | ${Math.round(analysis.cacheReadTokens.mean).toLocaleString()} | ${Math.round(analysis.cacheCreationTokens.mean).toLocaleString()} | $${analysis.costPerRun.mean.toFixed(2)} | ${wallTimeMin}m | ${Math.round(analysis.numTurns.mean)} | ${Math.round(analysis.compactionCount.mean)} | ${ctxUtil}% |`,
     );
   }
 
@@ -419,7 +464,11 @@ function generateReport(
   lines.push('## Cost Projection');
   lines.push('');
 
-  const allCosts = results.map(r => estimateCost(r.scoredResults.metrics.totalTokens));
+  const allCosts = results.map(r =>
+    r.scoredResults.metrics.costUsd > 0
+      ? r.scoredResults.metrics.costUsd
+      : estimateCost(r.scoredResults.metrics.totalTokens),
+  );
   const avgCost = allCosts.reduce((s, c) => s + c, 0) / (allCosts.length || 1);
   const totalPhase0Cost = allCosts.reduce((s, c) => s + c, 0);
   const projection = projectFullSuiteCost(avgCost);

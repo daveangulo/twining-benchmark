@@ -14,6 +14,7 @@ import type {
   AgentTranscript,
   ToolCall,
   TokenUsage,
+  TurnUsage,
   SessionTiming,
   SessionExitReason,
 } from '../types/index.js';
@@ -105,18 +106,46 @@ function toSdkMcpServers(
 }
 
 /**
- * Extract token usage from an SDK result message.
+ * Extract token usage from an SDK result message, preserving full cache breakdown.
  */
 function extractTokenUsage(result: SDKResultMessage): TokenUsage {
   const usage = result.usage;
-  const input = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0);
+  const input = usage.input_tokens ?? 0;
   const output = usage.output_tokens ?? 0;
+  const cacheRead = usage.cache_read_input_tokens ?? 0;
+  const cacheCreation = usage.cache_creation_input_tokens ?? 0;
   return {
     input,
     output,
-    total: input + output,
+    cacheRead,
+    cacheCreation,
+    total: input + output + cacheRead + cacheCreation,
+    costUsd: (result as Record<string, unknown>).total_cost_usd as number ?? 0,
   };
 }
+
+/**
+ * Extract per-turn usage from SDK result iterations.
+ */
+function extractTurnUsage(result: SDKResultMessage): TurnUsage[] {
+  const iterations = (result as Record<string, unknown>).usage as Record<string, unknown> | undefined;
+  const iterationList = (iterations as Record<string, unknown>)?.iterations as Array<Record<string, unknown>> | undefined;
+  if (!Array.isArray(iterationList)) return [];
+
+  return iterationList.map((iter, idx) => ({
+    turnIndex: idx,
+    type: 'message' as const,
+    inputTokens: (iter.input_tokens as number) ?? 0,
+    outputTokens: (iter.output_tokens as number) ?? 0,
+    cacheReadTokens: (iter.cache_read_input_tokens as number) ?? 0,
+    cacheCreationTokens: (iter.cache_creation_input_tokens as number) ?? 0,
+  }));
+}
+
+/** Default zero-value TokenUsage for error/missing cases. */
+const ZERO_TOKEN_USAGE: TokenUsage = {
+  input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0, costUsd: 0,
+};
 
 /**
  * Determine exit reason from SDK result.
@@ -180,6 +209,7 @@ export class AgentSessionManager {
     let timeToFirstActionMs = -1;
     let timedOut = false;
     let sdkResult: SDKResultMessage | undefined;
+    let compactionCount = 0;
 
     const abortController = new AbortController();
 
@@ -213,6 +243,11 @@ export class AgentSessionManager {
           }
         }
 
+        // Track context compaction events
+        if (message.type === 'system' && (message as Record<string, unknown>).subtype === 'compact_boundary') {
+          compactionCount++;
+        }
+
         if (message.type === 'result') {
           sdkResult = message as SDKResultMessage;
         }
@@ -231,7 +266,12 @@ export class AgentSessionManager {
           timeToFirstActionMs,
           exitReason: 'error',
           error: errorMessage,
-          tokenUsage: { input: 0, output: 0, total: 0 },
+          tokenUsage: ZERO_TOKEN_USAGE,
+          numTurns: 0,
+          stopReason: null,
+          contextWindowSize: 0,
+          compactionCount: 0,
+          turnUsage: [],
         });
       }
     } finally {
@@ -239,13 +279,20 @@ export class AgentSessionManager {
     }
 
     const endTime = new Date();
-    const tokenUsage = sdkResult ? extractTokenUsage(sdkResult) : { input: 0, output: 0, total: 0 };
+    const tokenUsage = sdkResult ? extractTokenUsage(sdkResult) : ZERO_TOKEN_USAGE;
     const exitReason = sdkResult ? determineExitReason(sdkResult, timedOut) : (timedOut ? 'timeout' : 'error');
     const error = timedOut
       ? `Session timed out after ${this.timeoutMs}ms`
       : sdkResult
         ? extractError(sdkResult)
         : 'No result received from SDK';
+
+    // Extract per-turn data and context health metrics
+    const numTurns = sdkResult ? ((sdkResult as Record<string, unknown>).num_turns as number ?? 0) : 0;
+    const stopReason = sdkResult ? (sdkResult.subtype ?? null) : null;
+    const modelUsage = sdkResult ? ((sdkResult as Record<string, unknown>).modelUsage as Record<string, unknown> | undefined) : undefined;
+    const contextWindowSize = (modelUsage?.contextWindow as number) ?? 0;
+    const turnUsage = sdkResult ? extractTurnUsage(sdkResult) : [];
 
     return this.buildTranscript({
       sessionId,
@@ -258,6 +305,11 @@ export class AgentSessionManager {
       exitReason,
       error,
       tokenUsage,
+      numTurns,
+      stopReason,
+      contextWindowSize,
+      compactionCount,
+      turnUsage,
     });
   }
 
@@ -313,6 +365,11 @@ export class AgentSessionManager {
     exitReason: SessionExitReason;
     error?: string;
     tokenUsage: TokenUsage;
+    numTurns: number;
+    stopReason: string | null;
+    contextWindowSize: number;
+    compactionCount: number;
+    turnUsage: TurnUsage[];
   }): AgentTranscript {
     const timing: SessionTiming = {
       startTime: params.startTime.toISOString(),
@@ -334,6 +391,11 @@ export class AgentSessionManager {
       timing,
       exitReason: params.exitReason,
       error: params.error,
+      numTurns: params.numTurns,
+      stopReason: params.stopReason,
+      contextWindowSize: params.contextWindowSize,
+      compactionCount: params.compactionCount,
+      turnUsage: params.turnUsage,
     };
   }
 }

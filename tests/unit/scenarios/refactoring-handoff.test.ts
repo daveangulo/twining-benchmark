@@ -43,7 +43,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Test prompt',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 1000, output: 500, total: 1500 },
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
     timing: {
       startTime: '2026-02-20T10:00:00Z',
       endTime: '2026-02-20T10:05:00Z',
@@ -51,6 +51,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: 10000,
     },
     exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }
@@ -385,7 +390,7 @@ describe('RefactoringHandoffScenario', () => {
       const rawResults: RawResults = {
         transcripts: [
           makeTranscript({
-            tokenUsage: { input: 2000, output: 1000, total: 3000 },
+            tokenUsage: { input: 2000, output: 1000, cacheRead: 0, cacheCreation: 0, total: 3000, costUsd: 0.02 },
             timing: {
               startTime: '2026-02-20T10:00:00Z',
               endTime: '2026-02-20T10:05:00Z',
@@ -398,7 +403,7 @@ describe('RefactoringHandoffScenario', () => {
             ],
           }),
           makeTranscript({
-            tokenUsage: { input: 1500, output: 800, total: 2300 },
+            tokenUsage: { input: 1500, output: 800, cacheRead: 0, cacheCreation: 0, total: 2300, costUsd: 0.015 },
             timing: {
               startTime: '2026-02-20T10:05:00Z',
               endTime: '2026-02-20T10:08:00Z',
@@ -419,8 +424,14 @@ describe('RefactoringHandoffScenario', () => {
       const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
 
       expect(scored.metrics.totalTokens).toBe(5300);
+      expect(scored.metrics.inputTokens).toBe(3500);
+      expect(scored.metrics.outputTokens).toBe(1800);
+      expect(scored.metrics.cacheReadTokens).toBe(0);
+      expect(scored.metrics.costUsd).toBeCloseTo(0.035);
       expect(scored.metrics.wallTimeMs).toBe(480000);
       expect(scored.metrics.agentSessions).toBe(2);
+      expect(scored.metrics.numTurns).toBe(10);
+      expect(scored.metrics.compactionCount).toBe(0);
       expect(scored.metrics.gitChurn.linesAdded).toBe(50);
       expect(scored.metrics.gitChurn.linesRemoved).toBe(5);
       expect(scored.metrics.gitChurn.filesChanged).toBe(3); // a.ts, b.ts, c.ts

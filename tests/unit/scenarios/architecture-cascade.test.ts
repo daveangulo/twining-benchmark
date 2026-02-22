@@ -40,7 +40,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Test prompt',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 1000, output: 500, total: 1500 },
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
     timing: {
       startTime: '2026-02-20T10:00:00Z',
       endTime: '2026-02-20T10:05:00Z',
@@ -48,6 +48,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: 10000,
     },
     exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }
@@ -371,21 +376,21 @@ describe('ArchitectureCascadeScenario', () => {
       const rawResults: RawResults = {
         transcripts: [
           makeTranscript({
-            tokenUsage: { input: 2000, output: 1000, total: 3000 },
+            tokenUsage: { input: 2000, output: 1000, cacheRead: 0, cacheCreation: 0, total: 3000, costUsd: 0.02 },
             timing: { startTime: '', endTime: '', durationMs: 300000, timeToFirstActionMs: 5000 },
             fileChanges: [
               { path: 'a.ts', changeType: 'modified', linesAdded: 10, linesRemoved: 3 },
             ],
           }),
           makeTranscript({
-            tokenUsage: { input: 1500, output: 800, total: 2300 },
+            tokenUsage: { input: 1500, output: 800, cacheRead: 0, cacheCreation: 0, total: 2300, costUsd: 0.015 },
             timing: { startTime: '', endTime: '', durationMs: 200000, timeToFirstActionMs: 3000 },
             fileChanges: [
               { path: 'b.ts', changeType: 'added', linesAdded: 20, linesRemoved: 0 },
             ],
           }),
           makeTranscript({
-            tokenUsage: { input: 1800, output: 900, total: 2700 },
+            tokenUsage: { input: 1800, output: 900, cacheRead: 0, cacheCreation: 0, total: 2700, costUsd: 0.018 },
             timing: { startTime: '', endTime: '', durationMs: 250000, timeToFirstActionMs: 4000 },
             fileChanges: [
               { path: 'c.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0 },

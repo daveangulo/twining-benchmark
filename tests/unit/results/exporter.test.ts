@@ -37,7 +37,15 @@ function makeAggregated(overrides: Partial<AggregatedResults> = {}): AggregatedR
     },
     metricSummaries: {
       totalTokens: makeSummary(10000, 1000),
+      inputTokens: makeSummary(6000, 600),
+      outputTokens: makeSummary(3000, 300),
+      cacheReadTokens: makeSummary(1000, 100),
+      cacheCreationTokens: makeSummary(0, 0),
+      costUsd: makeSummary(0.05, 0.01),
       wallTimeMs: makeSummary(60000, 5000),
+      numTurns: makeSummary(10, 2),
+      compactionCount: makeSummary(0, 0),
+      contextUtilization: makeSummary(0.4, 0.1),
       gitChurn: {
         linesAdded: makeSummary(100, 10),
         linesRemoved: makeSummary(20, 5),
@@ -110,8 +118,16 @@ function makeScores(overrides: Partial<ScoredResults> = {}): ScoredResults {
     },
     metrics: {
       totalTokens: 10000,
+      inputTokens: 6000,
+      outputTokens: 3000,
+      cacheReadTokens: 1000,
+      cacheCreationTokens: 0,
+      costUsd: 0.05,
       wallTimeMs: 60000,
       agentSessions: 2,
+      numTurns: 10,
+      compactionCount: 0,
+      contextUtilization: 0.4,
       gitChurn: { linesAdded: 100, linesRemoved: 20, filesChanged: 5, reverts: 0 },
       testsPass: 10,
       testsFail: 1,
@@ -277,7 +293,8 @@ describe('exportMarkdown', () => {
     const report = makeReport();
     const md = exportMarkdown(report);
     expect(md).toContain('Resource Usage');
-    expect(md).toContain('tokens');
+    expect(md).toContain('input:');
+    expect(md).toContain('output:');
   });
 
   it('includes twining-bench footer', () => {

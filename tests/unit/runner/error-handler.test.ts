@@ -17,7 +17,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Do something',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 100, output: 50, total: 150 },
+    tokenUsage: { input: 100, output: 50, cacheRead: 0, cacheCreation: 0, total: 150, costUsd: 0 },
     timing: {
       startTime: '2026-01-01T00:00:00.000Z',
       endTime: '2026-01-01T00:01:00.000Z',
@@ -25,6 +25,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: -1,
     },
     exitReason: 'completed',
+    numTurns: 1,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }

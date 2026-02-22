@@ -70,10 +70,20 @@ interface Phase0SessionResult {
   taskIndex: number;
   prompt: string;
   exitReason: string;
-  tokenUsage: { input: number; output: number; total: number };
+  tokenUsage: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheCreation: number;
+    total: number;
+    costUsd: number;
+  };
   timing: { durationMs: number; timeToFirstActionMs: number };
   toolCallCount: number;
   fileChanges: Array<{ path: string; changeType: string; linesAdded: number; linesRemoved: number }>;
+  numTurns: number;
+  compactionCount: number;
+  contextWindowSize: number;
   error?: string;
 }
 
@@ -151,6 +161,9 @@ function summarizeSession(transcript: AgentTranscript): Phase0SessionResult {
       linesAdded: fc.linesAdded,
       linesRemoved: fc.linesRemoved,
     })),
+    numTurns: transcript.numTurns,
+    compactionCount: transcript.compactionCount,
+    contextWindowSize: transcript.contextWindowSize,
     error: transcript.error,
   };
 }
@@ -458,13 +471,12 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  // Estimate cost
-  const totalTokens = allResults.reduce(
-    (sum, r) => sum + r.scoredResults.metrics.totalTokens,
+  // Cost from SDK-reported values (with fallback to estimate for old data)
+  const totalCostUsd = allResults.reduce(
+    (sum, r) => sum + (r.scoredResults.metrics.costUsd || estimateCost(r.scoredResults.metrics.totalTokens)),
     0,
   );
-  const estimatedCost = estimateCost(totalTokens);
-  console.log(`  Estimated total cost: $${estimatedCost.toFixed(2)}`);
+  console.log(`  Total cost: $${totalCostUsd.toFixed(2)}`);
   console.log(`  Results saved to: ${config.outputDir}/phase0-results.json`);
   console.log('');
   console.log('  Run phase0-analyze.ts to generate the full comparison report.');

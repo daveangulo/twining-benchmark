@@ -40,7 +40,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Test prompt',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 1000, output: 500, total: 1500 },
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
     timing: {
       startTime: '2026-02-20T10:00:00Z',
       endTime: '2026-02-20T10:10:00Z',
@@ -48,6 +48,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: 10000,
     },
     exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }
@@ -311,7 +316,7 @@ describe('MultiSessionBuildScenario', () => {
       const transcripts = Array.from({ length: 5 }, (_, i) =>
         makeTranscript({
           taskIndex: i,
-          tokenUsage: { input: 1000, output: 500, total: 1500 },
+          tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
           timing: { startTime: '', endTime: '', durationMs: 300000, timeToFirstActionMs: 5000 },
           fileChanges: [
             { path: `src/session-${i}.ts`, changeType: 'added', linesAdded: 20, linesRemoved: 0 },

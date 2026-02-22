@@ -368,8 +368,13 @@ export function exportMarkdown(report: BenchmarkReport): string {
   const tokenSummaries = report.aggregated
     .filter((a) => a.metricSummaries.totalTokens.n > 0)
     .map(
-      (a) =>
-        `- **${a.condition}** (${a.scenario}): ${formatSummary(a.metricSummaries.totalTokens)} tokens`,
+      (a) => {
+        const m = a.metricSummaries;
+        const costStr = m.costUsd.mean > 0
+          ? `$${m.costUsd.mean.toFixed(2)}/run`
+          : `${formatSummary(m.totalTokens)} tokens`;
+        return `- **${a.condition}** (${a.scenario}): ${costStr} | input: ${Math.round(m.inputTokens.mean).toLocaleString()} | output: ${Math.round(m.outputTokens.mean).toLocaleString()} | cache_read: ${Math.round(m.cacheReadTokens.mean).toLocaleString()} | turns: ${Math.round(m.numTurns.mean)} | compactions: ${Math.round(m.compactionCount.mean)}`;
+      },
     );
   if (tokenSummaries.length > 0) {
     sections.push('## Resource Usage', '');
@@ -427,8 +432,16 @@ export function exportCsv(results: ScoredResults[]): string {
     ...dimensions.map((d) => `confidence_${d}`),
     ...dimensions.map((d) => `method_${d}`),
     'totalTokens',
+    'inputTokens',
+    'outputTokens',
+    'cacheReadTokens',
+    'cacheCreationTokens',
+    'costUsd',
     'wallTimeMs',
     'agentSessions',
+    'numTurns',
+    'compactionCount',
+    'contextUtilization',
     'linesAdded',
     'linesRemoved',
     'filesChanged',
@@ -457,8 +470,16 @@ export function exportCsv(results: ScoredResults[]): string {
         r.scores[d] !== undefined ? r.scores[d].method : '',
       ),
       String(r.metrics.totalTokens),
+      String(r.metrics.inputTokens),
+      String(r.metrics.outputTokens),
+      String(r.metrics.cacheReadTokens),
+      String(r.metrics.cacheCreationTokens),
+      String(r.metrics.costUsd),
       String(r.metrics.wallTimeMs),
       String(r.metrics.agentSessions),
+      String(r.metrics.numTurns),
+      String(r.metrics.compactionCount),
+      String(r.metrics.contextUtilization),
       String(r.metrics.gitChurn.linesAdded),
       String(r.metrics.gitChurn.linesRemoved),
       String(r.metrics.gitChurn.filesChanged),
@@ -490,7 +511,15 @@ export function exportAggregatedCsv(aggregated: AggregatedResults[]): string {
     'composite_ci_upper',
     'composite_high_variance',
     'totalTokens_mean',
+    'inputTokens_mean',
+    'outputTokens_mean',
+    'cacheReadTokens_mean',
+    'cacheCreationTokens_mean',
+    'costUsd_mean',
     'wallTimeMs_mean',
+    'numTurns_mean',
+    'compactionCount_mean',
+    'contextUtilization_mean',
     'linesAdded_mean',
     'linesRemoved_mean',
     'testsPass_mean',
@@ -512,7 +541,15 @@ export function exportAggregatedCsv(aggregated: AggregatedResults[]): string {
       String(cs.confidenceInterval[1]),
       String(cs.highVariance),
       String(a.metricSummaries.totalTokens.mean),
+      String(a.metricSummaries.inputTokens.mean),
+      String(a.metricSummaries.outputTokens.mean),
+      String(a.metricSummaries.cacheReadTokens.mean),
+      String(a.metricSummaries.cacheCreationTokens.mean),
+      String(a.metricSummaries.costUsd.mean),
       String(a.metricSummaries.wallTimeMs.mean),
+      String(a.metricSummaries.numTurns.mean),
+      String(a.metricSummaries.compactionCount.mean),
+      String(a.metricSummaries.contextUtilization.mean),
       String(a.metricSummaries.gitChurn.linesAdded.mean),
       String(a.metricSummaries.gitChurn.linesRemoved.mean),
       String(a.metricSummaries.testsPass.mean),

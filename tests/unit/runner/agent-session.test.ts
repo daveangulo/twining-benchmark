@@ -138,9 +138,16 @@ describe('AgentSessionManager', () => {
     expect(transcript.condition).toBe('baseline');
     expect(transcript.exitReason).toBe('completed');
     expect(transcript.error).toBeUndefined();
-    expect(transcript.tokenUsage.input).toBe(1200); // 1000 + 200 cache read
+    expect(transcript.tokenUsage.input).toBe(1000); // non-cached input only
     expect(transcript.tokenUsage.output).toBe(500);
-    expect(transcript.tokenUsage.total).toBe(1700);
+    expect(transcript.tokenUsage.cacheRead).toBe(200);
+    expect(transcript.tokenUsage.cacheCreation).toBe(0);
+    expect(transcript.tokenUsage.total).toBe(1700); // 1000 + 500 + 200 + 0
+    expect(transcript.tokenUsage.costUsd).toBe(0.01);
+    expect(transcript.numTurns).toBe(2);
+    expect(transcript.stopReason).toBe('success');
+    expect(transcript.compactionCount).toBe(0);
+    expect(transcript.turnUsage).toEqual([]);
     expect(transcript.toolCalls).toHaveLength(1);
     expect(transcript.toolCalls[0]!.toolName).toBe('Edit');
   });

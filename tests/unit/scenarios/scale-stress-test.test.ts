@@ -41,7 +41,7 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
     prompt: 'Test prompt',
     toolCalls: [],
     fileChanges: [],
-    tokenUsage: { input: 1000, output: 500, total: 1500 },
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
     timing: {
       startTime: '2026-02-20T10:00:00Z',
       endTime: '2026-02-20T10:05:00Z',
@@ -49,6 +49,11 @@ function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscri
       timeToFirstActionMs: 10000,
     },
     exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
     ...overrides,
   };
 }
@@ -325,7 +330,7 @@ describe('ScaleStressTestScenario', () => {
       const transcripts = Array.from({ length: 4 }, (_, i) =>
         makeTranscript({
           taskIndex: i,
-          tokenUsage: { input: 2000, output: 1000, total: 3000 },
+          tokenUsage: { input: 2000, output: 1000, cacheRead: 0, cacheCreation: 0, total: 3000, costUsd: 0.02 },
           timing: { startTime: '', endTime: '', durationMs: 600000, timeToFirstActionMs: 5000 },
           fileChanges: [
             { path: `src/c${i}.ts`, changeType: 'added', linesAdded: 25, linesRemoved: 0 },
