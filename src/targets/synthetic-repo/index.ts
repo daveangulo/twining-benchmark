@@ -191,6 +191,7 @@ export class SyntheticRepoTarget implements ITestTarget {
     await git.init();
     await git.addConfig('user.email', 'benchmark@twining-bench.local');
     await git.addConfig('user.name', 'Twining Benchmark');
+    await git.addConfig('commit.gpgsign', 'false');
     await git.add('.');
     await git.commit('Initial commit: TaskFlow Pro synthetic repo');
 

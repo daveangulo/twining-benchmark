@@ -80,6 +80,7 @@ async function makeMockTargetWorkingDir(tempDir: string): Promise<WorkingDirecto
   await git.init();
   await git.addConfig('user.email', 'test@test.com');
   await git.addConfig('user.name', 'Test');
+  await git.addConfig('commit.gpgsign', 'false');
   await writeFile(join(dir, 'index.ts'), 'export const app = {};', 'utf-8');
   await git.add('.');
   await git.commit('initial');

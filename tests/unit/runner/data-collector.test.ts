@@ -71,6 +71,7 @@ describe('DataCollector', () => {
     await git.init();
     await git.addConfig('user.email', 'test@test.com');
     await git.addConfig('user.name', 'Test');
+    await git.addConfig('commit.gpgsign', 'false');
     await writeFile(join(repoDir, 'initial.ts'), 'export const x = 1;\n', 'utf-8');
     await git.add('.');
     await git.commit('initial commit');
