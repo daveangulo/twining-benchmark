@@ -4,11 +4,11 @@ A CLI-driven benchmark execution engine that quantitatively compares multi-agent
 
 The harness runs controlled experiments where multiple Claude agents collaborate on a shared codebase under different coordination conditions (no coordination, CLAUDE.md only, shared markdown, file-based reload, structured frameworks, full Twining MCP), then scores the results using automated analysis and statistical comparison.
 
-## Current Status: Phase 0 (Concept Validation)
+## Current Status: Phase 1 (End-to-End CLI Execution)
 
-Phase 0 validates that the methodology produces meaningful, differentiable results before investing in the full harness. It runs the **refactoring-handoff** scenario under three max-contrast conditions (baseline, CLAUDE.md only, full Twining) and produces a statistical comparison report with go/no-go recommendation.
+Phase 0 (concept validation) is complete with a GREEN go/no-go verdict. Phase 1 wires the CLI `run` command for end-to-end execution: the orchestrator now calls `scenario.score()` after each iteration, persists structured results via `ResultsStore`, and uses the real `SyntheticRepoTarget` instead of a placeholder.
 
-The full architecture (5 scenarios, 6 conditions, web dashboard) is scaffolded but not yet wired for production use. Phase 0 is the operational entry point.
+Phase 0's standalone runner (`phase0-runner.ts`) remains available for quick validation. The CLI `twining-bench run` is the primary entry point going forward.
 
 ## Quick Start
 
@@ -26,7 +26,22 @@ cd twining-benchmark-harness
 npm install
 ```
 
-### Run Phase 0
+### Run Benchmarks (CLI)
+
+```bash
+# Run a single scenario/condition pair
+npx twining-bench run --scenario refactor --condition baseline --runs 1
+
+# Dry run — validate config and estimate cost without executing
+npx twining-bench run --scenario refactor --condition all --runs 3 --dry-run
+
+# Set a budget ceiling (default: $100)
+npx twining-bench run --scenario refactor --condition all --runs 3 --budget 50
+```
+
+Results are written to `benchmark-results/<run-id>/` with structured subdirectories for metadata, scores, transcripts, and artifacts.
+
+### Run Phase 0 (Standalone)
 
 ```bash
 # Run all 3 conditions, 3 iterations each (9 total runs, ~1-2 hours)
@@ -194,7 +209,8 @@ twining-benchmark-harness/
 │   │       └── progress.ts         # Progress display
 │   └── types/                      # All TypeScript interfaces
 ├── tests/
-│   └── unit/                       # 358 tests across 25 files
+│   ├── unit/                        # 360 unit tests across 25 files
+│   └── integration/                 # End-to-end integration tests
 ├── benchmark-results/              # Default output directory
 ├── twining-bench.config.ts         # Default configuration
 ├── tsconfig.json
@@ -204,7 +220,20 @@ twining-benchmark-harness/
 
 ## Output Structure
 
-Each Phase 0 run produces:
+### CLI Runs (`twining-bench run`)
+
+```
+benchmark-results/
+└── <run-id>/
+    ├── metadata.json                 # Run configuration, status, timing
+    ├── scores/                       # Scored results per iteration
+    │   └── <scenario>_<condition>_<iteration>.json
+    ├── raw/                          # Agent session transcripts
+    │   └── <session-id>.json
+    └── artifacts/                    # Coordination artifact snapshots
+```
+
+### Phase 0 Runs (standalone)
 
 ```
 benchmark-results/phase0/
@@ -341,13 +370,13 @@ export interface ITestTarget {
 | AST Analysis | ts-morph | Pattern detection in TypeScript code |
 | Git Operations | simple-git | Diffs, churn analysis, repo management |
 | Process Management | execa | Child process execution (test runners, builds) |
-| Testing | Vitest | 358 unit tests |
+| Testing | Vitest | 361 tests (unit + integration) |
 | Dashboard (planned) | React + Vite + Recharts | Web-based results visualization |
 
 ## Development
 
 ```bash
-npm test              # Run all 358 tests
+npm test              # Run all 361 tests
 npm run test:watch    # Watch mode
 npm run lint          # Type-check
 npm run build         # Compile to dist/
@@ -355,12 +384,13 @@ npm run build         # Compile to dist/
 
 ## Roadmap
 
-Phase 0 is complete. Subsequent phases (pending Phase 0 go/no-go result):
+Phase 0 is complete (GREEN verdict). Phase 1 core wiring is done.
 
-- **Phase 1**: Full CLI (`twining-bench run`), all 6 conditions wired for production, agent session management with budget controls
+- **Phase 0**: Concept validation -- **Complete** (9 runs, GREEN go/no-go)
+- **Phase 1**: End-to-end CLI execution -- **In progress** (scoring + results store wired; remaining: all 6 conditions production-ready, budget enforcement during execution)
 - **Phase 2**: All 5 scenarios scored, LLM-as-judge evaluation framework, full statistical reporting
 - **Phase 3**: Web dashboard with comparison charts, trend views, and Markdown/CSV export
-- **Phase 4**: Programmatic repo generator, external repo adapter, `--dry-run`, suite resume
+- **Phase 4**: Programmatic repo generator, external repo adapter, suite resume
 
 ## License
 
