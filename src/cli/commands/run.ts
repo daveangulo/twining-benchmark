@@ -5,6 +5,8 @@ import { RunOrchestrator, type ProgressUpdate } from '../../runner/orchestrator.
 import { DEFAULT_CONFIG, type BenchmarkConfig } from '../../types/config.js';
 import { ProgressDisplay, formatDuration, formatDollars } from '../utils/progress.js';
 import { configureLogger } from '../utils/logger.js';
+import { SyntheticRepoTarget } from '../../targets/synthetic-repo/index.js';
+import { ResultsStore } from '../../results/store.js';
 import type { CostEstimate } from '../../types/analysis.js';
 import type { ScenarioName } from '../../types/scenario.js';
 
@@ -215,14 +217,17 @@ export function createRunCommand(): Command {
         const progress = new ProgressDisplay(totalIterations);
         let completedIterations = 0;
 
+        // Create target and results store
+        const target = new SyntheticRepoTarget();
+        const resultsStore = new ResultsStore(config.outputDirectory);
+
         // Create orchestrator
-        // Target is created by the orchestrator — for now use a stub
-        // TODO: Wire to actual target factory based on --target
         const orchestrator = new RunOrchestrator({
           config,
           scenarios,
           conditions,
-          target: null as never, // Placeholder — real target wiring in Phase 1
+          target,
+          resultsStore,
           runsPerPair: runs,
           seed: opts.seed,
           onProgress: (update: ProgressUpdate) => {
@@ -249,6 +254,12 @@ export function createRunCommand(): Command {
         console.log(`  Status:     ${result.runMetadata.status}`);
         console.log(`  Duration:   ${formatDuration(result.runMetadata.duration)}`);
         console.log(`  Iterations: ${result.iterations.length}`);
+
+        const scoredCount = result.iterations.filter(it => it.scoredResults).length;
+        if (scoredCount > 0) {
+          console.log(`  Scored:     ${scoredCount}/${result.iterations.length} iterations`);
+          console.log(`  Results:    ${config.outputDirectory}/${result.runMetadata.id}/`);
+        }
 
         const totalErrors = result.iterations.reduce(
           (sum, it) => sum + it.errors.length, 0,

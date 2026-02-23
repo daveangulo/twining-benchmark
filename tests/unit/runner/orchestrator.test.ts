@@ -15,9 +15,11 @@ import type {
   CoordinationArtifacts,
   WorkingDirectory,
   ArchitecturalManifest,
+  ScoredResults,
 } from '../../../src/types/index.js';
 import type { ITestTarget, ValidationResult } from '../../../src/targets/target.interface.js';
 import { DEFAULT_CONFIG } from '../../../src/types/config.js';
+import { ResultsStore } from '../../../src/results/store.js';
 
 // Mock the agent session manager module before importing orchestrator
 vi.mock('../../../src/runner/agent-session.js', () => {
@@ -225,6 +227,9 @@ describe('RunOrchestrator', () => {
     expect(result.iterations[0]!.condition).toBe('baseline');
     expect(result.iterations[0]!.sessions).toHaveLength(2);
     expect(result.runMetadata.duration).toBeGreaterThan(0);
+    // Scoring should produce results
+    expect(result.iterations[0]!.scoredResults).toBeDefined();
+    expect(result.iterations[0]!.scoredResults!.composite).toBe(85);
   });
 
   it('emits progress updates during execution', async () => {
@@ -335,5 +340,57 @@ describe('RunOrchestrator', () => {
 
     expect(result.runMetadata.status).toBe('partial');
     expect(result.iterations).toHaveLength(1);
+  });
+
+  it('handles scoring failure gracefully', async () => {
+    const outputDir = join(tempDir, 'results');
+
+    const failingScenario = makeMockScenario();
+    failingScenario.score = async () => {
+      throw new Error('Scoring engine crashed');
+    };
+
+    const orchestrator = new RunOrchestrator({
+      config: makeConfig({ outputDirectory: outputDir }),
+      scenarios: [failingScenario],
+      conditions: [makeMockCondition()],
+      target: makeMockTarget(tempDir),
+      runsPerPair: 1,
+    });
+
+    const result = await orchestrator.run();
+
+    expect(result.runMetadata.status).toBe('completed');
+    expect(result.iterations).toHaveLength(1);
+    expect(result.iterations[0]!.scoredResults).toBeUndefined();
+    expect(result.iterations[0]!.errors).toContain('Scoring failed: Scoring engine crashed');
+  });
+
+  it('persists results via ResultsStore when provided', async () => {
+    const outputDir = join(tempDir, 'store-results');
+    const resultsStore = new ResultsStore(outputDir);
+
+    const initRunSpy = vi.spyOn(resultsStore, 'initRun');
+    const saveScoresSpy = vi.spyOn(resultsStore, 'saveScores');
+    const saveTranscriptSpy = vi.spyOn(resultsStore, 'saveTranscript');
+    const updateMetadataSpy = vi.spyOn(resultsStore, 'updateMetadata');
+
+    const orchestrator = new RunOrchestrator({
+      config: makeConfig({ outputDirectory: outputDir }),
+      scenarios: [makeMockScenario()],
+      conditions: [makeMockCondition()],
+      target: makeMockTarget(tempDir),
+      resultsStore,
+      runsPerPair: 1,
+    });
+
+    const result = await orchestrator.run();
+
+    expect(result.runMetadata.status).toBe('completed');
+    expect(initRunSpy).toHaveBeenCalledOnce();
+    expect(saveScoresSpy).toHaveBeenCalledOnce();
+    // 2 sessions → 2 transcript saves
+    expect(saveTranscriptSpy).toHaveBeenCalledTimes(2);
+    expect(updateMetadataSpy).toHaveBeenCalledOnce();
   });
 });

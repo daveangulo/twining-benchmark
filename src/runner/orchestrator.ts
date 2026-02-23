@@ -7,7 +7,10 @@ import type {
   RunEnvironment,
   Scenario,
   Condition,
+  RawResults,
+  ScoredResults,
 } from '../types/index.js';
+import { ResultsStore } from '../results/store.js';
 import type { ITestTarget } from '../targets/target.interface.js';
 import { AgentSessionManager } from './agent-session.js';
 import { DataCollector, type CollectedSessionData } from './data-collector.js';
@@ -36,6 +39,8 @@ export interface OrchestratorOptions {
   seed?: string;
   /** Resume from a specific run ID (if restarting) */
   resumeRunId?: string;
+  /** Optional results store for persisting scored results */
+  resultsStore?: ResultsStore;
   /** Callback for progress updates */
   onProgress?: (update: ProgressUpdate) => void;
 }
@@ -65,6 +70,8 @@ export interface IterationResult {
   allSessionsCompleted: boolean;
   errors: string[];
   wallTimeMs: number;
+  /** Scored results from scenario.score(), undefined if scoring failed */
+  scoredResults?: ScoredResults;
 }
 
 /**
@@ -104,6 +111,7 @@ export class RunOrchestrator {
   private readonly runsPerPair: number;
   private readonly seed?: string;
   private readonly resumeRunId?: string;
+  private readonly resultsStore?: ResultsStore;
   private readonly onProgress?: (update: ProgressUpdate) => void;
 
   constructor(options: OrchestratorOptions) {
@@ -114,6 +122,7 @@ export class RunOrchestrator {
     this.runsPerPair = options.runsPerPair;
     this.seed = options.seed;
     this.resumeRunId = options.resumeRunId;
+    this.resultsStore = options.resultsStore;
     this.onProgress = options.onProgress;
   }
 
@@ -157,6 +166,11 @@ export class RunOrchestrator {
     // Save initial metadata
     await this.saveRunMetadata(runMetadata);
 
+    // Initialize results store if present
+    if (this.resultsStore) {
+      await this.resultsStore.initRun(runMetadata);
+    }
+
     const iterations: IterationResult[] = [];
 
     try {
@@ -186,6 +200,16 @@ export class RunOrchestrator {
             });
 
             iterations.push(result);
+
+            // Persist scored results and transcripts via store
+            if (this.resultsStore && result.scoredResults) {
+              await this.resultsStore.saveScores(result.scoredResults);
+            }
+            if (this.resultsStore) {
+              for (const session of result.sessions) {
+                await this.resultsStore.saveTranscript(session.transcript);
+              }
+            }
 
             // Incremental save after each iteration (crash-safe)
             const allSessions = iterations.flatMap(it => it.sessions);
@@ -221,6 +245,11 @@ export class RunOrchestrator {
     runMetadata.duration = Date.now() - startTime.getTime();
     await this.saveRunMetadata(runMetadata);
 
+    // Update results store with final metadata
+    if (this.resultsStore) {
+      await this.resultsStore.updateMetadata(runMetadata);
+    }
+
     this.emitProgress({
       type: 'run-complete',
       runId,
@@ -247,6 +276,7 @@ export class RunOrchestrator {
     const sessions: CollectedSessionData[] = [];
     const errors: string[] = [];
     let allCompleted = true;
+    let scoredResults: ScoredResults | undefined;
 
     // 1. Setup target (isolated working directory)
     const workingDir = await this.target.setup();
@@ -351,6 +381,24 @@ export class RunOrchestrator {
             message: `Task ${i + 1}/${tasks.length} ${retryResult.success ? 'completed' : 'failed'}`,
           });
         }
+
+        // Score the iteration
+        try {
+          const rawResults: RawResults = {
+            transcripts: sessions.map(s => s.transcript),
+            finalWorkingDir: workingDir.path,
+            allSessionsCompleted: allCompleted,
+            errors,
+          };
+          const groundTruth = this.target.getGroundTruth();
+          scoredResults = await scenario.score(rawResults, groundTruth);
+          scoredResults.runId = runId;
+          scoredResults.condition = condition.name;
+          scoredResults.iteration = iteration;
+        } catch (scoreErr: unknown) {
+          const msg = scoreErr instanceof Error ? scoreErr.message : String(scoreErr);
+          errors.push(`Scoring failed: ${msg}`);
+        }
       } finally {
         // 7. Teardown condition
         await condition.teardown();
@@ -368,6 +416,7 @@ export class RunOrchestrator {
       allSessionsCompleted: allCompleted,
       errors,
       wallTimeMs: Date.now() - iterationStart,
+      scoredResults,
     };
   }
 
