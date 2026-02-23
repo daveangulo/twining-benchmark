@@ -95,7 +95,7 @@ The key question: does Agent B discover and respect Agent A's decisions? Or does
 | **Completion** (0-100) | Did both agents complete their assigned tasks? | Exit status + file change detection |
 | **Composite** (0-100) | Weighted aggregate of all dimensions | `0.35 * consistency + 0.25 * rework + 0.40 * completion` |
 
-Additional metrics captured per run: total tokens, wall time, lines added/removed, files changed, test pass/fail counts, compilation status.
+Additional metrics captured per run: input/output/cache-read/cache-creation token breakdown, SDK-reported cost, wall time, turn count, compaction count, context utilization, lines added/removed, files changed, test pass/fail counts, compilation status.
 
 ### The Conditions
 
@@ -138,9 +138,9 @@ The analysis pipeline (`phase0-analyze.ts`) computes:
 | **YELLOW** | Medium effect but not significant, or insufficient runs, or high variance | Increase runs or adjust scenario difficulty |
 | **RED** | No detectable effect (d < 0.5) on any primary KPI | Reassess methodology or Twining's approach |
 
-### Cost Estimation
+### Cost Tracking
 
-Token costs are estimated at Sonnet 4 rates ($3/MTok input, $15/MTok output, assuming 70/30 input/output split). The analysis report includes actual Phase 0 cost and projected cost for a full suite (5 scenarios x 6 conditions x 3 runs = 90 runs).
+Token costs are reported using the SDK's `total_cost_usd` field, which reflects actual per-token pricing including cache discounts. The analysis report breaks down input, output, cache-read, and cache-creation tokens separately, along with context health metrics (turns, compactions, context window utilization). A legacy cost estimator (Sonnet 4 rates, $3/MTok input, $15/MTok output) is used as a fallback for older results that predate SDK cost reporting.
 
 ## Project Structure
 
@@ -194,7 +194,7 @@ twining-benchmark-harness/
 │   │       └── progress.ts         # Progress display
 │   └── types/                      # All TypeScript interfaces
 ├── tests/
-│   └── unit/                       # 355 tests across 25 files
+│   └── unit/                       # 358 tests across 25 files
 ├── benchmark-results/              # Default output directory
 ├── twining-bench.config.ts         # Default configuration
 ├── tsconfig.json
@@ -341,13 +341,13 @@ export interface ITestTarget {
 | AST Analysis | ts-morph | Pattern detection in TypeScript code |
 | Git Operations | simple-git | Diffs, churn analysis, repo management |
 | Process Management | execa | Child process execution (test runners, builds) |
-| Testing | Vitest | 355 unit tests |
+| Testing | Vitest | 358 unit tests |
 | Dashboard (planned) | React + Vite + Recharts | Web-based results visualization |
 
 ## Development
 
 ```bash
-npm test              # Run all 355 tests
+npm test              # Run all 358 tests
 npm run test:watch    # Watch mode
 npm run lint          # Type-check
 npm run build         # Compile to dist/
