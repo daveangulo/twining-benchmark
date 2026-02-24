@@ -206,7 +206,217 @@ export function percentageImprovement(
   return { percent, margin };
 }
 
+/**
+ * Paired t-test for two related samples (FR-ANL-003).
+ * Tests whether the mean of the paired differences is significantly different from 0.
+ * Requires equal-length arrays where pairs[i] = [conditionA[i], conditionB[i]].
+ */
+export function pairedTTest(
+  pairs: [number, number][],
+): { tStatistic: number; pValue: number; degreesOfFreedom: number } {
+  if (pairs.length < 2) {
+    throw new Error('Paired t-test requires at least 2 pairs');
+  }
+
+  const differences = pairs.map(([a, b]) => a - b);
+  const n = differences.length;
+  const df = n - 1;
+
+  const meanDiff = ssMean(differences);
+  const sdDiff = ssStdDev(differences);
+
+  if (sdDiff === 0) {
+    // All differences are identical
+    return {
+      tStatistic: meanDiff === 0 ? 0 : Infinity,
+      pValue: meanDiff === 0 ? 1.0 : 0.0,
+      degreesOfFreedom: df,
+    };
+  }
+
+  const tStatistic = meanDiff / (sdDiff / Math.sqrt(n));
+
+  // Two-tailed p-value using t-distribution approximation
+  const pValue = tDistributionPValue(Math.abs(tStatistic), df);
+
+  return {
+    tStatistic,
+    pValue: Math.min(pValue, 1.0),
+    degreesOfFreedom: df,
+  };
+}
+
+/**
+ * Wilcoxon signed-rank test for two related samples (FR-ANL-003).
+ * Non-parametric alternative to paired t-test.
+ * Uses normal approximation for p-value.
+ */
+export function wilcoxonSignedRank(
+  pairs: [number, number][],
+): { wStatistic: number; zScore: number; pValue: number } {
+  if (pairs.length < 2) {
+    throw new Error('Wilcoxon signed-rank test requires at least 2 pairs');
+  }
+
+  const differences = pairs.map(([a, b]) => a - b);
+
+  // Remove zero differences
+  const nonZeroDiffs = differences.filter((d) => d !== 0);
+  const n = nonZeroDiffs.length;
+
+  if (n === 0) {
+    // All differences are zero
+    return { wStatistic: 0, zScore: 0, pValue: 1.0 };
+  }
+
+  // Rank absolute differences
+  const absDiffs = nonZeroDiffs.map((d) => Math.abs(d));
+  const sortedIndices = absDiffs
+    .map((v, i) => ({ value: v, index: i }))
+    .sort((a, b) => a.value - b.value);
+
+  const ranks = assignRanks(sortedIndices.map((s) => s.value));
+
+  // Map ranks back to original order
+  const orderedRanks = new Array<number>(n);
+  for (let i = 0; i < sortedIndices.length; i++) {
+    orderedRanks[sortedIndices[i]!.index] = ranks[i]!;
+  }
+
+  // Sum of positive ranks (W+) and negative ranks (W-)
+  let wPlus = 0;
+  let wMinus = 0;
+  for (let i = 0; i < n; i++) {
+    if (nonZeroDiffs[i]! > 0) {
+      wPlus += orderedRanks[i]!;
+    } else {
+      wMinus += orderedRanks[i]!;
+    }
+  }
+
+  const w = Math.min(wPlus, wMinus);
+
+  // Normal approximation with continuity correction
+  const muW = (n * (n + 1)) / 4;
+  const sigmaW = Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24);
+
+  if (sigmaW === 0) {
+    return { wStatistic: w, zScore: 0, pValue: 1.0 };
+  }
+
+  const z = (Math.abs(w - muW) - 0.5) / sigmaW;
+  const pValue = 2 * (1 - normalCdf(z));
+
+  return {
+    wStatistic: w,
+    zScore: z,
+    pValue: Math.min(pValue, 1.0),
+  };
+}
+
 // --- Internal helpers ---
+
+/**
+ * Two-tailed p-value from t-distribution using Welch-Satterthwaite approximation.
+ * Uses the incomplete beta function approximation.
+ */
+function tDistributionPValue(t: number, df: number): number {
+  // Use the relationship between t-distribution and normal for large df
+  if (df > 100) {
+    return 2 * (1 - normalCdf(t));
+  }
+
+  // For smaller df, use the approximation:
+  // P(T > t) ≈ P(Z > t * (1 - 1/(4*df))) for moderate df
+  // More accurate: use the regularized incomplete beta function
+  const x = df / (df + t * t);
+  const p = incompleteBeta(x, df / 2, 0.5);
+  return Math.min(p, 1.0);
+}
+
+/**
+ * Regularized incomplete beta function approximation.
+ * Uses a continued fraction expansion.
+ */
+function incompleteBeta(x: number, a: number, b: number): number {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+
+  // Use the series expansion for small x or when a is small
+  const lnBeta = lnGamma(a) + lnGamma(b) - lnGamma(a + b);
+  const prefix = Math.exp(a * Math.log(x) + b * Math.log(1 - x) - lnBeta);
+
+  // Continued fraction (Lentz's method)
+  const maxIter = 200;
+  const eps = 1e-14;
+
+  let f = 1;
+  let c = 1;
+  let d = 1 - (a + b) * x / (a + 1);
+  if (Math.abs(d) < 1e-30) d = 1e-30;
+  d = 1 / d;
+  f = d;
+
+  for (let m = 1; m <= maxIter; m++) {
+    // Even step
+    let numerator = m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m));
+    d = 1 + numerator * d;
+    if (Math.abs(d) < 1e-30) d = 1e-30;
+    c = 1 + numerator / c;
+    if (Math.abs(c) < 1e-30) c = 1e-30;
+    d = 1 / d;
+    f *= c * d;
+
+    // Odd step
+    numerator = -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1));
+    d = 1 + numerator * d;
+    if (Math.abs(d) < 1e-30) d = 1e-30;
+    c = 1 + numerator / c;
+    if (Math.abs(c) < 1e-30) c = 1e-30;
+    d = 1 / d;
+    const delta = c * d;
+    f *= delta;
+
+    if (Math.abs(delta - 1) < eps) break;
+  }
+
+  return prefix * f / a;
+}
+
+/**
+ * Log-gamma function (Stirling's approximation + Lanczos).
+ */
+function lnGamma(x: number): number {
+  if (x <= 0) return 0;
+
+  // Lanczos approximation coefficients
+  const g = 7;
+  const coef = [
+    0.99999999999980993,
+    676.5203681218851,
+    -1259.1392167224028,
+    771.32342877765313,
+    -176.61502916214059,
+    12.507343278686905,
+    -0.13857109526572012,
+    9.9843695780195716e-6,
+    1.5056327351493116e-7,
+  ];
+
+  if (x < 0.5) {
+    // Reflection formula
+    return Math.log(Math.PI / Math.sin(Math.PI * x)) - lnGamma(1 - x);
+  }
+
+  x -= 1;
+  let a = coef[0]!;
+  const t = x + g + 0.5;
+  for (let i = 1; i < g + 2; i++) {
+    a += coef[i]! / (x + i);
+  }
+
+  return 0.5 * Math.log(2 * Math.PI) + (x + 0.5) * Math.log(t) - t + Math.log(a);
+}
 
 /**
  * Assign ranks to sorted values, handling ties with average ranks.

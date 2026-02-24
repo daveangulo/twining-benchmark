@@ -3,8 +3,18 @@ import { join } from 'node:path';
 import { Command } from 'commander';
 import { DEFAULT_CONFIG } from '../../types/config.js';
 import type { RunMetadata } from '../../types/run.js';
-import type { ScoredResults } from '../../types/results.js';
+import type { ScoredResults, BenchmarkReport } from '../../types/results.js';
 import { formatDuration } from '../utils/progress.js';
+import {
+  aggregateResults,
+  rankConditions,
+  calculateEfficacyScore,
+  generatePairwiseComparisons,
+} from '../../analyzer/composite-scorer.js';
+import {
+  exportMarkdown,
+  generateKeyFindings,
+} from '../../results/exporter.js';
 
 /**
  * Load run metadata from a run directory.
@@ -66,80 +76,98 @@ async function loadScoredResults(runDir: string): Promise<ScoredResults[]> {
 }
 
 /**
- * Print a formatted summary of a run.
+ * Build a BenchmarkReport from scored results and metadata.
  */
-function printRunSummary(metadata: RunMetadata, scores: ScoredResults[]): void {
-  console.log('');
-  console.log(`  ${'═'.repeat(60)}`);
-  console.log(`  BENCHMARK RESULTS — Run ${metadata.id.slice(0, 8)}`);
-  console.log(`  ${'═'.repeat(60)}`);
-  console.log('');
-  console.log(`  Run ID:     ${metadata.id}`);
-  console.log(`  Timestamp:  ${metadata.timestamp}`);
-  console.log(`  Status:     ${metadata.status}`);
-  console.log(`  Duration:   ${formatDuration(metadata.duration)}`);
-  console.log(`  Scenarios:  ${metadata.scenarios.join(', ')}`);
-  console.log(`  Conditions: ${metadata.conditions.join(', ')}`);
-  console.log(`  Runs/pair:  ${metadata.runsPerPair}`);
-  if (metadata.seed) {
-    console.log(`  Seed:       ${metadata.seed}`);
+export function buildReport(
+  metadata: RunMetadata,
+  scores: ScoredResults[],
+): BenchmarkReport {
+  if (scores.length === 0) {
+    return {
+      runId: metadata.id,
+      timestamp: metadata.timestamp,
+      aggregated: [],
+      comparisons: [],
+      ranking: [],
+      efficacyScore: 0,
+      keyFindings: [],
+    };
   }
 
-  console.log('');
-  console.log('  Environment:');
-  console.log(`    Node:     ${metadata.environment.nodeVersion}`);
-  console.log(`    Platform: ${metadata.environment.platform}`);
-  console.log(`    Model:    ${metadata.environment.claudeModel}`);
-  if (metadata.environment.twiningVersion) {
-    console.log(`    Twining:  ${metadata.environment.twiningVersion}`);
+  // Group by scenario+condition pair
+  const groups = new Map<string, ScoredResults[]>();
+  for (const s of scores) {
+    const key = `${s.scenario}:${s.condition}`;
+    const arr = groups.get(key) ?? [];
+    arr.push(s);
+    groups.set(key, arr);
   }
 
-  if (scores.length > 0) {
-    console.log('');
-    console.log('  Scores:');
-    console.log(
-      '  ' +
-      'Scenario'.padEnd(25) +
-      'Condition'.padEnd(25) +
-      'Iter'.padEnd(6) +
-      'Composite'
-    );
-    console.log('  ' + '─'.repeat(65));
+  // Aggregate each group
+  const aggregated = [...groups.values()].map(group => aggregateResults(group));
 
-    for (const result of scores) {
-      console.log(
-        '  ' +
-        result.scenario.padEnd(25) +
-        result.condition.padEnd(25) +
-        String(result.iteration).padEnd(6) +
-        result.composite.toFixed(1)
-      );
-    }
+  // Generate pairwise comparisons across conditions
+  const comparisons = generatePairwiseComparisons(
+    aggregated,
+    'composite',
+    (agg) => {
+      const groupKey = `${agg.scenario}:${agg.condition}`;
+      return (groups.get(groupKey) ?? []).map(s => s.composite);
+    },
+  );
 
-    console.log('');
+  // Rank conditions
+  const ranking = rankConditions(aggregated);
 
-    // Per-dimension breakdown for the first score
-    const firstScore = scores[0];
-    if (firstScore && Object.keys(firstScore.scores).length > 0) {
-      console.log('  Score dimensions (first iteration):');
-      for (const [dim, score] of Object.entries(firstScore.scores)) {
-        console.log(
-          `    ${dim.padEnd(25)} ${String(score.value).padEnd(6)} (${score.confidence}, ${score.method})`
-        );
-      }
-      console.log('');
-    }
-  } else {
-    console.log('\n  No scored results found for this run.');
-    console.log('  (Scores are generated after analysis — run scoring has not been executed yet.)');
-    console.log('');
-  }
+  // Calculate efficacy score
+  const efficacyScore = calculateEfficacyScore(aggregated);
+
+  const report: BenchmarkReport = {
+    runId: metadata.id,
+    timestamp: metadata.timestamp,
+    aggregated,
+    comparisons,
+    ranking,
+    efficacyScore,
+    keyFindings: [],
+  };
+
+  // Auto-generate key findings
+  report.keyFindings = generateKeyFindings(report);
+
+  return report;
 }
 
 /**
- * Print a side-by-side comparison of two runs.
+ * Print the full KPI summary using the Section 9.3 template.
  */
-function printComparison(
+export function printRunSummary(metadata: RunMetadata, scores: ScoredResults[]): void {
+  if (scores.length === 0) {
+    console.log('');
+    console.log(`  ${'═'.repeat(60)}`);
+    console.log(`  BENCHMARK RESULTS — Run ${metadata.id.slice(0, 8)}`);
+    console.log(`  ${'═'.repeat(60)}`);
+    console.log('');
+    console.log(`  Run ID:     ${metadata.id}`);
+    console.log(`  Timestamp:  ${metadata.timestamp}`);
+    console.log(`  Status:     ${metadata.status}`);
+    console.log(`  Duration:   ${formatDuration(metadata.duration)}`);
+    console.log('\n  No scored results found for this run.');
+    console.log('  (Scores are generated after analysis — run scoring has not been executed yet.)');
+    console.log('');
+    return;
+  }
+
+  const report = buildReport(metadata, scores);
+  const markdown = exportMarkdown(report);
+  console.log('');
+  console.log(markdown);
+}
+
+/**
+ * Print a side-by-side comparison of two runs using the full KPI template.
+ */
+export function printComparison(
   metaA: RunMetadata,
   scoresA: ScoredResults[],
   metaB: RunMetadata,
@@ -150,68 +178,136 @@ function printComparison(
   console.log(`  COMPARISON: ${metaA.id.slice(0, 8)} vs ${metaB.id.slice(0, 8)}`);
   console.log(`  ${'═'.repeat(70)}`);
   console.log('');
+
+  const reportA = buildReport(metaA, scoresA);
+  const reportB = buildReport(metaB, scoresB);
+
+  // Show run info
   console.log(`  Run A: ${metaA.id} (${metaA.timestamp})`);
   console.log(`  Run B: ${metaB.id} (${metaB.timestamp})`);
   console.log('');
 
-  // Compare by scenario/condition pairs
-  const keysA = new Map(scoresA.map(s => [`${s.scenario}:${s.condition}:${s.iteration}`, s]));
-  const keysB = new Map(scoresB.map(s => [`${s.scenario}:${s.condition}:${s.iteration}`, s]));
-
-  const allKeys = new Set([...keysA.keys(), ...keysB.keys()]);
-
-  if (allKeys.size === 0) {
+  if (reportA.ranking.length === 0 && reportB.ranking.length === 0) {
     console.log('  No scored results to compare.');
     console.log('');
     return;
   }
 
-  console.log(
-    '  ' +
-    'Scenario'.padEnd(22) +
-    'Condition'.padEnd(22) +
-    'Run A'.padEnd(8) +
-    'Run B'.padEnd(8) +
-    'Delta'.padEnd(10) +
-    'Change'
-  );
-  console.log('  ' + '─'.repeat(76));
-
-  for (const key of [...allKeys].sort()) {
-    const [scenario, condition, _iter] = key.split(':');
-    const a = keysA.get(key);
-    const b = keysB.get(key);
-
-    const scoreA = a ? a.composite.toFixed(1) : '  —';
-    const scoreB = b ? b.composite.toFixed(1) : '  —';
-
-    let delta = '';
-    let change = '';
-    if (a && b) {
-      const diff = b.composite - a.composite;
-      const pct = a.composite !== 0 ? (diff / a.composite) * 100 : 0;
-      const sign = diff >= 0 ? '+' : '';
-      delta = `${sign}${diff.toFixed(1)}`;
-      change = pct !== 0
-        ? `${sign}${pct.toFixed(1)}%`
-        : '0%';
-
-      if (diff > 0) change = `\x1b[32m${change}\x1b[0m`;
-      else if (diff < 0) change = `\x1b[31m${change}\x1b[0m`;
-    }
-
+  // Condition ranking comparison
+  if (reportA.ranking.length > 0 || reportB.ranking.length > 0) {
+    console.log('  Condition Rankings:');
     console.log(
       '  ' +
-      (scenario ?? '').padEnd(22) +
-      (condition ?? '').padEnd(22) +
-      scoreA.padEnd(8) +
-      scoreB.padEnd(8) +
-      delta.padEnd(10) +
-      change
+      'Condition'.padEnd(28) +
+      'Run A CES'.padEnd(12) +
+      'Run B CES'.padEnd(12) +
+      'Delta'.padEnd(12) +
+      'Significance'
     );
+    console.log('  ' + '─'.repeat(72));
+
+    // Gather all conditions
+    const allConditions = new Set([
+      ...reportA.ranking.map(r => r.condition),
+      ...reportB.ranking.map(r => r.condition),
+    ]);
+
+    for (const cond of allConditions) {
+      const rankA = reportA.ranking.find(r => r.condition === cond);
+      const rankB = reportB.ranking.find(r => r.condition === cond);
+
+      const cesA = rankA ? rankA.compositeScore.toFixed(1) : '—';
+      const cesB = rankB ? rankB.compositeScore.toFixed(1) : '—';
+
+      let deltaStr = '';
+      let sigStr = '';
+      if (rankA && rankB) {
+        const diff = rankB.compositeScore - rankA.compositeScore;
+        const sign = diff >= 0 ? '+' : '';
+        deltaStr = `${sign}${diff.toFixed(1)}`;
+
+        // Find pairwise comparison for this condition between runs
+        const aggA = reportA.aggregated.filter(a => a.condition === cond);
+        const aggB = reportB.aggregated.filter(a => a.condition === cond);
+
+        if (aggA.length > 0 && aggB.length > 0) {
+          const compA = aggA[0]!.compositeScore;
+          const compB = aggB[0]!.compositeScore;
+          if (compA.n >= 2 && compB.n >= 2) {
+            const combinedSe = Math.sqrt(
+              (compA.standardDeviation ** 2) / compA.n +
+              (compB.standardDeviation ** 2) / compB.n,
+            );
+            if (combinedSe > 0) {
+              const z = Math.abs(diff) / combinedSe;
+              const pValue = 2 * (1 - approxNormalCdf(z));
+              if (pValue < 0.05) {
+                sigStr = '\x1b[32mp < 0.05\x1b[0m';
+              } else if (pValue < 0.10) {
+                sigStr = '\x1b[33mp < 0.10\x1b[0m';
+              } else {
+                sigStr = 'n.s.';
+              }
+            }
+          }
+        }
+
+        if (diff > 0) deltaStr = `\x1b[32m${deltaStr}\x1b[0m`;
+        else if (diff < 0) deltaStr = `\x1b[31m${deltaStr}\x1b[0m`;
+      }
+
+      console.log(
+        '  ' +
+        cond.padEnd(28) +
+        cesA.padEnd(12) +
+        cesB.padEnd(12) +
+        deltaStr.padEnd(12) +
+        sigStr,
+      );
+    }
+    console.log('');
   }
 
-  console.log('');
+  // Show efficacy score comparison
+  if (reportA.efficacyScore !== 0 || reportB.efficacyScore !== 0) {
+    console.log(`  Efficacy Score (Twining advantage):`);
+    console.log(`    Run A: ${reportA.efficacyScore.toFixed(1)}`);
+    console.log(`    Run B: ${reportB.efficacyScore.toFixed(1)}`);
+    const delta = reportB.efficacyScore - reportA.efficacyScore;
+    const sign = delta >= 0 ? '+' : '';
+    console.log(`    Delta: ${sign}${delta.toFixed(1)}`);
+    console.log('');
+  }
+
+  // Show key findings from both
+  if (reportA.keyFindings.length > 0 || reportB.keyFindings.length > 0) {
+    if (reportA.keyFindings.length > 0) {
+      console.log(`  Key Findings (Run A):`);
+      for (const f of reportA.keyFindings) {
+        console.log(`    - ${f}`);
+      }
+      console.log('');
+    }
+    if (reportB.keyFindings.length > 0) {
+      console.log(`  Key Findings (Run B):`);
+      for (const f of reportB.keyFindings) {
+        console.log(`    - ${f}`);
+      }
+      console.log('');
+    }
+  }
+}
+
+/** Quick normal CDF for significance in comparison view */
+function approxNormalCdf(z: number): number {
+  if (z < -8) return 0;
+  if (z > 8) return 1;
+  const absZ = Math.abs(z);
+  const t = 1 / (1 + 0.2316419 * absZ);
+  const d = 0.3989422804014327;
+  const p = d * Math.exp((-absZ * absZ) / 2) *
+    (t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))));
+  return z > 0 ? 1 - p : p;
 }
 
 /**

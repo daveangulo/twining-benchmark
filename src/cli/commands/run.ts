@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { Command } from 'commander';
 import { resolveScenarioNames, getScenario } from '../../scenarios/registry.js';
 import { resolveConditionNames, getCondition } from '../../conditions/registry.js';
@@ -6,9 +7,13 @@ import { DEFAULT_CONFIG, type BenchmarkConfig } from '../../types/config.js';
 import { ProgressDisplay, formatDuration, formatDollars } from '../utils/progress.js';
 import { configureLogger } from '../utils/logger.js';
 import { SyntheticRepoTarget } from '../../targets/synthetic-repo/index.js';
+import { GeneratedRepoTarget } from '../../targets/generator/index.js';
+import { ExternalRepoTarget } from '../../targets/external/index.js';
 import { ResultsStore } from '../../results/store.js';
+import type { ITestTarget } from '../../targets/target.interface.js';
 import type { CostEstimate } from '../../types/analysis.js';
 import type { ScenarioName } from '../../types/scenario.js';
+import type { GeneratorConfig, ExternalRepoConfig } from '../../types/target.js';
 
 /**
  * Sonnet 4 pricing (from PRD resolved question #2).
@@ -124,6 +129,23 @@ export function createRunCommand(): Command {
       'Maximum dollar budget for the suite',
       String(DEFAULT_CONFIG.budgetDollars),
     )
+    .option(
+      '--target-type <type>',
+      'Target type: synthetic, generated, or external',
+      'synthetic',
+    )
+    .option(
+      '--generator-config <path>',
+      'Path to JSON file with GeneratorConfig (for --target-type generated)',
+    )
+    .option(
+      '--external-config <path>',
+      'Path to JSON file with ExternalRepoConfig (for --target-type external)',
+    )
+    .option(
+      '--scale-factor <n>',
+      'Scale factor for scale-stress-test scenario (1-5)',
+    )
     .option('--dry-run', 'Validate config and estimate cost without executing')
     .option('--verbose', 'Enable verbose logging')
     .action(async (opts: {
@@ -133,6 +155,10 @@ export function createRunCommand(): Command {
       runs: string;
       seed?: string;
       budget: string;
+      targetType: string;
+      generatorConfig?: string;
+      externalConfig?: string;
+      scaleFactor?: string;
       dryRun?: boolean;
       verbose?: boolean;
     }) => {
@@ -217,8 +243,26 @@ export function createRunCommand(): Command {
         const progress = new ProgressDisplay(totalIterations);
         let completedIterations = 0;
 
-        // Create target and results store
-        const target = new SyntheticRepoTarget();
+        // Create target based on type
+        let target: ITestTarget;
+        if (opts.targetType === 'generated') {
+          if (!opts.generatorConfig) {
+            throw new Error('--generator-config is required when --target-type is generated');
+          }
+          const configRaw = await readFile(opts.generatorConfig, 'utf-8');
+          const genConfig = JSON.parse(configRaw) as GeneratorConfig;
+          target = new GeneratedRepoTarget(genConfig);
+        } else if (opts.targetType === 'external') {
+          if (!opts.externalConfig) {
+            throw new Error('--external-config is required when --target-type is external');
+          }
+          const configRaw = await readFile(opts.externalConfig, 'utf-8');
+          const extConfig = JSON.parse(configRaw) as ExternalRepoConfig;
+          target = new ExternalRepoTarget(extConfig);
+        } else {
+          target = new SyntheticRepoTarget();
+        }
+
         const resultsStore = new ResultsStore(config.outputDirectory);
 
         // Create orchestrator
