@@ -212,48 +212,62 @@ export class AgentSessionManager {
     let compactionCount = 0;
 
     const abortController = new AbortController();
+    const effectiveTimeoutMs = task.timeoutMs || this.timeoutMs;
 
-    // Set up timeout
+    // Create rejection promise for hard timeout enforcement.
+    // If the SDK ignores AbortController.abort(), Promise.race() still resolves.
+    let timeoutReject: ((err: Error) => void) | undefined;
+    const timeoutPromise = new Promise<never>((_resolve, reject) => {
+      timeoutReject = reject;
+    });
+
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
       abortController.abort();
-    }, task.timeoutMs || this.timeoutMs);
+      timeoutReject?.(new Error('TIMEOUT'));
+    }, effectiveTimeoutMs);
 
     try {
       const sdkOptions = this.buildSdkOptions(task, abortController);
       const queryStream: Query = sdkQuery({ prompt: task.prompt, options: sdkOptions });
 
-      for await (const message of queryStream) {
-        rawMessages.push(message);
-        const now = new Date();
+      // Wrap iteration in a function so we can race it against the timeout
+      const processStream = async (): Promise<void> => {
+        for await (const message of queryStream) {
+          rawMessages.push(message);
+          const now = new Date();
 
-        if (message.type === 'assistant') {
-          const assistantMsg = message as SDKAssistantMessage;
-          const calls = extractToolCalls(assistantMsg, now.toISOString());
-          toolCalls.push(...calls);
+          if (message.type === 'assistant') {
+            const assistantMsg = message as SDKAssistantMessage;
+            const calls = extractToolCalls(assistantMsg, now.toISOString());
+            toolCalls.push(...calls);
 
-          // Track time-to-first-action
-          if (timeToFirstActionMs < 0) {
-            for (const call of calls) {
-              if (isFileChangingToolCall(call)) {
-                timeToFirstActionMs = now.getTime() - startTime.getTime();
-                break;
+            // Track time-to-first-action
+            if (timeToFirstActionMs < 0) {
+              for (const call of calls) {
+                if (isFileChangingToolCall(call)) {
+                  timeToFirstActionMs = now.getTime() - startTime.getTime();
+                  break;
+                }
               }
             }
           }
-        }
 
-        // Track context compaction events
-        if (message.type === 'system' && (message as Record<string, unknown>).subtype === 'compact_boundary') {
-          compactionCount++;
-        }
+          // Track context compaction events
+          if (message.type === 'system' && (message as Record<string, unknown>).subtype === 'compact_boundary') {
+            compactionCount++;
+          }
 
-        if (message.type === 'result') {
-          sdkResult = message as SDKResultMessage;
+          if (message.type === 'result') {
+            sdkResult = message as SDKResultMessage;
+          }
         }
-      }
+      };
+
+      // Race: iteration vs timeout — ensures hard timeout even if SDK ignores abort
+      await Promise.race([processStream(), timeoutPromise]);
     } catch (err: unknown) {
-      // AbortError from timeout is expected
+      // Timeout: fall through to normal transcript building with partial data
       if (!timedOut) {
         const errorMessage = err instanceof Error ? err.message : String(err);
         return this.buildTranscript({
@@ -282,7 +296,7 @@ export class AgentSessionManager {
     const tokenUsage = sdkResult ? extractTokenUsage(sdkResult) : ZERO_TOKEN_USAGE;
     const exitReason = sdkResult ? determineExitReason(sdkResult, timedOut) : (timedOut ? 'timeout' : 'error');
     const error = timedOut
-      ? `Session timed out after ${this.timeoutMs}ms`
+      ? `Session timed out after ${effectiveTimeoutMs}ms`
       : sdkResult
         ? extractError(sdkResult)
         : 'No result received from SDK';

@@ -333,6 +333,68 @@ describe('AgentSessionManager', () => {
     );
   });
 
+  it('enforces timeout when SDK does not respect abort', async () => {
+    // Create a stream that yields one message then hangs forever
+    async function* hangingGenerator() {
+      yield {
+        type: 'assistant',
+        message: {
+          content: [
+            {
+              type: 'tool_use',
+              name: 'Read',
+              input: { file_path: '/test/file.ts' },
+            },
+          ],
+        },
+        parent_tool_use_id: null,
+        uuid: 'msg-1',
+        session_id: 'sess-1',
+      };
+      // Hang forever — simulates SDK ignoring AbortController.abort()
+      await new Promise(() => {});
+    }
+
+    const gen = hangingGenerator();
+    const stream = Object.assign(gen, {
+      interrupt: vi.fn().mockResolvedValue(undefined),
+      setPermissionMode: vi.fn().mockResolvedValue(undefined),
+      setModel: vi.fn().mockResolvedValue(undefined),
+      setMaxThinkingTokens: vi.fn().mockResolvedValue(undefined),
+      initializationResult: vi.fn().mockResolvedValue({}),
+      supportedCommands: vi.fn().mockResolvedValue([]),
+      supportedModels: vi.fn().mockResolvedValue([]),
+      mcpServerStatus: vi.fn().mockResolvedValue([]),
+      accountInfo: vi.fn().mockResolvedValue({}),
+      rewindFiles: vi.fn().mockResolvedValue({ canRewind: false }),
+      reconnectMcpServer: vi.fn().mockResolvedValue(undefined),
+      toggleMcpServer: vi.fn().mockResolvedValue(undefined),
+      setMcpServers: vi.fn().mockResolvedValue({ added: [], removed: [], errors: {} }),
+      streamInput: vi.fn().mockResolvedValue(undefined),
+      stopTask: vi.fn().mockResolvedValue(undefined),
+      close: vi.fn(),
+    });
+
+    mockQuery.mockReturnValue(stream as ReturnType<typeof sdkQuery>);
+
+    const manager = new AgentSessionManager({
+      runId: 'run-timeout',
+      scenario: 'test',
+      condition: 'baseline',
+      workingDir: '/tmp/test',
+      agentConfig: makeAgentConfig(),
+    });
+
+    const transcript = await manager.executeTask(makeTask({ timeoutMs: 200 }));
+
+    expect(transcript.exitReason).toBe('timeout');
+    expect(transcript.timing.durationMs).toBeLessThan(5000);
+    // Partial data preserved: the one tool call before the hang
+    expect(transcript.toolCalls).toHaveLength(1);
+    expect(transcript.toolCalls[0]!.toolName).toBe('Read');
+    expect(transcript.error).toContain('timed out');
+  });
+
   it('returns -1 for timeToFirstAction when no file changes occur', async () => {
     const stream = createMockQueryStream([
       {

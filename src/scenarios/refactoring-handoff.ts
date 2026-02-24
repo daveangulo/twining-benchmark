@@ -110,19 +110,37 @@ export const REFACTORING_HANDOFF_GROUND_TRUTH: ArchitecturalManifest = {
  */
 const AGENT_A_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/repositories/user.repository.ts\` — UserRepository class (your main refactoring target)
+- \`src/repositories/base.repository.ts\` — BaseRepository abstract class (preserve this pattern)
+- \`src/services/user.service.ts\` — UserService that depends on UserRepository
+- \`src/models/user.ts\` — User model/type definitions
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models
+  repositories/  # Data access layer (base + user)
+  services/      # Business logic
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: Refactor the UserService to extract an IUserRepository interface and implement the repository pattern. Document your decisions.
 
 Specifically:
-1. Look at the existing UserRepository class and UserService that depends on it.
+1. Look at \`src/repositories/user.repository.ts\` and \`src/services/user.service.ts\` to understand the current dependency.
 2. Extract an IUserRepository interface that captures the public API of UserRepository.
-3. Update UserService to depend on IUserRepository (the interface) rather than the concrete UserRepository class.
-4. Ensure the existing UserRepository implements the new interface.
+3. Update \`src/services/user.service.ts\` to depend on IUserRepository (the interface) rather than the concrete UserRepository class.
+4. Ensure the existing UserRepository in \`src/repositories/user.repository.ts\` implements the new interface.
 5. Make sure all existing tests still pass after your refactoring.
 6. Document what you did and why — leave clear notes for the next developer.
 
 Important:
 - Do NOT change the existing functionality — this is a pure refactoring.
-- Preserve the existing BaseRepository pattern.
+- Preserve the existing BaseRepository pattern in \`src/repositories/base.repository.ts\`.
 - Make sure the codebase compiles and tests pass when you're done.`;
 
 /**
@@ -132,12 +150,30 @@ Important:
  */
 const AGENT_B_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/repositories/user.repository.ts\` — UserRepository class (may now implement IUserRepository)
+- \`src/repositories/base.repository.ts\` — BaseRepository abstract class
+- \`src/services/user.service.ts\` — UserService (depends on the repository interface)
+- \`src/models/user.ts\` — User model/type definitions
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models
+  repositories/  # Data access layer (base + user)
+  services/      # Business logic
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: Add a caching layer to the user data access. Build on the existing architecture.
 
 Specifically:
-1. Understand the current architecture — look at how user data access is structured.
+1. Review \`src/repositories/user.repository.ts\` and \`src/services/user.service.ts\` to understand the current architecture and any interfaces (e.g., IUserRepository).
 2. Add an in-memory caching layer for user lookups (findById, findByEmail).
-3. The cache should integrate with the existing patterns and interfaces.
+3. The cache should integrate with the existing patterns and interfaces in \`src/repositories/\`.
 4. Cache invalidation: updates and deletes should invalidate the relevant cache entries.
 5. Add tests for the caching behavior.
 6. Make sure the codebase compiles and all existing tests still pass.

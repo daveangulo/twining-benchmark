@@ -126,12 +126,30 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
  */
 const AGENT_A_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/services/order.service.ts\` — OrderService (currently calls NotificationService directly)
+- \`src/services/notification.service.ts\` — NotificationService (tightly coupled to orders)
+- \`src/events/event-bus.ts\` — EventBus class (already exists — consider using it for decoupling)
+- \`src/events/event-types.ts\` — Event type definitions
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  events/        # Event bus and event types
+  models/        # Data models
+  services/      # Business logic (order, notification)
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: The notification system needs to be decoupled from the order processing module. Choose an approach, implement the decoupling, and document your architectural decision with rationale.
 
 Specifically:
-1. Examine how the order processing module currently triggers notifications (look at the OrderService and NotificationService).
-2. Choose a decoupling approach (e.g., event-driven, observer pattern, message queue abstraction) and document WHY you chose it.
-3. Implement the decoupling — the order module should no longer directly call the notification module.
+1. Examine \`src/services/order.service.ts\` and \`src/services/notification.service.ts\` to see the current coupling. Also check \`src/events/event-bus.ts\` — an EventBus already exists that could be used for decoupling.
+2. Choose a decoupling approach (e.g., event-driven using the existing EventBus, observer pattern, message queue abstraction) and document WHY you chose it.
+3. Implement the decoupling — \`src/services/order.service.ts\` should no longer directly call the notification module.
 4. Ensure existing functionality is preserved (orders still trigger notifications, just indirectly).
 5. Write or update tests to cover the new decoupled architecture.
 6. Document your decision clearly — the next developers need to understand your approach to build on it.
@@ -146,13 +164,32 @@ Important:
  */
 const AGENT_B_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/services/order.service.ts\` — OrderService (emits order events)
+- \`src/services/notification.service.ts\` — NotificationService (subscribes to events)
+- \`src/events/event-bus.ts\` — EventBus class (central event dispatch)
+- \`src/events/event-types.ts\` — Event type definitions
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  events/        # Event bus and event types
+  models/        # Data models
+  notifications/ # (you may create this for email handler)
+  services/      # Business logic
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: Add email notifications when an order status changes. Integrate with the existing notification architecture.
 
 Specifically:
-1. Understand the current notification architecture — look at how notifications are structured and triggered.
+1. Review \`src/services/notification.service.ts\` and \`src/events/event-bus.ts\` to understand the current notification architecture and event patterns.
 2. Implement email notifications that fire when an order's status changes (e.g., created, processing, shipped, delivered).
 3. Create an email notification handler/service that formats and would send email notifications.
-4. Integrate your email notifications with the existing notification patterns in the codebase.
+4. Integrate your email notifications with the existing event/notification patterns — subscribe to order events via the EventBus.
 5. Add tests for the email notification functionality.
 6. Make sure the codebase compiles and all existing tests still pass.
 
@@ -167,13 +204,32 @@ Important:
  */
 const AGENT_C_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/services/order.service.ts\` — OrderService (emits order events)
+- \`src/services/notification.service.ts\` — NotificationService (subscribes to events)
+- \`src/events/event-bus.ts\` — EventBus class (central event dispatch)
+- \`src/events/event-types.ts\` — Event type definitions
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  events/        # Event bus and event types
+  models/        # Data models
+  notifications/ # (may contain email handler from previous agent)
+  services/      # Business logic
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: Add a webhook system that fires on order events. Integrate with the existing notification architecture.
 
 Specifically:
-1. Understand the current notification architecture — look at how notifications are structured and triggered.
+1. Review \`src/services/notification.service.ts\` and \`src/events/event-bus.ts\` to understand the current notification architecture and event patterns.
 2. Implement a webhook system that fires HTTP callbacks when order events occur (e.g., order created, status changed).
 3. Create a webhook registry where external URLs can be registered for specific event types.
-4. Integrate your webhook system with the existing notification patterns in the codebase.
+4. Integrate your webhook system with the existing event/notification patterns — subscribe to order events via the EventBus.
 5. Add tests for the webhook functionality.
 6. Make sure the codebase compiles and all existing tests still pass.
 

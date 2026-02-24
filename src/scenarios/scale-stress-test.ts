@@ -115,6 +115,27 @@ export const SCALE_STRESS_GROUND_TRUTH: ArchitecturalManifest = {
  * - Sessions 5-8 (at scale 2): additional components + integration
  * - etc.
  */
+/**
+ * Codebase orientation block shared across all scale-stress-test prompts.
+ */
+const SCALE_ORIENTATION = `## Codebase Orientation
+This is a TypeScript service. Key structural directories:
+- \`src/services/\` — service classes (shared interface + component implementations)
+- \`src/components/\` — component modules (if created by previous sessions)
+- \`src/models/\` or \`src/types/\` — shared type definitions and interfaces
+- \`tests/\` — unit and integration test files
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models and shared interfaces
+  services/      # Service layer (shared interface, component services)
+  components/    # Component modules (created by agents)
+  utils/         # Shared utilities
+tests/           # Test files (unit + integration)
+\`\`\`
+`;
+
 function buildComponentPrompt(sessionIndex: number, totalSessions: number): string {
   const componentNumber = sessionIndex + 1;
   const isIntegrationSession = sessionIndex === totalSessions - 1;
@@ -123,10 +144,11 @@ function buildComponentPrompt(sessionIndex: number, totalSessions: number): stri
   if (isIntegrationSession) {
     return `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+${SCALE_ORIENTATION}
 Your task: Write integration tests for all ${totalSessions - 1} components that have been built and ensure everything works end-to-end.
 
 Specifically:
-1. Review all components that have been added by previous sessions.
+1. Review all components in \`src/services/\` and \`src/components/\` that have been added by previous sessions.
 2. Write integration tests that verify cross-component functionality.
 3. Test that all components integrate correctly with the shared service layer.
 4. Test error propagation across component boundaries.
@@ -142,16 +164,17 @@ Important:
   if (isEarlySession) {
     return `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+${SCALE_ORIENTATION}
 Your task: Build component #${componentNumber} for the modular feature system.
 
 Specifically:
-1. ${sessionIndex === 0 ? 'Design the component architecture and shared service interface. Create the base patterns that subsequent components will follow.' : 'Review the existing components and architecture established by previous sessions.'}
+1. ${sessionIndex === 0 ? 'Design the component architecture and shared service interface. Create the base patterns in `src/services/` that subsequent components will follow.' : 'Review the existing components and architecture in `src/services/` established by previous sessions.'}
 2. Create component-${componentNumber} with:
    - A service class that implements the shared interface
    - At least 2 public methods with clear TypeScript interfaces
    - Proper error handling
    - Unit tests for the component
-3. ${sessionIndex === 0 ? 'Create a shared service interface and registry that future components will use.' : 'Register your component with the existing service registry.'}
+3. ${sessionIndex === 0 ? 'Create a shared service interface and registry in `src/services/` that future components will use.' : 'Register your component with the existing service registry in `src/services/`.'}
 4. Make sure the codebase compiles and tests pass.
 
 Important:
@@ -162,10 +185,11 @@ Important:
   // Later sessions at higher scale factors
   return `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+${SCALE_ORIENTATION}
 Your task: Build component #${componentNumber} and integrate it with the existing ${componentNumber - 1} components.
 
 Specifically:
-1. Review the existing component architecture and integration patterns.
+1. Review the existing component architecture in \`src/services/\` and \`src/components/\` and their integration patterns.
 2. Create component-${componentNumber} following the established patterns:
    - A service class implementing the shared interface
    - At least 2 public methods with TypeScript interfaces

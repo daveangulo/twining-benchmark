@@ -155,11 +155,28 @@ export const MULTI_SESSION_BUILD_GROUND_TRUTH: ArchitecturalManifest = {
 
 const SESSION_1_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). You'll be adding a new analytics feature. Follow existing patterns:
+- \`src/services/\` — existing service classes (follow this pattern for your analytics service)
+- \`src/models/\` — existing model/type definitions (put analytics types here)
+- \`src/routes/\` or \`src/controllers/\` — existing route handlers (if present, follow their pattern)
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models
+  services/      # Business logic
+  repositories/  # Data access layer
+  utils/         # Shared utilities
+tests/           # Test files
+\`\`\`
+
 Your task: Design and scaffold the API for a new analytics dashboard. Create the route structure, data models, and write a brief design doc.
 
 Specifically:
 1. Design the analytics dashboard API: decide on routes (e.g., GET /api/analytics/dashboard, GET /api/analytics/metrics/:type), request/response shapes, and data flow.
-2. Create TypeScript interfaces/types for analytics data models (e.g., DashboardData, MetricSummary, TimeSeriesPoint).
+2. Create TypeScript interfaces/types for analytics data models (e.g., DashboardData, MetricSummary, TimeSeriesPoint) in \`src/models/\` or \`src/types/\`.
 3. Scaffold the route files with stub handlers that return placeholder data.
 4. Write a brief design document (DESIGN.md or inline comments) explaining:
    - The route structure and why
@@ -175,10 +192,17 @@ Important:
 
 const SESSION_2_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service. The previous session scaffolded an analytics feature. Check these locations:
+- \`src/services/\` — for any analytics service stubs or interfaces
+- \`src/models/\` or \`src/types/\` — for analytics data model definitions
+- \`DESIGN.md\` — for the design document from the previous session
+- \`src/routes/\` — for route scaffolding with stub handlers
+
 Your task: Implement the data aggregation service for the analytics dashboard. Follow the design from Session 1.
 
 Specifically:
-1. Look at the existing design and route scaffolding from the previous session.
+1. Read \`DESIGN.md\` (if it exists) and check \`src/services/\` for the existing design and route scaffolding from the previous session.
 2. Implement the data aggregation service that processes raw data into analytics summaries.
 3. The service should conform to any interfaces or contracts defined in the design.
 4. Implement key aggregation functions: time-series aggregation, metric summaries, and dashboard data composition.
@@ -191,10 +215,16 @@ Important:
 
 const SESSION_3_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service. Previous sessions created the analytics feature. Check these locations:
+- \`src/services/\` — for the analytics/aggregation service implementation
+- \`src/models/\` or \`src/types/\` — for analytics data model definitions
+- \`tests/\` — for any existing test patterns to follow
+
 Your task: Add unit tests for the aggregation service and fix any issues you discover.
 
 Specifically:
-1. Look at the aggregation service implementation from the previous session.
+1. Find the aggregation service implementation in \`src/services/\` from the previous session.
 2. Write comprehensive unit tests covering:
    - Normal operation (valid inputs produce expected outputs)
    - Edge cases (empty data, single data point, large datasets)
@@ -209,10 +239,17 @@ Important:
 
 const SESSION_4_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service. Previous sessions created analytics routes, service, and tests. Check these locations:
+- \`src/routes/\` — for route scaffolding with stub handlers (from Session 1)
+- \`src/services/\` — for the aggregation service implementation (from Session 2)
+- \`src/models/\` or \`src/types/\` — for analytics data model definitions
+- \`tests/\` — for existing unit tests (from Session 3)
+
 Your task: Implement the API endpoint handlers, connecting them to the aggregation service.
 
 Specifically:
-1. Look at the existing route scaffolding (from Session 1) and the aggregation service (from Session 2).
+1. Find the route scaffolding in \`src/routes/\` (from Session 1) and the aggregation service in \`src/services/\` (from Session 2).
 2. Replace stub/placeholder handlers with real implementations that call the aggregation service.
 3. Add proper error handling, input validation, and response formatting.
 4. Make sure all routes return the correct data shapes as defined in the data models.
@@ -225,10 +262,17 @@ Important:
 
 const SESSION_5_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service. Previous sessions built the full analytics feature. Check these locations:
+- \`src/routes/\` — API route handlers (connected in Session 4)
+- \`src/services/\` — aggregation service implementation (Session 2)
+- \`src/models/\` or \`src/types/\` — analytics data model definitions (Session 1)
+- \`tests/\` — existing unit tests (Session 3)
+
 Your task: Write integration tests for the full analytics pipeline and ensure everything works end-to-end.
 
 Specifically:
-1. Review the full analytics stack: routes → handlers → aggregation service → data models.
+1. Review the full analytics stack in \`src/\`: routes → handlers → aggregation service → data models.
 2. Write integration tests that test the full pipeline from HTTP request to response.
 3. Test key scenarios: fetching dashboard data, querying specific metrics, time-range filtering.
 4. Test error scenarios: invalid parameters, missing data, unauthorized access.

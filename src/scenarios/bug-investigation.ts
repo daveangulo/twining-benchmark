@@ -101,11 +101,27 @@ export const BUG_INVESTIGATION_GROUND_TRUTH: ArchitecturalManifest = {
  */
 const AGENT_A_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your investigation:
+- \`src/utils/pagination.ts\` — Pagination utility (likely location of the bug)
+- \`src/services/search.service.ts\` — Search service that uses pagination
+- \`tests/\` — existing test files
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models
+  services/      # Business logic (search service)
+  utils/         # Shared utilities (pagination)
+  repositories/  # Data access layer
+tests/           # Test files
+\`\`\`
+
 Your task: Users report that page 2 of search results sometimes shows duplicates from page 1. Investigate and document your findings.
 
 Specifically:
-1. Reproduce the issue — look at how pagination/search results work in the codebase.
-2. Trace the data flow from the search request through to result pagination.
+1. Start with \`src/utils/pagination.ts\` — check the offset calculation for an off-by-one error.
+2. Also examine \`src/services/search.service.ts\` to trace the data flow from search request through to result pagination.
 3. Identify the root cause of the duplicate results on page 2.
 4. Document your findings clearly: what you investigated, what you found, and where you think the bug is.
 5. If you find the fix, implement it. If not, document your progress so far.
@@ -120,13 +136,29 @@ Important:
  */
 const AGENT_B_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
+## Codebase Orientation
+This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
+- \`src/utils/pagination.ts\` — Pagination utility (check here for the off-by-one offset calculation)
+- \`src/services/search.service.ts\` — Search service that uses pagination
+- \`tests/\` — existing test files (add your regression test here)
+
+Directory structure:
+\`\`\`
+src/
+  models/        # Data models
+  services/      # Business logic (search service)
+  utils/         # Shared utilities (pagination)
+  repositories/  # Data access layer
+tests/           # Test files
+\`\`\`
+
 Your task: Continue the investigation into the search results pagination bug. Fix it and add a regression test.
 
-Context: A previous developer was investigating a bug where page 2 of search results sometimes shows duplicate items from page 1. They may have left notes or partial findings.
+Context: A previous developer was investigating a bug where page 2 of search results sometimes shows duplicate items from page 1. They may have left notes or partial findings. Check \`src/utils/pagination.ts\` for the off-by-one offset calculation.
 
 Specifically:
 1. Check for any investigation notes, comments, or partial fixes left by the previous developer.
-2. If the root cause has been identified, implement the fix. If not, continue investigating.
+2. Look at \`src/utils/pagination.ts\` — the offset calculation likely has an off-by-one error.
 3. Fix the pagination bug so that page 2+ results never contain duplicates from previous pages.
 4. Add a regression test that specifically catches this pagination offset bug.
 5. Ensure the regression test fails against the original buggy code and passes with the fix.
