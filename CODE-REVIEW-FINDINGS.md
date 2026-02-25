@@ -336,21 +336,12 @@ All five scenarios' `doSetup()` methods return hardcoded metadata without modify
 5. ~~**Add `.twining/` files to artifact collection**~~ -- FIXED: 3 Twining data files in `full-twining.ts`
 
 ### Short-term (blocks meaningful benchmarking)
-6. **Wire resume logic** -- `completedSessionIds` should skip already-completed iterations
+6. ~~**Wire resume logic**~~ -- FIXED: skip completed iterations using `completedIterationKeys` in orchestrator
 7. **Write real tests** for `code-analysis.ts` (parseTestOutput, analyzeGitChurn) and `llm-judge.ts` (runSingleEvaluation, parseEvaluationResponse)
 8. **Fix generated repo target** -- run `npm install`, wire `fileCount`, implement real `validate()`
 9. **Fix external repo target** -- create isolated working copies per run, fix shell command parsing
 
 ### Medium-term (PRD alignment)
-10. **Extract `extractMetrics()`** to `BaseScenario` to eliminate 5x duplication
+10. ~~**Extract `extractMetrics()`**~~ -- FIXED: moved to `BaseScenario`, removed from all 5 scenario files (~300 lines removed)
 11. **Invoke LLM-as-judge** in scenario scoring (the infrastructure exists, just needs wiring)
-12. **Wire config file loading** so `tbh.config.ts` is actually read by the `run` command
-13. **Relabel integration tests** as unit tests, or rewrite them to actually run agents
-14. **Fix scoring heuristics** -- see Section 8c for specific issues per scenario
-15. **Implement actual scenario setup** -- scenarios should modify the working directory, not assume pre-configured targets
-
-### Longer-term (robustness)
-16. Implement budget enforcement (stop execution, not just project)
-17. Wire seed determinism through the RNG chain
-18. Add file locking to results store for concurrent safety
-19. Fix `contextUtilization` calculation to be meaningful (peak per-turn input, not cumulative total)
+12. ~~**Wire config file loading**~~ -- FIXED: `run` loads `twining-bench.config.json`, `init` generates it
