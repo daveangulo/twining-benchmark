@@ -290,6 +290,43 @@ describe('GeneratedRepoTarget', () => {
     expect(result.errors).toHaveLength(0);
   }, 15_000);
 
+  it('validate warns when fileCount does not match actual generated count', async () => {
+    target = new GeneratedRepoTarget({
+      fileCount: 50, // much higher than moduleCount * 4 = 8
+      moduleCount: 2,
+      dependencyDepth: 1,
+      testCoverage: 0,
+      documentationLevel: 'none',
+      seed: 'filecount-mismatch',
+    });
+
+    await target.setup();
+    const result = await target.validate();
+
+    expect(result.valid).toBe(true);
+    expect(result.warnings).toContainEqual(
+      expect.stringContaining('fileCount config is 50'),
+    );
+  }, 15_000);
+
+  it('getGroundTruth returns a defensive copy', async () => {
+    target = new GeneratedRepoTarget({
+      fileCount: 10,
+      moduleCount: 2,
+      dependencyDepth: 1,
+      testCoverage: 0,
+      documentationLevel: 'none',
+      seed: 'defensive-copy-test',
+    });
+
+    await target.setup();
+    const manifest1 = target.getGroundTruth();
+    manifest1.name = 'mutated';
+
+    const manifest2 = target.getGroundTruth();
+    expect(manifest2.name).toBe('generated-project');
+  }, 15_000);
+
   it('teardown is idempotent', async () => {
     target = new GeneratedRepoTarget({
       fileCount: 10,

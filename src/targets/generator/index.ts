@@ -5,8 +5,9 @@
  * Same seed + config = byte-identical output.
  */
 
-import { mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdir, writeFile, rm, readdir } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simpleGit } from 'simple-git';
@@ -121,6 +122,7 @@ export class GeneratedRepoTarget implements ITestTarget {
   private workingDir: string | undefined;
   private cleanupFn: (() => Promise<void>) | undefined;
   private manifest: ArchitecturalManifest | undefined;
+  private initialCommitHash: string | undefined;
 
   constructor(config: Partial<GeneratorConfig> = {}) {
     this.config = { ...DEFAULT_GENERATOR_CONFIG, ...config };
@@ -253,6 +255,10 @@ export class GeneratedRepoTarget implements ITestTarget {
     await git.add('.');
     await git.commit('Initial commit: generated project');
 
+    // Store initial commit hash for reset()
+    const log = await git.log();
+    this.initialCommitHash = log.latest?.hash;
+
     this.cleanupFn = async () => {
       await rm(tmpDir, { recursive: true, force: true });
     };
@@ -283,6 +289,42 @@ export class GeneratedRepoTarget implements ITestTarget {
       warnings.push('Working directory has uncommitted changes');
     }
 
+    // Verify expected directory structure
+    const requiredDirs = ['src/models', 'src/repositories', 'src/services', 'src/config'];
+    for (const dir of requiredDirs) {
+      if (!existsSync(join(this.workingDir, dir))) {
+        errors.push(`Missing required directory: ${dir}`);
+      }
+    }
+
+    // Verify required files exist
+    if (!existsSync(join(this.workingDir, 'package.json'))) {
+      errors.push('Missing package.json');
+    }
+    if (!existsSync(join(this.workingDir, 'tsconfig.json'))) {
+      errors.push('Missing tsconfig.json');
+    }
+
+    // Verify source files were generated
+    const modelsDir = join(this.workingDir, 'src', 'models');
+    if (existsSync(modelsDir)) {
+      const modelFiles = await readdir(modelsDir);
+      if (modelFiles.length === 0) {
+        errors.push('No model files generated');
+      }
+    }
+
+    // Warn if fileCount doesn't match actual generated count
+    if (this.manifest) {
+      const actualFileCount = this.countGeneratedFiles();
+      if (actualFileCount !== this.config.fileCount) {
+        warnings.push(
+          `fileCount config is ${this.config.fileCount} but ${actualFileCount} files were generated ` +
+          `(driven by moduleCount=${this.config.moduleCount})`
+        );
+      }
+    }
+
     return {
       valid: errors.length === 0,
       errors,
@@ -290,11 +332,21 @@ export class GeneratedRepoTarget implements ITestTarget {
     };
   }
 
+  /**
+   * Count the actual number of generated source/test files.
+   */
+  private countGeneratedFiles(): number {
+    // Each module produces 4 files (model, repo, service, config)
+    // Tests add 2 files per covered module, plus optional README
+    // This is an approximation since test coverage is probabilistic
+    return this.config.moduleCount * 4;
+  }
+
   getGroundTruth(): ArchitecturalManifest {
     if (!this.manifest) {
       throw new Error('Target not set up. Call setup() first.');
     }
-    return this.manifest;
+    return structuredClone(this.manifest);
   }
 
   async reset(): Promise<void> {
@@ -305,6 +357,11 @@ export class GeneratedRepoTarget implements ITestTarget {
     const git = simpleGit(this.workingDir);
     await git.checkout('.');
     await git.clean('f', ['-d']);
+
+    // Reset to initial commit, discarding any agent commits
+    if (this.initialCommitHash) {
+      await git.reset(['--hard', this.initialCommitHash]);
+    }
   }
 
   async teardown(): Promise<void> {

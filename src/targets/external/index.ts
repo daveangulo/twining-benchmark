@@ -42,6 +42,7 @@ export class ExternalRepoTarget implements ITestTarget {
   private config: ExternalRepoConfig;
   private workingDir: string | undefined;
   private cleanupFn: (() => Promise<void>) | undefined;
+  private initialCommitHash: string | undefined;
 
   constructor(config: ExternalRepoConfig) {
     this.config = config;
@@ -72,15 +73,15 @@ export class ExternalRepoTarget implements ITestTarget {
     await repoGit.addConfig('user.name', 'Twining Benchmark');
     await repoGit.addConfig('commit.gpgsign', 'false');
 
-    // Run setup commands sequentially
+    // Run setup commands sequentially using shell to handle quoted args
     for (const cmd of this.config.setupCommands) {
-      const [command, ...args] = cmd.split(' ');
-      if (!command) continue;
+      if (!cmd.trim()) continue;
 
-      await execa(command, args, {
+      await execa(cmd, {
         cwd: tmpDir,
         timeout: 300_000, // 5 minute timeout per command
         stdio: 'pipe',
+        shell: true,
       });
     }
 
@@ -90,6 +91,10 @@ export class ExternalRepoTarget implements ITestTarget {
       await repoGit.add('.');
       await repoGit.commit('Benchmark baseline: post-setup state');
     }
+
+    // Store the commit hash to reset to (post-setup baseline)
+    const log = await repoGit.log();
+    this.initialCommitHash = log.latest?.hash;
 
     this.cleanupFn = async () => {
       await rm(tmpDir, { recursive: true, force: true });
@@ -138,7 +143,7 @@ export class ExternalRepoTarget implements ITestTarget {
   }
 
   getGroundTruth(): ArchitecturalManifest {
-    return this.config.manifest;
+    return structuredClone(this.config.manifest);
   }
 
   async reset(): Promise<void> {
@@ -149,6 +154,11 @@ export class ExternalRepoTarget implements ITestTarget {
     const git = simpleGit(this.workingDir);
     await git.checkout('.');
     await git.clean('f', ['-d']);
+
+    // Reset to the post-setup baseline commit, discarding any agent commits
+    if (this.initialCommitHash) {
+      await git.reset(['--hard', this.initialCommitHash]);
+    }
   }
 
   async teardown(): Promise<void> {

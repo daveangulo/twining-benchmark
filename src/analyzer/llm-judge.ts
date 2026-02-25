@@ -183,7 +183,7 @@ You MUST respond in exactly this JSON format:
 /**
  * Parse a structured evaluation response from the LLM.
  */
-function parseEvaluationResponse(response: string): {
+export function parseEvaluationResponse(response: string): {
   score: number;
   confidence: ScoreConfidence;
   justification: string;

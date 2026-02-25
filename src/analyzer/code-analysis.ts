@@ -412,7 +412,7 @@ export async function checkCompilation(
  * Parse test runner output to extract pass/fail/skip counts.
  * Supports vitest, jest, and mocha output formats.
  */
-function parseTestOutput(output: string): {
+export function parseTestOutput(output: string): {
   passed: number;
   failed: number;
   skipped: number;

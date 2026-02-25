@@ -66,7 +66,7 @@ describe('ExternalRepoTarget', () => {
     expect(target.name).toBe('external-repo');
   });
 
-  it('returns manifest from config', async () => {
+  it('returns manifest from config as a defensive copy', async () => {
     const { ExternalRepoTarget } = await import('../../../src/targets/external/index.js');
     const manifest = {
       name: 'test-repo',
@@ -84,7 +84,12 @@ describe('ExternalRepoTarget', () => {
     };
 
     const target = new ExternalRepoTarget(config);
-    expect(target.getGroundTruth()).toEqual(manifest);
+    const result = target.getGroundTruth();
+    expect(result).toEqual(manifest);
+
+    // Mutating the returned copy should not affect the original
+    result.name = 'mutated';
+    expect(target.getGroundTruth().name).toBe('test-repo');
   });
 
   it('setup rejects invalid config', async () => {

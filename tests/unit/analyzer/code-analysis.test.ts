@@ -1,34 +1,144 @@
 import { describe, it, expect } from 'vitest';
+import { parseTestOutput, detectPatterns } from '../../../src/analyzer/code-analysis.js';
+import { resolve } from 'node:path';
 
-// We test the exported functions from code-analysis that don't require
-// a full filesystem or git setup. detectPatterns requires a real tsconfig,
-// so we test the interface and parseTestOutput logic through runTestSuite.
+describe('parseTestOutput', () => {
+  describe('vitest format', () => {
+    it('parses passed only', () => {
+      const output = 'Tests  5 passed (5)';
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(5);
+      expect(result.failed).toBe(0);
+      expect(result.skipped).toBe(0);
+      expect(result.total).toBe(5);
+    });
 
-describe('code-analysis module', () => {
-  it('exports expected functions', async () => {
-    const mod = await import('../../../src/analyzer/code-analysis.js');
+    it('parses passed and failed', () => {
+      const output = 'Tests  5 passed | 2 failed (7)';
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(5);
+      expect(result.failed).toBe(2);
+      expect(result.skipped).toBe(0);
+      expect(result.total).toBe(7);
+    });
 
-    expect(typeof mod.analyzeGitChurn).toBe('function');
-    expect(typeof mod.detectPatterns).toBe('function');
-    expect(typeof mod.runTestSuite).toBe('function');
-    expect(typeof mod.checkCompilation).toBe('function');
+    it('parses passed, failed, and skipped', () => {
+      const output = 'Tests  5 passed | 2 failed | 1 skipped (8)';
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(5);
+      expect(result.failed).toBe(2);
+      expect(result.skipped).toBe(1);
+      expect(result.total).toBe(8);
+    });
+
+    it('parses from real vitest output with surrounding lines', () => {
+      const output = `
+ ✓ tests/unit/foo.test.ts (3 tests) 5ms
+ ✗ tests/unit/bar.test.ts (2 tests) 12ms
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  3 passed | 2 failed (5)
+   Start at  14:30:00
+   Duration  200ms
+`;
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(3);
+      expect(result.failed).toBe(2);
+      expect(result.total).toBe(5);
+    });
+  });
+
+  describe('jest format', () => {
+    it('parses jest summary line', () => {
+      const output = `
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       5 passed, 2 failed, 7 total
+Snapshots:   0 total
+Time:        3.456 s
+`;
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(5);
+      expect(result.failed).toBe(2);
+      expect(result.total).toBe(7);
+    });
+
+    it('parses jest with skipped tests', () => {
+      const output = 'Tests:       3 passed, 1 failed, 2 skipped, 6 total';
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(3);
+      expect(result.failed).toBe(1);
+      expect(result.skipped).toBe(2);
+      expect(result.total).toBe(6);
+    });
+  });
+
+  describe('mocha format', () => {
+    it('parses mocha passing/failing/pending', () => {
+      const output = `
+  10 passing (2s)
+  3 failing
+  1 pending
+`;
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(10);
+      expect(result.failed).toBe(3);
+      expect(result.skipped).toBe(1);
+      expect(result.total).toBe(14);
+    });
+
+    it('parses mocha passing only', () => {
+      const output = '  5 passing (500ms)';
+      const result = parseTestOutput(output);
+      expect(result.passed).toBe(5);
+      expect(result.failed).toBe(0);
+      expect(result.total).toBe(5);
+    });
+  });
+
+  describe('coverage parsing', () => {
+    it('parses "All files" coverage format', () => {
+      const output = `
+Tests  10 passed (10)
+---------|---------|----------|---------|---------|
+File     | % Stmts | % Branch | % Funcs | % Lines |
+---------|---------|----------|---------|---------|
+All files|   85.2  |    70.1  |   90.0  |   85.2  |
+---------|---------|----------|---------|---------|
+`;
+      const result = parseTestOutput(output);
+      expect(result.coveragePct).toBeCloseTo(85.2);
+    });
+
+    it('parses "Statements" coverage format', () => {
+      const output = 'Tests  5 passed (5)\nStatements : 92.5%';
+      const result = parseTestOutput(output);
+      expect(result.coveragePct).toBeCloseTo(92.5);
+    });
+  });
+
+  describe('edge cases', () => {
+    it('returns zeros for unrecognized output', () => {
+      const result = parseTestOutput('Build succeeded with no warnings');
+      expect(result.passed).toBe(0);
+      expect(result.failed).toBe(0);
+      expect(result.total).toBe(0);
+      expect(result.coveragePct).toBeUndefined();
+    });
+
+    it('returns zeros for empty string', () => {
+      const result = parseTestOutput('');
+      expect(result.total).toBe(0);
+    });
   });
 });
 
 describe('detectPatterns', () => {
-  // detectPatterns requires a real tsconfig and project files.
-  // We test it against the synthetic repo fixtures.
-
-  it('detects patterns in the synthetic repo fixtures', async () => {
-    const { detectPatterns } = await import('../../../src/analyzer/code-analysis.js');
-    const { resolve } = await import('node:path');
-
+  it('detects patterns in the synthetic repo fixtures', () => {
     const fixturesPath = resolve(
       import.meta.dirname ?? '.',
       '../../../src/targets/synthetic-repo/fixtures',
     );
 
-    // The synthetic repo should have repository pattern and event emitter
     const patterns = detectPatterns(fixturesPath);
 
     expect(patterns.length).toBeGreaterThan(0);
@@ -36,7 +146,6 @@ describe('detectPatterns', () => {
     const patternNames = patterns.map(p => p.patternName);
     expect(patternNames).toContain('repository-pattern');
 
-    // Each pattern should have files and evidence
     for (const p of patterns) {
       expect(p.files.length).toBeGreaterThan(0);
       expect(p.evidence.length).toBeGreaterThan(0);
@@ -44,26 +153,4 @@ describe('detectPatterns', () => {
       expect(p.confidence).toBeLessThanOrEqual(1);
     }
   }, 30_000);
-});
-
-describe('test output parsing', () => {
-  // Since parseTestOutput is not exported, we verify the test result
-  // structure is correct by checking the interface
-  it('TestSuiteResults has expected shape', async () => {
-    const { runTestSuite } = await import('../../../src/analyzer/code-analysis.js');
-
-    // We can test the function exists and returns the right type
-    // when given a non-existent path (it should handle errors gracefully)
-    const result = await runTestSuite('/nonexistent/path');
-
-    expect(result).toHaveProperty('passed');
-    expect(result).toHaveProperty('failed');
-    expect(result).toHaveProperty('skipped');
-    expect(result).toHaveProperty('total');
-    expect(result).toHaveProperty('compiles');
-    expect(result).toHaveProperty('compilationErrors');
-    expect(typeof result.passed).toBe('number');
-    expect(typeof result.failed).toBe('number');
-    expect(typeof result.compiles).toBe('boolean');
-  });
 });

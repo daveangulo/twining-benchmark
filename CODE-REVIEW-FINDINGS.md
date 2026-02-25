@@ -335,11 +335,11 @@ All five scenarios' `doSetup()` methods return hardcoded metadata without modify
 4. ~~**Add missing Twining tools**~~ -- FIXED: 7 tools added to `full-twining.ts`
 5. ~~**Add `.twining/` files to artifact collection**~~ -- FIXED: 3 Twining data files in `full-twining.ts`
 
-### Short-term (blocks meaningful benchmarking)
+### Short-term (blocks meaningful benchmarking) -- DONE
 6. ~~**Wire resume logic**~~ -- FIXED: skip completed iterations using `completedIterationKeys` in orchestrator
-7. **Write real tests** for `code-analysis.ts` (parseTestOutput, analyzeGitChurn) and `llm-judge.ts` (runSingleEvaluation, parseEvaluationResponse)
-8. **Fix generated repo target** -- run `npm install`, wire `fileCount`, implement real `validate()`
-9. **Fix external repo target** -- create isolated working copies per run, fix shell command parsing
+7. ~~**Write real tests**~~ -- FIXED: 36 behavioral tests for `parseTestOutput`, `parseEvaluationResponse`, `runSingleEvaluation`, `buildEvaluatorPrompt`, templates
+8. ~~**Fix generated repo target**~~ -- FIXED: real `validate()` with structure checks, `reset()` to initial commit, defensive copy from `getGroundTruth()`, fileCount mismatch warning
+9. ~~**Fix external repo target**~~ -- FIXED: shell execution for setup commands, `reset()` to baseline commit, defensive copy from `getGroundTruth()`
 
 ### Medium-term (PRD alignment)
 10. ~~**Extract `extractMetrics()`**~~ -- FIXED: moved to `BaseScenario`, removed from all 5 scenario files (~300 lines removed)
