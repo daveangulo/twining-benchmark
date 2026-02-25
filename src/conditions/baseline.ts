@@ -1,4 +1,4 @@
-import { readdir, unlink } from 'node:fs/promises';
+import { rm, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
@@ -25,13 +25,10 @@ export class BaselineCondition extends BaseCondition {
       // File doesn't exist — that's fine
     }
 
-    // Also strip any .claude directory
+    // Also strip any .claude directory (may contain subdirectories)
     const claudeDir = join(workingDir, '.claude');
     try {
-      const entries = await readdir(claudeDir);
-      for (const entry of entries) {
-        await unlink(join(claudeDir, entry));
-      }
+      await rm(claudeDir, { recursive: true, force: true });
     } catch {
       // Directory doesn't exist — that's fine
     }

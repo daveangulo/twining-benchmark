@@ -220,7 +220,9 @@ describe('RefactoringHandoffScenario', () => {
 
       const results = await scenario.execute(mockRunner);
 
-      expect(results.transcripts).toHaveLength(1); // Only the successful one
+      expect(results.transcripts).toHaveLength(2); // Includes error placeholder to keep indexes aligned
+      expect(results.transcripts[0]!.exitReason).toBe('error'); // First task threw
+      expect(results.transcripts[1]!.exitReason).toBe('completed'); // Second succeeded
       expect(results.allSessionsCompleted).toBe(false);
       expect(results.errors).toHaveLength(1);
       expect(results.errors[0]).toContain('Agent crashed');

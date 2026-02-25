@@ -1,7 +1,7 @@
 import {
   mean as ssMean,
   median as ssMedian,
-  standardDeviation as ssStdDev,
+  sampleStandardDeviation as ssStdDev,
   min as ssMin,
   max as ssMax,
 } from 'simple-statistics';

@@ -40,15 +40,15 @@ describe('BaselineCondition', () => {
     expect(ctx.setupFiles).toEqual([]);
   });
 
-  it('strips .claude directory contents', async () => {
+  it('removes .claude directory entirely', async () => {
     const claudeDir = join(workDir, '.claude');
     await mkdir(claudeDir, { recursive: true });
     await writeFile(join(claudeDir, 'settings.json'), '{}', 'utf-8');
 
     await condition.setup(workDir);
 
-    const entries = await readdir(claudeDir);
-    expect(entries).toEqual([]);
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(claudeDir)).toBe(false);
   });
 
   it('returns agent config with no MCP servers and no system prompt', async () => {

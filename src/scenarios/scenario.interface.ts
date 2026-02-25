@@ -153,6 +153,27 @@ export abstract class BaseScenario implements Scenario {
         allCompleted = false;
         const message = err instanceof Error ? err.message : String(err);
         errors.push(`Task ${task.sequenceOrder} failed: ${message}`);
+
+        // Push a placeholder transcript so indexes stay aligned with tasks
+        transcripts.push({
+          sessionId: `error-${task.sequenceOrder}`,
+          runId: '',
+          scenario: this.context.metadata.name,
+          condition: '',
+          taskIndex: task.sequenceOrder,
+          prompt: task.prompt,
+          toolCalls: [],
+          fileChanges: [],
+          tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0, costUsd: 0 },
+          timing: { startTime: new Date().toISOString(), endTime: new Date().toISOString(), durationMs: 0, timeToFirstActionMs: 0 },
+          exitReason: 'error',
+          error: message,
+          numTurns: 0,
+          stopReason: null,
+          contextWindowSize: 0,
+          compactionCount: 0,
+          turnUsage: [],
+        });
       }
     }
 

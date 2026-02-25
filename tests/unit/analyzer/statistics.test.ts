@@ -11,7 +11,7 @@ import {
 describe('computeSummary', () => {
   it('computes correct statistics for a known dataset', () => {
     // Dataset: [2, 4, 4, 4, 5, 5, 7, 9]
-    // mean = 5, median = 4.5, stddev ≈ 2.0
+    // mean = 5, median = 4.5, sample stddev ≈ 2.138
     const values = [2, 4, 4, 4, 5, 5, 7, 9];
     const summary = computeSummary(values);
 
@@ -20,7 +20,7 @@ describe('computeSummary', () => {
     expect(summary.min).toBe(2);
     expect(summary.max).toBe(9);
     expect(summary.n).toBe(8);
-    expect(summary.standardDeviation).toBeCloseTo(2.0, 1);
+    expect(summary.standardDeviation).toBeCloseTo(2.138, 1);
   });
 
   it('computes correct 95% confidence interval', () => {
@@ -178,14 +178,14 @@ describe('cohensD', () => {
   });
 
   it('computes correct effect size for known example', () => {
-    // Group A: [8, 10, 12] → mean=10, pop_sd=√(8/3)≈1.633
-    // Group B: [5, 7, 9]   → mean=7,  pop_sd=√(8/3)≈1.633
-    // Pooled sd (using pop_sd): √((2×2.667 + 2×2.667) / 4) ≈ 1.633
-    // d = (10-7)/1.633 ≈ 1.837
+    // Group A: [8, 10, 12] → mean=10, sample_sd=2.0
+    // Group B: [5, 7, 9]   → mean=7,  sample_sd=2.0
+    // Pooled sd (using sample_sd): √((2×4 + 2×4) / 4) = 2.0
+    // d = (10-7)/2.0 = 1.5
     const a = [8, 10, 12];
     const b = [5, 7, 9];
     const d = cohensD(a, b);
-    expect(d).toBeCloseTo(1.837, 1);
+    expect(d).toBeCloseTo(1.5, 1);
   });
 
   it('returns negative d when B > A', () => {

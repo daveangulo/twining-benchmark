@@ -87,7 +87,14 @@ export class FullTwiningCondition extends BaseCondition {
         'mcp__twining__twining_graph_query',
         'mcp__twining__twining_verify',
         'mcp__twining__twining_status',
+        'mcp__twining__twining_archive',
         'mcp__twining__twining_export',
+        // Agent coordination tools
+        'mcp__twining__twining_agents',
+        'mcp__twining__twining_discover',
+        'mcp__twining__twining_delegate',
+        'mcp__twining__twining_handoff',
+        'mcp__twining__twining_acknowledge',
       ],
       permissionMode: 'acceptEdits',
     };
@@ -106,7 +113,12 @@ export class FullTwiningCondition extends BaseCondition {
   }
 
   protected override getCoordinationFilePaths(): string[] {
-    return ['CLAUDE.md'];
+    return [
+      'CLAUDE.md',
+      '.twining/blackboard.jsonl',
+      '.twining/decisions.jsonl',
+      '.twining/graph.json',
+    ];
   }
 
   private generateClaudeMdWithTwining(): string {
