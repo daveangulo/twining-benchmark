@@ -4,11 +4,11 @@ A CLI-driven benchmark execution engine that quantitatively compares multi-agent
 
 The harness runs controlled experiments where multiple Claude agents collaborate on a shared codebase under different coordination conditions (no coordination, CLAUDE.md only, shared markdown, file-based reload, structured frameworks, full Twining MCP), then scores the results using automated analysis and statistical comparison.
 
-## Current Status: Phase 1 (End-to-End CLI Execution)
+## Current Status: Phase 2 Complete (Scenarios, Scoring & KPI Reporting)
 
-Phase 0 (concept validation) is complete with a GREEN go/no-go verdict. Phase 1 wires the CLI `run` command for end-to-end execution: the orchestrator now calls `scenario.score()` after each iteration, persists structured results via `ResultsStore`, and uses the real `SyntheticRepoTarget` instead of a placeholder.
+Phase 0 (concept validation) and Phase 1 (end-to-end CLI execution) are complete. Phase 2 adds all 5 benchmark scenarios with full scoring, paired statistical tests, a programmatic repo generator, external repo adapter, and the complete KPI summary display (Section 9.3 template with verdict, confidence, ranking tables, and significance indicators).
 
-Phase 0's standalone runner (`phase0-runner.ts`) remains available for quick validation. The CLI `twining-bench run` is the primary entry point going forward.
+The CLI `twining-bench run` is the primary entry point. Phase 0's standalone runner (`phase0-runner.ts`) remains available for quick validation.
 
 ## Quick Start
 
@@ -30,16 +30,42 @@ npm install
 
 ```bash
 # Run a single scenario/condition pair
-npx twining-bench run --scenario refactor --condition baseline --runs 1
+npx twining-bench run --scenario refactoring-handoff --condition baseline --runs 1
+
+# Run all scenarios against all conditions
+npx twining-bench run --scenario all --condition all --runs 3
 
 # Dry run — validate config and estimate cost without executing
-npx twining-bench run --scenario refactor --condition all --runs 3 --dry-run
+npx twining-bench run --scenario all --condition all --runs 3 --dry-run
 
 # Set a budget ceiling (default: $100)
-npx twining-bench run --scenario refactor --condition all --runs 3 --budget 50
+npx twining-bench run --scenario all --condition all --runs 3 --budget 50
+
+# Use a generated repo target (deterministic from seed)
+npx twining-bench run --scenario scale-stress-test --condition baseline \
+  --target-type generated --generator-config ./my-generator.json --runs 1
+
+# Use an external repo target
+npx twining-bench run --scenario refactoring-handoff --condition all \
+  --target-type external --external-config ./my-repo.json --runs 3
 ```
 
 Results are written to `benchmark-results/<run-id>/` with structured subdirectories for metadata, scores, transcripts, and artifacts.
+
+### View Results
+
+```bash
+# Show full KPI summary for the latest run (Section 9.3 template)
+npx twining-bench results show latest
+
+# Show results for a specific run
+npx twining-bench results show <run-id>
+
+# Compare two runs side-by-side with significance testing
+npx twining-bench results compare <run-id-1> <run-id-2>
+```
+
+The results display includes a VERDICT (whether Twining helps), CONFIDENCE level, condition ranking table with significance indicators, pairwise comparisons, and auto-generated key findings.
 
 ### Run Phase 0 (Standalone)
 
@@ -89,45 +115,60 @@ Each benchmark run executes this sequence:
 2. **Condition Setup** -- Coordination artifacts are injected per condition (e.g., CLAUDE.md files, Twining MCP server, structured framework files)
 3. **Agent Execution** -- Claude agents execute tasks sequentially via the [Claude Agent SDK](https://docs.anthropic.com/en/docs/agents-and-tools/claude-code/sdk), with per-condition tool/MCP configuration
 4. **Data Collection** -- Git diffs, token usage, timing, and tool call transcripts are captured per session
-5. **Scoring** -- Automated analysis scores consistency, rework, completion, and produces a composite score
+5. **Scoring** -- LLM-as-judge and automated analysis score consistency, integration, redundancy, and coherence into a Coordination Effectiveness Score (CES)
 6. **Teardown** -- Temp directories and MCP servers are cleaned up
 
-### The Scenario: Refactoring Handoff
+### Scenarios
 
-The Phase 0 scenario tests a common multi-agent pattern:
+The harness includes 5 scenarios testing different multi-agent coordination challenges:
 
-- **Agent A** (refactorer): Extracts an `IUserRepository` interface from the UserService, implementing the repository pattern
-- **Agent B** (extender): Adds a caching layer to user data access, building on Agent A's architecture
-
-The key question: does Agent B discover and respect Agent A's decisions? Or does it introduce conflicting patterns?
+| Scenario | Agents | What It Tests |
+|----------|--------|---------------|
+| `refactoring-handoff` | 2 | Agent A refactors, Agent B extends. Does B respect A's architecture? |
+| `architecture-cascade` | 3 | A chain of 3 agents propagating architectural decisions downstream. |
+| `bug-investigation` | 2 | Agent A investigates planted bugs, Agent B fixes them from A's findings. |
+| `multi-session-build` | 5 | Five sequential agents building a feature end-to-end. |
+| `scale-stress-test` | 2-10 | Parameterized stress test with configurable scale factor (1-5). |
 
 ### Scoring Dimensions
 
+Each scenario scores 4 dimensions using automated analysis and LLM-as-judge evaluation:
+
 | Dimension | What It Measures | Method |
 |-----------|-----------------|--------|
-| **Consistency** (0-100) | Does Agent B align with Agent A's architectural choices? | Automated pattern detection + heuristics |
-| **Rework** (0-100) | How much of Agent A's code did Agent B revert or rewrite? | Git churn analysis (inverse of reverts) |
-| **Completion** (0-100) | Did both agents complete their assigned tasks? | Exit status + file change detection |
-| **Composite** (0-100) | Weighted aggregate of all dimensions | `0.35 * consistency + 0.25 * rework + 0.40 * completion` |
+| **Consistency** (0-100) | Do agents align with each other's architectural choices? | LLM-judge evaluation |
+| **Integration** (0-100) | Does the combined output compile, pass tests, and integrate? | Automated (tsc, test runner, git) |
+| **Redundancy** (0-100, inverse) | How much redundant or duplicated work occurred? | LLM-judge evaluation |
+| **Coherence** (0-100) | Is the final codebase architecturally coherent? | LLM-judge evaluation |
+
+These are combined into a **Coordination Effectiveness Score (CES)** using the PRD formula:
+
+```
+CES = 0.25*Consistency + 0.30*Integration + 0.20*Redundancy + 0.15*Coherence - 0.10*OverheadPenalty
+```
+
+The overhead penalty kicks in when coordination overhead exceeds 10% of total work: `max(0, (ratio - 0.10)) * 200`.
 
 Additional metrics captured per run: input/output/cache-read/cache-creation token breakdown, SDK-reported cost, wall time, turn count, compaction count, context utilization, lines added/removed, files changed, test pass/fail counts, compilation status.
 
 ### The Conditions
 
-Phase 0 tests three conditions. The full harness defines six.
+All 6 coordination conditions are implemented and runnable:
 
-| Condition | Available to Agents | Phase 0 |
-|-----------|-------------------|---------|
-| `baseline` | Codebase only. No coordination files, no shared state. | Yes |
-| `claude-md-only` | Codebase + CLAUDE.md with project conventions and instructions. | Yes |
-| `shared-markdown` | CLAUDE.md + shared COORDINATION.md for freeform agent notes. | No |
-| `file-reload-generic` | Simulates `/clear` + CONTEXT.md reload. Zero conversation history. | No |
-| `file-reload-structured` | GSD/BMAD-style framework: role files, STATE.md, PLAN.md, decisions.md, handoff.md. | No |
-| `full-twining` | Full Twining MCP server: blackboard, decisions, knowledge graph, semantic search. | Yes |
+| Condition | Available to Agents |
+|-----------|-------------------|
+| `baseline` | Codebase only. No coordination files, no shared state. |
+| `claude-md-only` | Codebase + CLAUDE.md with project conventions and instructions. |
+| `shared-markdown` | CLAUDE.md + shared COORDINATION.md for freeform agent notes. |
+| `file-reload-generic` | Simulates `/clear` + CONTEXT.md reload. Zero conversation history. |
+| `file-reload-structured` | GSD/BMAD-style framework: role files, STATE.md, PLAN.md, decisions.md, handoff.md. |
+| `full-twining` | Full Twining MCP server: blackboard, decisions, knowledge graph, semantic search. |
 
-### The Test Target: TaskFlow Pro
+### Test Targets
 
-A 28-file TypeScript project with a 3-layer architecture:
+Three target types are available:
+
+**Synthetic (default): TaskFlow Pro** -- A 28-file TypeScript project with a 3-layer architecture:
 
 - **Repository layer**: `BaseRepository` -> `UserRepository` / `OrderRepository` -> `Database`
 - **Event system**: `EventBus` with typed events, `NotificationService` as listener
@@ -135,23 +176,41 @@ A 28-file TypeScript project with a 3-layer architecture:
 - **Two architectural decisions** agents must discover: repository pattern for data access, event-driven notifications
 - 70 passing tests in the fixture project
 
+**Generated (`--target-type generated`)** -- Deterministic repo generator controlled by a config file:
+
+- `fileCount` (10-100), `moduleCount` (2-10), `dependencyDepth` (1-5)
+- `testCoverage` (0-100%), `documentationLevel` (none/minimal/thorough)
+- `seed` for reproducibility -- same seed produces byte-identical output
+- Generates a module DAG with services, repositories, models, configs, and tests
+- Returns an `ArchitecturalManifest` documenting embedded decisions for ground-truth scoring
+
+**External (`--target-type external`)** -- Adapter for real-world repositories:
+
+- Clones a git repo, runs setup commands, creates an isolated working copy
+- Ground truth provided via a user-supplied manifest in the config file
+- Each run gets a fresh clone for isolation
+
 ## Statistical Analysis
 
-The analysis pipeline (`phase0-analyze.ts`) computes:
+The analysis pipeline computes:
 
 - **Per-condition summaries**: Mean, median, standard deviation, min/max, 95% confidence interval for every metric
 - **Pairwise effect sizes**: Cohen's d between every pair of conditions, with interpretation (small/medium/large)
-- **Significance testing**: Mann-Whitney U test (non-parametric, appropriate for small sample sizes) with p-values
+- **Significance testing**: Mann-Whitney U (unpaired), paired t-test, and Wilcoxon signed-rank test
+- **Pairwise comparisons**: Every condition pair compared with effect size, p-value, and significance indicator
 - **Variance flagging**: Metrics where standard deviation exceeds 20% of the mean are flagged as high-variance
-- **Go/No-Go recommendation**: Automated assessment based on effect size and significance thresholds
+- **Efficacy score**: Quantifies Twining's advantage over the best non-Twining condition
+- **Auto-generated key findings**: Extracted from pairwise comparisons and ranking data
 
-### Go/No-Go Criteria
+### Significance Indicators
 
-| Signal | Criteria | Action |
-|--------|----------|--------|
-| **GREEN** | Large effect (d > 0.8) + significant (p < 0.05), or medium effect (d > 0.5) + suggestive (p < 0.10) | Proceed to Phase 1 |
-| **YELLOW** | Medium effect but not significant, or insufficient runs, or high variance | Increase runs or adjust scenario difficulty |
-| **RED** | No detectable effect (d < 0.5) on any primary KPI | Reassess methodology or Twining's approach |
+Results display uses color-coded significance levels:
+
+| Indicator | Meaning |
+|-----------|---------|
+| Green | p < 0.05 (statistically significant) |
+| Yellow | p < 0.10 (suggestive) |
+| Red | p >= 0.10 (not significant) |
 
 ### Cost Tracking
 
@@ -172,9 +231,16 @@ twining-benchmark-harness/
 │   │   └── error-handler.ts          # Failure classification & retry logic
 │   ├── targets/
 │   │   ├── target.interface.ts       # ITestTarget contract
-│   │   └── synthetic-repo/
-│   │       ├── index.ts              # SyntheticRepoTarget (TaskFlow Pro)
-│   │       └── fixtures/             # The pre-built test project files
+│   │   ├── synthetic-repo/
+│   │   │   ├── index.ts              # SyntheticRepoTarget (TaskFlow Pro)
+│   │   │   └── fixtures/             # The pre-built test project files
+│   │   ├── generator/
+│   │   │   ├── index.ts              # GeneratedRepoTarget (deterministic from seed)
+│   │   │   ├── rng.ts                # Seeded PRNG (mulberry32)
+│   │   │   ├── templates.ts          # Code generation templates
+│   │   │   └── manifest-builder.ts   # ArchitecturalManifest builder
+│   │   └── external/
+│   │       └── index.ts              # ExternalRepoTarget (git clone adapter)
 │   ├── conditions/
 │   │   ├── condition.interface.ts    # BaseCondition abstract class
 │   │   ├── registry.ts              # Condition registry & resolver
@@ -203,14 +269,14 @@ twining-benchmark-harness/
 │   │   └── exporter.ts             # Markdown & CSV export
 │   ├── cli/
 │   │   ├── index.ts                # Commander.js CLI entry point
-│   │   ├── commands/               # run, scenarios, conditions, results, dashboard, init, clean
+│   │   ├── commands/               # run, scenarios, conditions, results, export, dashboard, init, clean
 │   │   └── utils/
 │   │       ├── logger.ts           # Structured logger
 │   │       └── progress.ts         # Progress display
 │   └── types/                      # All TypeScript interfaces
 ├── tests/
-│   ├── unit/                        # 360 unit tests across 25 files
-│   └── integration/                 # End-to-end integration tests
+│   ├── unit/                        # 32 test files
+│   └── integration/                 # 2 integration test files
 ├── benchmark-results/              # Default output directory
 ├── twining-bench.config.ts         # Default configuration
 ├── tsconfig.json
@@ -370,27 +436,34 @@ export interface ITestTarget {
 | AST Analysis | ts-morph | Pattern detection in TypeScript code |
 | Git Operations | simple-git | Diffs, churn analysis, repo management |
 | Process Management | execa | Child process execution (test runners, builds) |
-| Testing | Vitest | 361 tests (unit + integration) |
+| Testing | Vitest | 466 tests across 34 files |
 | Dashboard (planned) | React + Vite + Recharts | Web-based results visualization |
 
 ## Development
 
 ```bash
-npm test              # Run all 361 tests
+npm test              # Run all 466 tests
 npm run test:watch    # Watch mode
 npm run lint          # Type-check
 npm run build         # Compile to dist/
 ```
 
+### Verifying Everything Works
+
+The Phase 2 exit criterion integration test exercises the full pipeline:
+
+```bash
+npx vitest run tests/integration/phase2-exit-criterion.test.ts
+```
+
+It verifies all 5 scenarios and 6 conditions resolve, CES calculation matches the PRD formula, the KPI template renders correctly, paired statistical tests work, and all target types can be instantiated.
+
 ## Roadmap
 
-Phase 0 is complete (GREEN verdict). Phase 1 core wiring is done.
-
 - **Phase 0**: Concept validation -- **Complete** (9 runs, GREEN go/no-go)
-- **Phase 1**: End-to-end CLI execution -- **In progress** (scoring + results store wired; remaining: all 6 conditions production-ready, budget enforcement during execution)
-- **Phase 2**: All 5 scenarios scored, LLM-as-judge evaluation framework, full statistical reporting
+- **Phase 1**: End-to-end CLI execution -- **Complete** (scoring + results store wired, all 6 conditions, budget enforcement)
+- **Phase 2**: Scenarios, scoring & KPI reporting -- **Complete** (5 scenarios, CES formula, paired stats, generated/external targets, full Section 9.3 template)
 - **Phase 3**: Web dashboard with comparison charts, trend views, and Markdown/CSV export
-- **Phase 4**: Programmatic repo generator, external repo adapter, suite resume
 
 ## License
 
