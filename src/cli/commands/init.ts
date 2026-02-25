@@ -4,6 +4,7 @@ import { Command } from 'commander';
 import { DEFAULT_CONFIG, DEFAULT_SCORE_WEIGHTS } from '../../types/config.js';
 
 const CONFIG_FILENAME = 'twining-bench.config.ts';
+const JSON_CONFIG_FILENAME = 'twining-bench.config.json';
 
 /**
  * Generate the default config file content.
@@ -76,16 +77,38 @@ export function createInitCommand(): Command {
     .description('Generate a default twining-bench.config.ts file')
     .option('--force', 'Overwrite existing config file')
     .action(async (opts: { force?: boolean }) => {
-      if (existsSync(CONFIG_FILENAME) && !opts.force) {
-        console.log(`  ${CONFIG_FILENAME} already exists. Use --force to overwrite.`);
+      if (existsSync(JSON_CONFIG_FILENAME) && !opts.force) {
+        console.log(`  ${JSON_CONFIG_FILENAME} already exists. Use --force to overwrite.`);
         return;
       }
 
+      // Write the JSON config (used at runtime by the run command)
+      const jsonConfig = {
+        targetPath: DEFAULT_CONFIG.targetPath,
+        defaultRuns: DEFAULT_CONFIG.defaultRuns,
+        scenarioDirectories: [] as string[],
+        agentTimeoutMs: DEFAULT_CONFIG.agentTimeoutMs,
+        tokenBudgetPerRun: DEFAULT_CONFIG.tokenBudgetPerRun,
+        budgetDollars: DEFAULT_CONFIG.budgetDollars,
+        outputDirectory: DEFAULT_CONFIG.outputDirectory,
+        maxTurns: DEFAULT_CONFIG.maxTurns,
+        retryCount: DEFAULT_CONFIG.retryCount,
+        dashboardPort: DEFAULT_CONFIG.dashboardPort,
+        evaluatorModel: DEFAULT_CONFIG.evaluatorModel,
+      };
+      await writeFile(
+        JSON_CONFIG_FILENAME,
+        JSON.stringify(jsonConfig, null, 2) + '\n',
+        'utf-8',
+      );
+      console.log(`  Created ${JSON_CONFIG_FILENAME}`);
+
+      // Also write the TypeScript config for type-safe reference
       const content = generateConfigContent();
       await writeFile(CONFIG_FILENAME, content, 'utf-8');
-      console.log(`  Created ${CONFIG_FILENAME}`);
+      console.log(`  Created ${CONFIG_FILENAME} (type reference)`);
       console.log('');
-      console.log('  Edit this file to customize your benchmark configuration.');
+      console.log(`  Edit ${JSON_CONFIG_FILENAME} to customize your benchmark configuration.`);
       console.log('  CLI flags will override values in the config file.');
       console.log('');
     });

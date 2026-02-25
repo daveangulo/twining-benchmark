@@ -142,7 +142,10 @@ export class RunOrchestrator {
     const resumeState = this.resumeRunId
       ? await collector.loadPartialRunState(this.resumeRunId)
       : null;
-    const completedSessionIds = new Set(resumeState?.completedSessionIds ?? []);
+    const completedIterationKeys = new Set<string>(
+      (resumeState?.metadata as { completedIterationKeys?: string[] })
+        ?.completedIterationKeys ?? [],
+    );
 
     const runMetadata: RunMetadata = {
       id: runId,
@@ -181,6 +184,19 @@ export class RunOrchestrator {
           for (let iteration = 0; iteration < this.runsPerPair; iteration++) {
             const iterationKey = `${scenarioMeta.name}:${condition.name}:${iteration}`;
 
+            // Skip already-completed iterations when resuming
+            if (completedIterationKeys.has(iterationKey)) {
+              this.emitProgress({
+                type: 'iteration-complete',
+                runId,
+                scenario: scenarioMeta.name,
+                condition: condition.name,
+                iteration,
+                message: `Skipping ${iterationKey} (already completed)`,
+              });
+              continue;
+            }
+
             this.emitProgress({
               type: 'session-start',
               runId,
@@ -196,7 +212,6 @@ export class RunOrchestrator {
               condition,
               iteration,
               collector,
-              completedSessionIds,
             });
 
             iterations.push(result);
@@ -212,11 +227,13 @@ export class RunOrchestrator {
             }
 
             // Incremental save after each iteration (crash-safe)
+            completedIterationKeys.add(iterationKey);
             const allSessions = iterations.flatMap(it => it.sessions);
             await collector.savePartialRunState(runId, allSessions, {
               currentScenario: scenarioMeta.name,
               currentCondition: condition.name,
               currentIteration: iteration,
+              completedIterationKeys: [...completedIterationKeys],
             });
 
             this.emitProgress({
@@ -268,7 +285,6 @@ export class RunOrchestrator {
     condition: Condition;
     iteration: number;
     collector: DataCollector;
-    completedSessionIds: Set<string>;
   }): Promise<IterationResult> {
     const { runId, scenario, condition, iteration, collector } = params;
     const scenarioMeta = scenario.getMetadata();

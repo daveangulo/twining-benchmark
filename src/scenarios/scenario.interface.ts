@@ -22,7 +22,7 @@ import type {
 } from '../types/scenario.js';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
-import type { ScoredResults } from '../types/results.js';
+import type { ScoredResults, RunMetrics } from '../types/results.js';
 import type { AgentTranscript } from '../types/transcript.js';
 
 export type {
@@ -158,7 +158,7 @@ export abstract class BaseScenario implements Scenario {
         transcripts.push({
           sessionId: `error-${task.sequenceOrder}`,
           runId: '',
-          scenario: this.context.metadata.name,
+          scenario: this.buildMetadata().name,
           condition: '',
           taskIndex: task.sequenceOrder,
           prompt: task.prompt,
@@ -224,4 +224,71 @@ export abstract class BaseScenario implements Scenario {
 
   /** Scenario-specific cleanup. */
   protected abstract doTeardown(): Promise<void>;
+
+  /**
+   * Extract run metrics from raw results.
+   * Aggregates token usage, timing, file changes, and context utilization
+   * across all transcripts in the raw results.
+   */
+  protected extractMetrics(rawResults: RawResults): RunMetrics {
+    let totalTokens = 0;
+    let inputTokens = 0;
+    let outputTokens = 0;
+    let cacheReadTokens = 0;
+    let cacheCreationTokens = 0;
+    let costUsd = 0;
+    let wallTimeMs = 0;
+    let numTurns = 0;
+    let compactionCount = 0;
+    let linesAdded = 0;
+    let linesRemoved = 0;
+    let maxContextUtilization = 0;
+    const changedFiles = new Set<string>();
+
+    for (const transcript of rawResults.transcripts) {
+      totalTokens += transcript.tokenUsage.total;
+      inputTokens += transcript.tokenUsage.input;
+      outputTokens += transcript.tokenUsage.output;
+      cacheReadTokens += transcript.tokenUsage.cacheRead;
+      cacheCreationTokens += transcript.tokenUsage.cacheCreation;
+      costUsd += transcript.tokenUsage.costUsd;
+      wallTimeMs += transcript.timing.durationMs;
+      numTurns += transcript.numTurns;
+      compactionCount += transcript.compactionCount;
+
+      if (transcript.contextWindowSize > 0) {
+        const utilization = transcript.tokenUsage.total / transcript.contextWindowSize;
+        maxContextUtilization = Math.max(maxContextUtilization, utilization);
+      }
+
+      for (const change of transcript.fileChanges) {
+        linesAdded += change.linesAdded;
+        linesRemoved += change.linesRemoved;
+        changedFiles.add(change.path);
+      }
+    }
+
+    return {
+      totalTokens,
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      costUsd,
+      wallTimeMs,
+      agentSessions: rawResults.transcripts.length,
+      numTurns,
+      compactionCount,
+      contextUtilization: maxContextUtilization,
+      gitChurn: {
+        linesAdded,
+        linesRemoved,
+        filesChanged: changedFiles.size,
+        reverts: 0, // Calculated by deeper analysis later
+      },
+      testsPass: 0, // Filled by test runner
+      testsFail: 0, // Filled by test runner
+      compiles: rawResults.allSessionsCompleted,
+    };
+  }
 }

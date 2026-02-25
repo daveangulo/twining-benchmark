@@ -449,69 +449,7 @@ export class RefactoringHandoffScenario extends BaseScenario {
   /**
    * Extract quantitative metrics from raw results.
    */
-  private extractMetrics(rawResults: RawResults) {
-    let totalTokens = 0;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let cacheReadTokens = 0;
-    let cacheCreationTokens = 0;
-    let costUsd = 0;
-    let wallTimeMs = 0;
-    let numTurns = 0;
-    let compactionCount = 0;
-    let linesAdded = 0;
-    let linesRemoved = 0;
-    let maxContextUtilization = 0;
-
-    const changedFiles = new Set<string>();
-
-    for (const transcript of rawResults.transcripts) {
-      totalTokens += transcript.tokenUsage.total;
-      inputTokens += transcript.tokenUsage.input;
-      outputTokens += transcript.tokenUsage.output;
-      cacheReadTokens += transcript.tokenUsage.cacheRead;
-      cacheCreationTokens += transcript.tokenUsage.cacheCreation;
-      costUsd += transcript.tokenUsage.costUsd;
-      wallTimeMs += transcript.timing.durationMs;
-      numTurns += transcript.numTurns;
-      compactionCount += transcript.compactionCount;
-
-      // Context utilization: peak cumulative input / context window
-      if (transcript.contextWindowSize > 0) {
-        const utilization = transcript.tokenUsage.total / transcript.contextWindowSize;
-        maxContextUtilization = Math.max(maxContextUtilization, utilization);
-      }
-
-      for (const change of transcript.fileChanges) {
-        linesAdded += change.linesAdded;
-        linesRemoved += change.linesRemoved;
-        changedFiles.add(change.path);
-      }
-    }
-
-    return {
-      totalTokens,
-      inputTokens,
-      outputTokens,
-      cacheReadTokens,
-      cacheCreationTokens,
-      costUsd,
-      wallTimeMs,
-      agentSessions: rawResults.transcripts.length,
-      numTurns,
-      compactionCount,
-      contextUtilization: maxContextUtilization,
-      gitChurn: {
-        linesAdded,
-        linesRemoved,
-        filesChanged: changedFiles.size,
-        reverts: 0, // Calculated by deeper analysis later
-      },
-      testsPass: 0, // Filled by test runner
-      testsFail: 0, // Filled by test runner
-      compiles: rawResults.allSessionsCompleted,
-    };
-  }
+  // extractMetrics is inherited from BaseScenario
 }
 
 /**

@@ -1,4 +1,6 @@
 import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { Command } from 'commander';
 import { resolveScenarioNames, getScenario } from '../../scenarios/registry.js';
 import { resolveConditionNames, getCondition } from '../../conditions/registry.js';
@@ -14,6 +16,27 @@ import type { ITestTarget } from '../../targets/target.interface.js';
 import type { CostEstimate } from '../../types/analysis.js';
 import type { ScenarioName } from '../../types/scenario.js';
 import type { GeneratorConfig, ExternalRepoConfig } from '../../types/target.js';
+
+const CONFIG_FILENAMES = [
+  'twining-bench.config.json',
+  'twining-bench.json',
+];
+
+/**
+ * Load config from a JSON file if one exists.
+ * Returns the parsed config merged with defaults, or just defaults.
+ */
+async function loadConfigFile(): Promise<BenchmarkConfig> {
+  for (const filename of CONFIG_FILENAMES) {
+    const configPath = resolve(process.cwd(), filename);
+    if (existsSync(configPath)) {
+      const raw = await readFile(configPath, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<BenchmarkConfig>;
+      return { ...DEFAULT_CONFIG, ...parsed };
+    }
+  }
+  return { ...DEFAULT_CONFIG };
+}
 
 /**
  * Sonnet 4 pricing (from PRD resolved question #2).
@@ -168,6 +191,9 @@ export function createRunCommand(): Command {
       });
 
       try {
+        // Load config file (if any), then apply CLI overrides
+        const fileConfig = await loadConfigFile();
+
         // Resolve scenario and condition names
         const scenarioNames = resolveScenarioNames(opts.scenario);
         const conditionNames = resolveConditionNames(opts.condition);
@@ -226,9 +252,9 @@ export function createRunCommand(): Command {
           return;
         }
 
-        // Build config
+        // Build config: file defaults < config file < CLI flags
         const config: BenchmarkConfig = {
-          ...DEFAULT_CONFIG,
+          ...fileConfig,
           targetPath: opts.target,
           defaultRuns: runs,
           budgetDollars: budget,
