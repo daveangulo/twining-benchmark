@@ -1,3 +1,4 @@
+import type Anthropic from '@anthropic-ai/sdk';
 import type { ConditionContext } from './condition.js';
 import type { ScoredResults } from './results.js';
 import type { ArchitecturalManifest, WorkingDirectory } from './target.js';
@@ -101,8 +102,8 @@ export interface Scenario {
   getAgentTasks(): AgentTask[];
   /** Execute the scenario using the provided runner */
   execute(runner: ScenarioRunner): Promise<RawResults>;
-  /** Score raw results against ground truth */
-  score(rawResults: RawResults, groundTruth: ArchitecturalManifest): Promise<ScoredResults>;
+  /** Score raw results against ground truth, optionally using LLM-as-judge */
+  score(rawResults: RawResults, groundTruth: ArchitecturalManifest, evaluatorClient?: Anthropic): Promise<ScoredResults>;
   /** Clean up scenario resources */
   teardown(): Promise<void>;
 }

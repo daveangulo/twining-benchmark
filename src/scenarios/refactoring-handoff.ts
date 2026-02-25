@@ -11,11 +11,17 @@
  * - Completion (0-100): Did both agents complete their assigned tasks?
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
 import { BaseScenario } from './scenario.interface.js';
+import {
+  buildEvaluationContextFromResults,
+  runSingleEvaluation,
+  DECISION_CONSISTENCY_TEMPLATE,
+} from '../analyzer/llm-judge.js';
 
 /** Default timeout per agent session: 15 minutes */
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
@@ -236,8 +242,21 @@ export class RefactoringHandoffScenario extends BaseScenario {
   protected async doScore(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
-    const consistency = this.scoreConsistency(rawResults, groundTruth);
+    let consistency: DimensionScore;
+    if (evaluatorClient) {
+      const evalCtx = buildEvaluationContextFromResults(rawResults, groundTruth);
+      const result = await runSingleEvaluation(evaluatorClient, DECISION_CONSISTENCY_TEMPLATE, evalCtx);
+      consistency = {
+        value: result.score,
+        confidence: result.confidence,
+        method: 'llm-judge',
+        justification: result.justification,
+      };
+    } else {
+      consistency = this.scoreConsistency(rawResults, groundTruth);
+    }
     const rework = this.scoreRework(rawResults);
     const completion = this.scoreCompletion(rawResults);
 

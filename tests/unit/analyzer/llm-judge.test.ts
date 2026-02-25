@@ -4,6 +4,7 @@ import {
   parseEvaluationResponse,
   runSingleEvaluation,
   getBuiltInTemplates,
+  buildEvaluationContextFromResults,
   DECISION_CONSISTENCY_TEMPLATE,
   INTEGRATION_QUALITY_TEMPLATE,
   ARCHITECTURAL_COHERENCE_TEMPLATE,
@@ -11,6 +12,8 @@ import {
   type EvaluationContext,
 } from '../../../src/analyzer/llm-judge.js';
 import type { EvaluatorPromptTemplate } from '../../../src/types/analysis.js';
+import type { RawResults } from '../../../src/types/scenario.js';
+import type { ArchitecturalManifest } from '../../../src/types/target.js';
 
 // --- parseEvaluationResponse tests ---
 
@@ -300,5 +303,114 @@ describe('template constants', () => {
   it('REDUNDANCY_DETECTION_TEMPLATE has correct dimension', () => {
     expect(REDUNDANCY_DETECTION_TEMPLATE.dimension).toBe('redundancy');
     expect(REDUNDANCY_DETECTION_TEMPLATE.id).toBe('redundancy-detection-v1');
+  });
+});
+
+// --- buildEvaluationContextFromResults tests ---
+
+describe('buildEvaluationContextFromResults', () => {
+  const groundTruth: ArchitecturalManifest = {
+    name: 'test-scenario',
+    description: 'A test scenario for evaluation',
+    decisions: [
+      {
+        id: 'decision-1',
+        description: 'Use repository pattern',
+        affectedFiles: ['src/repo.ts'],
+        expectedPatterns: ['IRepository'],
+        antiPatterns: ['direct-db'],
+      },
+    ],
+    moduleDependencies: {},
+    baselineTestCoverage: 80,
+  };
+
+  it('extracts diffs from transcripts into codeDiffs', () => {
+    const rawResults: RawResults = {
+      transcripts: [
+        {
+          sessionId: 's1', runId: 'r1', scenario: 'test', condition: 'baseline',
+          taskIndex: 0, prompt: '', toolCalls: [],
+          fileChanges: [
+            { path: 'src/a.ts', changeType: 'modified', linesAdded: 5, linesRemoved: 1, diff: '+new line' },
+          ],
+          tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0, costUsd: 0 },
+          timing: { startTime: '', endTime: '', durationMs: 0, timeToFirstActionMs: 0 },
+          exitReason: 'completed', numTurns: 1, stopReason: null, contextWindowSize: 0, compactionCount: 0, turnUsage: [],
+        },
+      ],
+      finalWorkingDir: '/tmp/test',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+
+    const ctx = buildEvaluationContextFromResults(rawResults, groundTruth);
+
+    expect(ctx.codeDiffs).toContain('Agent Session 1');
+    expect(ctx.codeDiffs).toContain('src/a.ts');
+    expect(ctx.codeDiffs).toContain('+new line');
+  });
+
+  it('serializes ground truth into structured text', () => {
+    const rawResults: RawResults = {
+      transcripts: [],
+      finalWorkingDir: '/tmp/test',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+
+    const ctx = buildEvaluationContextFromResults(rawResults, groundTruth);
+
+    expect(ctx.groundTruth).toContain('test-scenario');
+    expect(ctx.groundTruth).toContain('decision-1');
+    expect(ctx.groundTruth).toContain('Use repository pattern');
+    expect(ctx.groundTruth).toContain('IRepository');
+  });
+
+  it('returns placeholder when no diffs are available', () => {
+    const rawResults: RawResults = {
+      transcripts: [
+        {
+          sessionId: 's1', runId: 'r1', scenario: 'test', condition: 'baseline',
+          taskIndex: 0, prompt: '', toolCalls: [],
+          fileChanges: [
+            { path: 'src/a.ts', changeType: 'modified', linesAdded: 5, linesRemoved: 1 },
+          ],
+          tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0, costUsd: 0 },
+          timing: { startTime: '', endTime: '', durationMs: 0, timeToFirstActionMs: 0 },
+          exitReason: 'completed', numTurns: 1, stopReason: null, contextWindowSize: 0, compactionCount: 0, turnUsage: [],
+        },
+      ],
+      finalWorkingDir: '/tmp/test',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+
+    const ctx = buildEvaluationContextFromResults(rawResults, groundTruth);
+    expect(ctx.codeDiffs).toBe('(no diffs available)');
+  });
+
+  it('uses provided coordination artifacts', () => {
+    const rawResults: RawResults = {
+      transcripts: [],
+      finalWorkingDir: '/tmp/test',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+
+    const ctx = buildEvaluationContextFromResults(rawResults, groundTruth, 'Decision: use event bus');
+    expect(ctx.coordinationArtifacts).toBe('Decision: use event bus');
+  });
+
+  it('uses placeholder when no coordination artifacts provided', () => {
+    const rawResults: RawResults = {
+      transcripts: [],
+      finalWorkingDir: '/tmp/test',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+
+    const ctx = buildEvaluationContextFromResults(rawResults, groundTruth);
+    expect(ctx.coordinationArtifacts).toBe('(no coordination artifacts)');
   });
 });

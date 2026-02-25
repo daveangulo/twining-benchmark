@@ -6,6 +6,8 @@ import type {
   EvaluatorRubric,
 } from '../types/analysis.js';
 import type { ScoreConfidence } from '../types/results.js';
+import type { RawResults } from '../types/scenario.js';
+import type { ArchitecturalManifest } from '../types/target.js';
 
 /**
  * Context provided to the evaluator for each scoring judgment.
@@ -402,4 +404,47 @@ export function getBuiltInTemplates(): EvaluatorPromptTemplate[] {
     ARCHITECTURAL_COHERENCE_TEMPLATE,
     REDUNDANCY_DETECTION_TEMPLATE,
   ];
+}
+
+/**
+ * Build an EvaluationContext from RawResults and ground truth.
+ *
+ * Extracts code diffs from all agent transcripts and serializes the ground
+ * truth manifest and any coordination artifacts into a context object
+ * suitable for LLM-as-judge evaluation.
+ */
+export function buildEvaluationContextFromResults(
+  rawResults: RawResults,
+  groundTruth: ArchitecturalManifest,
+  coordinationArtifacts?: string,
+): EvaluationContext {
+  // Collect all diffs across transcripts
+  const codeDiffs = rawResults.transcripts
+    .map((t, i) => {
+      const diffs = t.fileChanges
+        .filter((fc) => fc.diff)
+        .map((fc) => `--- ${fc.path}\n${fc.diff}`)
+        .join('\n\n');
+      return diffs ? `## Agent Session ${i + 1}\n${diffs}` : '';
+    })
+    .filter(Boolean)
+    .join('\n\n');
+
+  // Serialize ground truth as structured text
+  const groundTruthText = [
+    `# ${groundTruth.name}`,
+    groundTruth.description,
+    '',
+    '## Decisions',
+    ...groundTruth.decisions.map(
+      (d) =>
+        `- **${d.id}**: ${d.description}\n  Expected: ${d.expectedPatterns.join(', ')}`,
+    ),
+  ].join('\n');
+
+  return {
+    groundTruth: groundTruthText,
+    codeDiffs: codeDiffs || '(no diffs available)',
+    coordinationArtifacts: coordinationArtifacts ?? '(no coordination artifacts)',
+  };
 }

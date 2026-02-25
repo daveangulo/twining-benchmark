@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
+import Anthropic from '@anthropic-ai/sdk';
 import type {
   BenchmarkConfig,
   RunMetadata,
@@ -113,6 +114,7 @@ export class RunOrchestrator {
   private readonly resumeRunId?: string;
   private readonly resultsStore?: ResultsStore;
   private readonly onProgress?: (update: ProgressUpdate) => void;
+  private evaluatorClient?: Anthropic;
 
   constructor(options: OrchestratorOptions) {
     this.config = options.config;
@@ -124,6 +126,17 @@ export class RunOrchestrator {
     this.resumeRunId = options.resumeRunId;
     this.resultsStore = options.resultsStore;
     this.onProgress = options.onProgress;
+  }
+
+  /**
+   * Get or lazily create the Anthropic client for LLM-as-judge evaluations.
+   * Returns undefined if ANTHROPIC_API_KEY is not set.
+   */
+  private getEvaluatorClient(): Anthropic | undefined {
+    if (this.evaluatorClient) return this.evaluatorClient;
+    if (!process.env['ANTHROPIC_API_KEY']) return undefined;
+    this.evaluatorClient = new Anthropic();
+    return this.evaluatorClient;
   }
 
   /**
@@ -407,7 +420,7 @@ export class RunOrchestrator {
             errors,
           };
           const groundTruth = this.target.getGroundTruth();
-          scoredResults = await scenario.score(rawResults, groundTruth);
+          scoredResults = await scenario.score(rawResults, groundTruth, this.getEvaluatorClient());
           scoredResults.runId = runId;
           scoredResults.condition = condition.name;
           scoredResults.iteration = iteration;

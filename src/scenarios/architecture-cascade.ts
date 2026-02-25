@@ -20,11 +20,17 @@
  * - Decision Quality (0-100): Was A's decision well-reasoned?
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
 import { BaseScenario } from './scenario.interface.js';
+import {
+  buildEvaluationContextFromResults,
+  runSingleEvaluation,
+  DECISION_CONSISTENCY_TEMPLATE,
+} from '../analyzer/llm-judge.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 50;
@@ -300,10 +306,23 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   protected async doScore(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
     const decisionPropagation = this.scoreDecisionPropagation(rawResults, groundTruth);
     const patternConsistency = this.scorePatternConsistency(rawResults);
-    const decisionQuality = this.scoreDecisionQuality(rawResults, groundTruth);
+    let decisionQuality: DimensionScore;
+    if (evaluatorClient) {
+      const evalCtx = buildEvaluationContextFromResults(rawResults, groundTruth);
+      const result = await runSingleEvaluation(evaluatorClient, DECISION_CONSISTENCY_TEMPLATE, evalCtx);
+      decisionQuality = {
+        value: result.score,
+        confidence: result.confidence,
+        method: 'llm-judge',
+        justification: result.justification,
+      };
+    } else {
+      decisionQuality = this.scoreDecisionQuality(rawResults, groundTruth);
+    }
 
     const scores: Record<string, DimensionScore> = {
       decisionPropagation,

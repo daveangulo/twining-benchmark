@@ -12,6 +12,7 @@
  * 5. `teardown()` — Clean up resources
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type {
   Scenario,
   ScenarioMetadata,
@@ -188,8 +189,9 @@ export abstract class BaseScenario implements Scenario {
   async score(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
-    return this.doScore(rawResults, groundTruth);
+    return this.doScore(rawResults, groundTruth, evaluatorClient);
   }
 
   async teardown(): Promise<void> {
@@ -216,10 +218,11 @@ export abstract class BaseScenario implements Scenario {
     condition: ConditionContext,
   ): Promise<Record<string, unknown>>;
 
-  /** Score raw results against ground truth. */
+  /** Score raw results against ground truth, optionally using LLM-as-judge. */
   protected abstract doScore(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults>;
 
   /** Scenario-specific cleanup. */

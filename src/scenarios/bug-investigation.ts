@@ -17,11 +17,17 @@
  * - Time-to-Resolution (seconds): Wall clock time from B's start to fix commit.
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
 import { BaseScenario } from './scenario.interface.js';
+import {
+  buildEvaluationContextFromResults,
+  runSingleEvaluation,
+  INTEGRATION_QUALITY_TEMPLATE,
+} from '../analyzer/llm-judge.js';
 
 /** Agent A timeout: 5 minutes (hard cutoff mid-investigation) */
 const AGENT_A_TIMEOUT_MS = 5 * 60 * 1000;
@@ -231,10 +237,23 @@ export class BugInvestigationScenario extends BaseScenario {
   protected async doScore(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
     const contextRecovery = this.scoreContextRecovery(rawResults);
     const redundantInvestigation = this.scoreRedundantInvestigation(rawResults);
-    const resolution = this.scoreResolution(rawResults, groundTruth);
+    let resolution: DimensionScore;
+    if (evaluatorClient) {
+      const evalCtx = buildEvaluationContextFromResults(rawResults, groundTruth);
+      const result = await runSingleEvaluation(evaluatorClient, INTEGRATION_QUALITY_TEMPLATE, evalCtx);
+      resolution = {
+        value: result.score,
+        confidence: result.confidence,
+        method: 'llm-judge',
+        justification: result.justification,
+      };
+    } else {
+      resolution = this.scoreResolution(rawResults, groundTruth);
+    }
     const timeToResolution = this.scoreTimeToResolution(rawResults);
 
     const scores: Record<string, DimensionScore> = {

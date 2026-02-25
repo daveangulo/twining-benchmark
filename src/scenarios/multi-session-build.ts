@@ -19,11 +19,17 @@
  * - Total Wall Time (seconds): Sum of session durations.
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
 import { BaseScenario } from './scenario.interface.js';
+import {
+  buildEvaluationContextFromResults,
+  runSingleEvaluation,
+  ARCHITECTURAL_COHERENCE_TEMPLATE,
+} from '../analyzer/llm-judge.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 50;
@@ -347,8 +353,21 @@ export class MultiSessionBuildScenario extends BaseScenario {
   protected async doScore(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
-    const architecturalDrift = this.scoreArchitecturalDrift(rawResults, groundTruth);
+    let architecturalDrift: DimensionScore;
+    if (evaluatorClient) {
+      const evalCtx = buildEvaluationContextFromResults(rawResults, groundTruth);
+      const result = await runSingleEvaluation(evaluatorClient, ARCHITECTURAL_COHERENCE_TEMPLATE, evalCtx);
+      architecturalDrift = {
+        value: result.score,
+        confidence: result.confidence,
+        method: 'llm-judge',
+        justification: result.justification,
+      };
+    } else {
+      architecturalDrift = this.scoreArchitecturalDrift(rawResults, groundTruth);
+    }
     const cumulativeRework = this.scoreCumulativeRework(rawResults);
     const finalQuality = this.scoreFinalQuality(rawResults, groundTruth);
 

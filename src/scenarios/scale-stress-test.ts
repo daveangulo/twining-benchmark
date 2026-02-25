@@ -19,6 +19,7 @@
  * Excluded from --scenario all; must be explicitly invoked.
  */
 
+import type Anthropic from '@anthropic-ai/sdk';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
@@ -29,6 +30,11 @@ import type {
   ScaleTestConfig,
 } from '../types/scenario.js';
 import { BaseScenario } from './scenario.interface.js';
+import {
+  buildEvaluationContextFromResults,
+  runSingleEvaluation,
+  ARCHITECTURAL_COHERENCE_TEMPLATE,
+} from '../analyzer/llm-judge.js';
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 50;
@@ -287,8 +293,21 @@ export class ScaleStressTestScenario extends BaseScenario {
   protected async doScore(
     rawResults: RawResults,
     _groundTruth: ArchitecturalManifest,
+    evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
-    const coherenceDegradation = this.scoreCoherenceDegradation(rawResults);
+    let coherenceDegradation: DimensionScore;
+    if (evaluatorClient) {
+      const evalCtx = buildEvaluationContextFromResults(rawResults, _groundTruth);
+      const result = await runSingleEvaluation(evaluatorClient, ARCHITECTURAL_COHERENCE_TEMPLATE, evalCtx);
+      coherenceDegradation = {
+        value: result.score,
+        confidence: result.confidence,
+        method: 'llm-judge',
+        justification: result.justification,
+      };
+    } else {
+      coherenceDegradation = this.scoreCoherenceDegradation(rawResults);
+    }
     const orientationOverhead = this.scoreOrientationOverhead(rawResults);
     const integrationSuccess = this.scoreIntegrationSuccess(rawResults);
 
