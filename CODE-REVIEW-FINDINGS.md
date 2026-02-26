@@ -343,5 +343,5 @@ All five scenarios' `doSetup()` methods return hardcoded metadata without modify
 
 ### Medium-term (PRD alignment)
 10. ~~**Extract `extractMetrics()`**~~ -- FIXED: moved to `BaseScenario`, removed from all 5 scenario files (~300 lines removed)
-11. **Invoke LLM-as-judge** in scenario scoring (the infrastructure exists, just needs wiring)
+11. ~~**Invoke LLM-as-judge**~~ -- FIXED: wired LLM-as-judge into all 5 scenarios for their most subjective dimension (consistency, decisionQuality, resolution, architecturalDrift, coherenceDegradation) with automated fallback when no API key is set
 12. ~~**Wire config file loading**~~ -- FIXED: `run` loads `twining-bench.config.json`, `init` generates it
