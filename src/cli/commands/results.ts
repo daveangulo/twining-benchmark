@@ -11,6 +11,7 @@ import {
   calculateEfficacyScore,
   generatePairwiseComparisons,
 } from '../../analyzer/composite-scorer.js';
+import { normalCdf } from '../../analyzer/statistics.js';
 import {
   exportMarkdown,
   generateKeyFindings,
@@ -240,7 +241,7 @@ export function printComparison(
             );
             if (combinedSe > 0) {
               const z = Math.abs(diff) / combinedSe;
-              const pValue = 2 * (1 - approxNormalCdf(z));
+              const pValue = 2 * (1 - normalCdf(z));
               if (pValue < 0.05) {
                 sigStr = '\x1b[32mp < 0.05\x1b[0m';
               } else if (pValue < 0.10) {
@@ -298,17 +299,6 @@ export function printComparison(
   }
 }
 
-/** Quick normal CDF for significance in comparison view */
-function approxNormalCdf(z: number): number {
-  if (z < -8) return 0;
-  if (z > 8) return 1;
-  const absZ = Math.abs(z);
-  const t = 1 / (1 + 0.2316419 * absZ);
-  const d = 0.3989422804014327;
-  const p = d * Math.exp((-absZ * absZ) / 2) *
-    (t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))));
-  return z > 0 ? 1 - p : p;
-}
 
 /**
  * Create the `results` command group.

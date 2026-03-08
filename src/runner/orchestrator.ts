@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { v4 as uuidv4 } from 'uuid';
 import Anthropic from '@anthropic-ai/sdk';
@@ -463,9 +463,56 @@ export class RunOrchestrator {
   }
 
   /**
-   * Emit a progress update.
+   * Emit a progress update and write live status file for dashboard monitoring.
    */
   private emitProgress(update: ProgressUpdate): void {
     this.onProgress?.(update);
+    // Write live status file (best-effort, don't block on errors)
+    this.writeStatusFile(update).catch(() => {});
+  }
+
+  /**
+   * Write the .current-run-status.json file for live dashboard monitoring.
+   */
+  private async writeStatusFile(update: ProgressUpdate): Promise<void> {
+    const statusPath = join(this.config.outputDirectory, '.current-run-status.json');
+
+    if (update.type === 'run-complete') {
+      // Clean up status file when run finishes
+      await rm(statusPath, { force: true });
+      return;
+    }
+
+    const status = {
+      active: true,
+      runId: update.runId,
+      scenario: update.scenario,
+      condition: update.condition,
+      iteration: update.iteration,
+      percentComplete: this.calculatePercentComplete(update),
+      startTime: new Date().toISOString(),
+    };
+
+    await writeFile(statusPath, JSON.stringify(status, null, 2), 'utf-8');
+  }
+
+  /**
+   * Calculate completion percentage based on progress update context.
+   */
+  private calculatePercentComplete(update: ProgressUpdate): number {
+    if (update.type === 'run-start') return 0;
+    const totalIterations = this.scenarios.length * this.conditions.length * this.runsPerPair;
+    if (totalIterations === 0) return 0;
+    const iteration = update.iteration ?? 0;
+    const scenarioIdx = update.scenario
+      ? this.scenarios.findIndex(s => s.getMetadata().name === update.scenario)
+      : 0;
+    const conditionIdx = update.condition
+      ? this.conditions.findIndex(c => c.name === update.condition)
+      : 0;
+    const completed = scenarioIdx * this.conditions.length * this.runsPerPair
+      + conditionIdx * this.runsPerPair
+      + iteration;
+    return Math.min(100, (completed / totalIterations) * 100);
   }
 }

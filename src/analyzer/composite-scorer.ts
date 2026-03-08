@@ -1,5 +1,6 @@
 import type { ScoreWeights } from '../types/config.js';
 import { DEFAULT_SCORE_WEIGHTS as WEIGHTS } from '../types/config.js';
+import { normalCdf } from './statistics.js';
 import type {
   DimensionScore,
   ScoredResults,
@@ -241,7 +242,7 @@ export function rankConditions(
         if (combinedSe > 0) {
           const z = diff / combinedSe;
           // Approximate p-value from z-score
-          const pValue = 2 * (1 - approxNormalCdf(Math.abs(z)));
+          const pValue = 2 * (1 - normalCdf(Math.abs(z)));
           if (pValue < 0.05) {
             significance = 'significant';
           } else if (pValue < 0.10) {
@@ -339,24 +340,3 @@ export function generatePairwiseComparisons(
   return comparisons;
 }
 
-/**
- * Quick normal CDF approximation for internal use.
- */
-function approxNormalCdf(z: number): number {
-  if (z < -8) return 0;
-  if (z > 8) return 1;
-
-  const absZ = Math.abs(z);
-  const t = 1 / (1 + 0.2316419 * absZ);
-  const d = 0.3989422804014327;
-  const p =
-    d *
-    Math.exp((-absZ * absZ) / 2) *
-    (t *
-      (0.319381530 +
-        t *
-          (-0.356563782 +
-            t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))));
-
-  return z > 0 ? 1 - p : p;
-}

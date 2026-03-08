@@ -19,39 +19,31 @@ export function createScenariosCommand(): Command {
       console.log(
         '  ' +
         'Name'.padEnd(25) +
-        'Sessions'.padEnd(10) +
+        'Agents'.padEnd(8) +
         'Est. Duration'.padEnd(16) +
-        'Target Type'.padEnd(25) +
-        'Excl.'
+        'Target Type'.padEnd(16) +
+        'Scoring Dimensions'
       );
-      console.log('  ' + '─'.repeat(82));
+      console.log('  ' + '─'.repeat(95));
 
       for (const name of names) {
         const entry = SCENARIO_REGISTRY[name];
         if (!entry) continue;
         const m = entry.metadata;
+        const dims = m.scoringDimensions.join(', ');
         console.log(
           '  ' +
           m.name.padEnd(25) +
-          String(m.agentSessionCount).padEnd(10) +
+          String(m.agentSessionCount).padEnd(8) +
           `${m.estimatedDurationMinutes} min`.padEnd(16) +
-          m.requiredTargetType.padEnd(25) +
-          (m.excludeFromAll ? 'yes' : 'no')
+          m.requiredTargetType.padEnd(16) +
+          dims
         );
       }
 
       console.log('');
-      console.log('  Scoring dimensions per scenario:');
-
-      for (const name of names) {
-        const entry = SCENARIO_REGISTRY[name];
-        if (!entry) continue;
-        console.log(`    ${entry.metadata.name}: ${entry.metadata.scoringDimensions.join(', ')}`);
-      }
-
-      console.log('');
       console.log(`  Total: ${names.length} scenarios`);
-      console.log(`  Note: "Excl." = excluded from --scenario all (must be explicitly specified)`);
+      console.log(`  Note: scale-stress-test is excluded from --scenario all (must be explicitly specified)`);
       console.log('');
     });
 

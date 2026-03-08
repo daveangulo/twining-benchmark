@@ -169,6 +169,7 @@ export function createRunCommand(): Command {
       '--scale-factor <n>',
       'Scale factor for scale-stress-test scenario (1-5)',
     )
+    .option('--output <dir>', 'Output directory for results', DEFAULT_CONFIG.outputDirectory)
     .option('--dry-run', 'Validate config and estimate cost without executing')
     .option('--verbose', 'Enable verbose logging')
     .action(async (opts: {
@@ -182,6 +183,7 @@ export function createRunCommand(): Command {
       generatorConfig?: string;
       externalConfig?: string;
       scaleFactor?: string;
+      output?: string;
       dryRun?: boolean;
       verbose?: boolean;
     }) => {
@@ -258,6 +260,7 @@ export function createRunCommand(): Command {
           targetPath: opts.target,
           defaultRuns: runs,
           budgetDollars: budget,
+          outputDirectory: opts.output ?? fileConfig.outputDirectory,
         };
 
         // Create scenario and condition instances

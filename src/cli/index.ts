@@ -8,6 +8,9 @@ import { createResultsCommand } from './commands/results.js';
 import { createDashboardCommand } from './commands/dashboard.js';
 import { createInitCommand } from './commands/init.js';
 import { createCleanCommand } from './commands/clean.js';
+import { createExportCommand } from './commands/export.js';
+import { createReproduceCommand } from './commands/reproduce.js';
+import { createCloudCommand } from './commands/cloud.js';
 
 const program = new Command();
 
@@ -23,5 +26,8 @@ program.addCommand(createResultsCommand());
 program.addCommand(createDashboardCommand());
 program.addCommand(createInitCommand());
 program.addCommand(createCleanCommand());
+program.addCommand(createExportCommand());
+program.addCommand(createReproduceCommand());
+program.addCommand(createCloudCommand());
 
 program.parse();

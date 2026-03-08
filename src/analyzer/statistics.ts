@@ -446,7 +446,7 @@ function assignRanks(sortedValues: number[]): number[] {
 /**
  * Standard normal CDF approximation (Abramowitz and Stegun).
  */
-function normalCdf(z: number): number {
+export function normalCdf(z: number): number {
   if (z < -8) return 0;
   if (z > 8) return 1;
 
