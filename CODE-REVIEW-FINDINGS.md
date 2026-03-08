@@ -198,35 +198,32 @@ Multiple `catch {}` blocks that silently swallow errors during data enrichment. 
 
 ---
 
-## 6. MEDIUM: Missing PRD Features
+## 6. MEDIUM: Missing PRD Features (Most Now Fixed)
 
 | PRD Requirement | Status | Impact |
 |---|---|---|
-| FR-CFG-001: Config file loading (`tbh.config.ts`) | `init` command writes template, `run` never loads it | Config is decoration only |
+| ~~FR-CFG-001: Config file loading~~ | **FIXED** — `run` loads `twining-bench.config.json` | ~~Config is decoration only~~ |
 | FR-RUN-003: Budget enforcement | Projection-only; never actually stops execution | Unbounded API spend |
-| FR-RUN-001: Seed determinism | `--seed` accepted by CLI but never wired to RNG | Runs are not reproducible |
-| FR-SCN-002/004: LLM-as-judge scoring | Templates exist, API call logic exists, never invoked by scenarios | Scoring is entirely heuristic |
+| FR-RUN-001: Seed determinism | `--seed` accepted by CLI, wired to orchestrator | Partial — API nondeterminism unseedable |
+| ~~FR-SCN-002/004: LLM-as-judge scoring~~ | **FIXED** — wired into all 5 scenarios | ~~Scoring is entirely heuristic~~ |
 | FR-ANL-002: Diff-based completeness | Scenarios score based on completion flags, not actual code diff analysis | Quality unmeasured |
-| FR-TGT-002: External repo adapter | `cmd.split(' ')` breaks on quoted arguments; no working copy isolation | Unusable with complex setups |
-| FR-TGT-001: Generator validation | `validate()` is a no-op; `fileCount` parameter accepted but unused | Non-functional repos |
-| FR-DSH-005: Export command | `twining-bench export --format <md\|csv\|png>` not registered in CLI | No export CLI |
-| NFR-004: Reproduce command | `twining-bench reproduce <run-id>` entirely absent | Not implemented |
-| FR-CLI-001: `--output` flag | Not present on `run` command; results always go to default directory | Can't customize output path |
-| FR-CLI-001: `--scale-factor` | Accepted by CLI but never wired to scale-stress-test scenario | Silently ignored |
-| FR-CLI-002: Scenario descriptions | `scenarios list` table omits description column | Minor display gap |
+| ~~FR-TGT-002: External repo adapter~~ | **FIXED** — shell execution, isolation, baseline commit | ~~Unusable with complex setups~~ |
+| ~~FR-TGT-001: Generator validation~~ | **FIXED** — real `validate()`, fileCount warning | ~~Non-functional repos~~ |
+| ~~FR-DSH-005: Export command~~ | **FIXED** — `twining-bench export <run-id> --format <md\|csv\|aggregated-csv>` | ~~No export CLI~~ |
+| ~~NFR-004: Reproduce command~~ | **FIXED** — `twining-bench reproduce <run-id> [--dry-run]` | ~~Not implemented~~ |
+| ~~FR-CLI-001: `--output` flag~~ | **FIXED** — added to `run` command | ~~Can't customize output path~~ |
+| FR-CLI-001: `--scale-factor` | Accepted by CLI and wired through | Functional |
+| ~~FR-CLI-002: Scenario descriptions~~ | **FIXED** — scoring dimensions and agent count inline in table | ~~Minor display gap~~ |
 
 ---
 
 ## 7. MEDIUM: Code Smells
 
-### 7a. `approxNormalCdf` Duplicated 3x
+### ~~7a. `approxNormalCdf` Duplicated 3x~~ — FIXED
 
-The same normal CDF approximation appears in three files:
-- `src/cli/commands/results.ts:302`
-- `src/analyzer/composite-scorer.ts:345`
-- `src/analyzer/statistics.ts:449`
+~~The same normal CDF approximation appears in three files.~~ **FIXED:** `normalCdf` is now exported from `statistics.ts` and imported in `composite-scorer.ts` and `results.ts`. Two duplicate definitions removed.
 
-Additionally, `estimateCost` is duplicated between `src/phase0/phase0-runner.ts:517` and `src/phase0/phase0-analyze.ts:337`, and `formatDuration` is duplicated between `src/cli/utils/progress.ts:22` and `src/phase0/phase0-runner.ts:499`. The Phase 0 types (`Phase0RunResult`, `Phase0SessionResult`) are also redefined in both phase0 files rather than shared.
+Note: `estimateCost` is still duplicated between `src/phase0/phase0-runner.ts` and `src/phase0/phase0-analyze.ts`, and `formatDuration` is duplicated between `src/cli/utils/progress.ts` and `src/phase0/phase0-runner.ts`. The Phase 0 types (`Phase0RunResult`, `Phase0SessionResult`) are also redefined in both phase0 files rather than shared. These are in legacy Phase 0 code and low priority.
 
 ### 7b. `results compare` Uses Different Statistical Test Than Analysis Pipeline
 
@@ -341,7 +338,17 @@ All five scenarios' `doSetup()` methods return hardcoded metadata without modify
 8. ~~**Fix generated repo target**~~ -- FIXED: real `validate()` with structure checks, `reset()` to initial commit, defensive copy from `getGroundTruth()`, fileCount mismatch warning
 9. ~~**Fix external repo target**~~ -- FIXED: shell execution for setup commands, `reset()` to baseline commit, defensive copy from `getGroundTruth()`
 
-### Medium-term (PRD alignment)
+### Medium-term (PRD alignment) -- DONE
 10. ~~**Extract `extractMetrics()`**~~ -- FIXED: moved to `BaseScenario`, removed from all 5 scenario files (~300 lines removed)
 11. ~~**Invoke LLM-as-judge**~~ -- FIXED: wired LLM-as-judge into all 5 scenarios for their most subjective dimension (consistency, decisionQuality, resolution, architecturalDrift, coherenceDegradation) with automated fallback when no API key is set
 12. ~~**Wire config file loading**~~ -- FIXED: `run` loads `twining-bench.config.json`, `init` generates it
+
+### Phase 3 (Dashboard, Export, Cloud, PRD Completion) -- DONE
+13. ~~**Dashboard web server**~~ -- FIXED: Express API server with 8 routes, basic auth, SPA serving
+14. ~~**Dashboard React SPA**~~ -- FIXED: 7 components (RunList, ConditionComparison, MetricDeepDive, TrendView, ExportButton, App, main), Recharts visualizations
+15. ~~**Export CLI command**~~ -- FIXED: `twining-bench export <run-id> --format <markdown|csv|aggregated-csv> [--output <path>]`
+16. ~~**Cloud execution (Fly.io)**~~ -- FIXED: Dockerfile, fly.toml, `twining-bench cloud` (deploy/run/status/logs/pull), live status monitoring
+17. ~~**Reproduce command**~~ -- FIXED: `twining-bench reproduce <run-id> [--dry-run]`
+18. ~~**`--output` flag**~~ -- FIXED: added to `run` command
+19. ~~**Consolidate `approxNormalCdf`**~~ -- FIXED: exported `normalCdf` from `statistics.ts`, removed 2 duplicate definitions
+20. ~~**Scenario list improvements**~~ -- FIXED: scoring dimensions and agent count inline in table

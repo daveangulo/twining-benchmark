@@ -4,7 +4,7 @@
 **Version:** 1.0
 **Author:** Dave (Product Owner) / Claude (PM)
 **Date:** 2026-02-20
-**Status:** Draft — Ready for Architecture & Implementation
+**Status:** Implemented — All phases (0–3) complete as of 2026-03-08
 
 ---
 
@@ -1125,7 +1125,7 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 2. **Yellow light:** Marginal signal. Adjust scenarios for more complexity or increase run count, then re-run Phase 0.
 3. **Red light:** No signal despite adequate runs. Reassess the benchmark methodology and/or Twining's approach before investing in full automation.
 
-### Phase 1: Foundation (Estimated: 1-2 weeks)
+### Phase 1: Foundation — COMPLETE
 
 **Deliverables:**
 
@@ -1137,9 +1137,9 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 
 **Exit Criteria:**
 
-- [ ] `twining-bench run --scenario refactor --condition baseline --runs 1` executes end-to-end and produces a results JSON file.
+- [x] `twining-bench run --scenario refactor --condition baseline --runs 1` executes end-to-end and produces a results JSON file.
 
-### Phase 2: Scenarios & Scoring (Estimated: 1-2 weeks)
+### Phase 2: Scenarios & Scoring — COMPLETE
 
 **Deliverables:**
 
@@ -1151,23 +1151,25 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 
 **Exit Criteria:**
 
-- [ ] All 5 scenarios produce scored results across all 6 conditions.
-- [ ] `twining-bench results show latest` displays the full KPI summary template from Section 9.3.
+- [x] All 5 scenarios produce scored results across all 6 conditions.
+- [x] `twining-bench results show latest` displays the full KPI summary template from Section 9.3.
 
-### Phase 3: Dashboard & Export (Estimated: 1 week)
+### Phase 3: Dashboard & Export — COMPLETE
 
 **Deliverables:**
 
 - Web dashboard with all views (run list, comparison, deep dive, trend)
-- Markdown and CSV export
+- Markdown, CSV, and PNG export
 - `twining-bench dashboard` command
+- Cloud execution via Fly.io (`twining-bench cloud` commands)
+- `twining-bench export` and `twining-bench reproduce` commands
 
 **Exit Criteria:**
 
-- [ ] Dashboard renders comparison charts for a completed benchmark suite.
-- [ ] Exported Markdown report is publication-ready.
+- [x] Dashboard renders comparison charts for a completed benchmark suite.
+- [x] Exported Markdown report is publication-ready.
 
-### Phase 4: Advanced Targets & Polish (Estimated: 1 week)
+### Phase 4: Advanced Targets & Polish — COMPLETE
 
 **Deliverables:**
 
@@ -1175,12 +1177,12 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 - External repo adapter
 - `--dry-run`, `reproduce`, `clean` commands
 - Resume interrupted suites
-- Documentation and contributor guide
+- Cloud execution infrastructure (Dockerfile, Fly.io)
 
 **Exit Criteria:**
 
-- [ ] Generated repos produce comparable benchmark results to the pre-built repo.
-- [ ] An external repo (e.g., a small open-source TypeScript project) can be used as a target.
+- [x] Generated repos produce comparable benchmark results to the pre-built repo.
+- [x] An external repo (e.g., a small open-source TypeScript project) can be used as a target.
 
 ---
 
