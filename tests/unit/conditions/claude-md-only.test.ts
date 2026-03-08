@@ -53,7 +53,7 @@ describe('ClaudeMdOnlyCondition', () => {
     expect(config.systemPrompt).toBe('');
     expect(config.mcpServers).toEqual({});
     expect(config.allowedTools).toContain('Read');
-    expect(config.allowedTools).not.toContain('mcp__twining__twining_post');
+    expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_post');
     expect(config.permissionMode).toBe('acceptEdits');
   });
 

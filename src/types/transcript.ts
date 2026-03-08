@@ -7,7 +7,7 @@ export type SessionExitReason = 'completed' | 'timeout' | 'error' | 'manual';
  * A single tool call made by an agent.
  */
 export interface ToolCall {
-  /** Tool name (e.g., "Read", "Edit", "Bash", "mcp__twining__twining_decide") */
+  /** Tool name (e.g., "Read", "Edit", "Bash", "mcp__plugin_twining_twining__twining_decide") */
   toolName: string;
   /** Parameters passed to the tool */
   parameters: Record<string, unknown>;

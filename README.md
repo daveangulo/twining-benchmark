@@ -1,6 +1,6 @@
 # Twining Benchmark Harness
 
-A CLI-driven benchmark execution engine that quantitatively compares multi-agent coordination strategies. It answers the question: **does [Twining](https://github.com/twining-mcp/twining-mcp) actually help AI agents work together, and by how much?**
+A CLI-driven benchmark execution engine that quantitatively compares multi-agent coordination strategies. It answers the question: **does [Twining](https://github.com/daveangulo/twining-mcp) actually help AI agents work together, and by how much?**
 
 The harness runs controlled experiments where multiple Claude agents collaborate on a shared codebase under different coordination conditions (no coordination, CLAUDE.md only, shared markdown, file-based reload, structured frameworks, full Twining MCP), then scores the results using automated analysis and statistical comparison.
 

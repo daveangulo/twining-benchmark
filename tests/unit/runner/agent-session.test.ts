@@ -304,11 +304,11 @@ describe('AgentSessionManager', () => {
         mcpServers: {
           twining: {
             command: 'npx',
-            args: ['twining-mcp'],
-            env: { TWINING_DIR: '/tmp/.twining' },
+            args: ['-y', 'twining-mcp', '--project', '/tmp/test'],
+            env: { TWINING_DASHBOARD: '0' },
           },
         },
-        allowedTools: ['Read', 'Edit', 'Bash', 'mcp__twining__twining_post'],
+        allowedTools: ['Read', 'Edit', 'Bash', 'mcp__plugin_twining_twining__twining_post'],
       }),
     });
 
@@ -322,11 +322,11 @@ describe('AgentSessionManager', () => {
             twining: {
               type: 'stdio',
               command: 'npx',
-              args: ['twining-mcp'],
-              env: { TWINING_DIR: '/tmp/.twining' },
+              args: ['-y', 'twining-mcp', '--project', '/tmp/test'],
+              env: { TWINING_DASHBOARD: '0' },
             },
           },
-          allowedTools: ['Read', 'Edit', 'Bash', 'mcp__twining__twining_post'],
+          allowedTools: ['Read', 'Edit', 'Bash', 'mcp__plugin_twining_twining__twining_post'],
           permissionMode: 'acceptEdits',
         }),
       }),

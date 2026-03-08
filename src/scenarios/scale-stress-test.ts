@@ -435,11 +435,11 @@ export class ScaleStressTestScenario extends BaseScenario {
       'mcp__plugin_serena_serena__get_symbols_overview',
       'mcp__plugin_serena_serena__search_for_pattern',
       'mcp__plugin_serena_serena__read_file',
-      'mcp__twining__twining_assemble',
-      'mcp__twining__twining_read',
-      'mcp__twining__twining_query',
-      'mcp__twining__twining_why',
-      'mcp__twining__twining_recent',
+      'mcp__plugin_twining_twining__twining_assemble',
+      'mcp__plugin_twining_twining__twining_read',
+      'mcp__plugin_twining_twining__twining_query',
+      'mcp__plugin_twining_twining__twining_why',
+      'mcp__plugin_twining_twining__twining_recent',
     ]);
 
     const productionTools = new Set([

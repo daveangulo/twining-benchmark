@@ -56,7 +56,7 @@ describe('FileReloadGenericCondition', () => {
     const config = condition.getAgentConfig();
 
     expect(config.mcpServers).toEqual({});
-    expect(config.allowedTools).not.toContain('mcp__twining__twining_post');
+    expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_post');
   });
 
   it('CLAUDE.md mentions context management', async () => {
