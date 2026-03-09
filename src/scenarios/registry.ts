@@ -4,6 +4,7 @@ import { createArchitectureCascadeScenario } from './architecture-cascade.js';
 import { createBugInvestigationScenario } from './bug-investigation.js';
 import { createMultiSessionBuildScenario } from './multi-session-build.js';
 import { createScaleStressTestScenario } from './scale-stress-test.js';
+import { createContextRecoveryScenario } from './context-recovery.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -68,6 +69,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createScaleStressTestScenario(),
+  },
+  'context-recovery': {
+    metadata: {
+      name: 'context-recovery',
+      description: 'Agent A works on analytics API, gets interrupted mid-task. Agent B recovers context and completes the work. Measures orientation efficiency and redundant rework.',
+      estimatedDurationMinutes: 30,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 2,
+      scoringDimensions: ['orientation-efficiency', 'redundant-rework', 'completion', 'context-accuracy'],
+      excludeFromAll: false,
+    },
+    create: () => createContextRecoveryScenario(),
   },
 };
 
