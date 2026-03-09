@@ -4,11 +4,17 @@ import {
   parseEvaluationResponse,
   runSingleEvaluation,
   getBuiltInTemplates,
+  getStandaloneTemplates,
+  evaluateStandaloneQuality,
   buildEvaluationContextFromResults,
   DECISION_CONSISTENCY_TEMPLATE,
   INTEGRATION_QUALITY_TEMPLATE,
   ARCHITECTURAL_COHERENCE_TEMPLATE,
   REDUNDANCY_DETECTION_TEMPLATE,
+  CODE_CORRECTNESS_TEMPLATE,
+  ARCHITECTURAL_SOUNDNESS_TEMPLATE,
+  MAINTAINABILITY_TEMPLATE,
+  COMPLETENESS_TEMPLATE,
   type EvaluationContext,
 } from '../../../src/analyzer/llm-judge.js';
 import type { EvaluatorPromptTemplate } from '../../../src/types/analysis.js';
@@ -412,5 +418,147 @@ describe('buildEvaluationContextFromResults', () => {
 
     const ctx = buildEvaluationContextFromResults(rawResults, groundTruth);
     expect(ctx.coordinationArtifacts).toBe('(no coordination artifacts)');
+  });
+});
+
+// --- Standalone quality templates ---
+
+describe('standalone quality templates', () => {
+  const standaloneTemplates = [
+    { name: 'CODE_CORRECTNESS_TEMPLATE', template: CODE_CORRECTNESS_TEMPLATE },
+    { name: 'ARCHITECTURAL_SOUNDNESS_TEMPLATE', template: ARCHITECTURAL_SOUNDNESS_TEMPLATE },
+    { name: 'MAINTAINABILITY_TEMPLATE', template: MAINTAINABILITY_TEMPLATE },
+    { name: 'COMPLETENESS_TEMPLATE', template: COMPLETENESS_TEMPLATE },
+  ];
+
+  for (const { name, template } of standaloneTemplates) {
+    describe(name, () => {
+      it('does not reference agents or coordination', () => {
+        expect(template.template).not.toMatch(/agent/i);
+        expect(template.template).not.toMatch(/coordinat/i);
+        expect(template.template).not.toMatch(/prior.*decision/i);
+        expect(template.template).not.toMatch(/shared.*state/i);
+      });
+
+      it('contains required placeholders', () => {
+        expect(template.template).toContain('{{GROUND_TRUTH}}');
+        expect(template.template).toContain('{{CODE_DIFFS}}');
+      });
+
+      it('does not contain coordination artifacts placeholder', () => {
+        expect(template.template).not.toContain('{{COORDINATION_ARTIFACTS}}');
+      });
+
+      it('has required fields', () => {
+        expect(template.id).toBeTruthy();
+        expect(template.version).toBeTruthy();
+        expect(template.dimension).toBeTruthy();
+        expect(template.template).toBeTruthy();
+        expect(template.rubric).toBeDefined();
+        expect(template.rubric.excellent).toBeTruthy();
+        expect(template.rubric.good).toBeTruthy();
+        expect(template.rubric.acceptable).toBeTruthy();
+        expect(template.rubric.poor).toBeTruthy();
+      });
+    });
+  }
+
+  it('rubric text does not reference agents or coordination', () => {
+    for (const { template } of standaloneTemplates) {
+      const rubricText = [
+        template.rubric.excellent,
+        template.rubric.good,
+        template.rubric.acceptable,
+        template.rubric.poor,
+      ].join(' ');
+      expect(rubricText).not.toMatch(/agent/i);
+      expect(rubricText).not.toMatch(/coordinat/i);
+    }
+  });
+});
+
+describe('getStandaloneTemplates', () => {
+  it('returns 4 templates', () => {
+    const templates = getStandaloneTemplates();
+    expect(templates).toHaveLength(4);
+  });
+
+  it('covers expected dimensions', () => {
+    const templates = getStandaloneTemplates();
+    const dimensions = templates.map(t => t.dimension);
+    expect(dimensions).toContain('correctness');
+    expect(dimensions).toContain('architecturalSoundness');
+    expect(dimensions).toContain('maintainability');
+    expect(dimensions).toContain('completeness');
+  });
+});
+
+describe('evaluateStandaloneQuality', () => {
+  function makeMockClient(scores: number[]) {
+    let callCount = 0;
+    return {
+      messages: {
+        create: vi.fn().mockImplementation(() => {
+          const score = scores[callCount % scores.length]!;
+          callCount++;
+          return Promise.resolve({
+            content: [{ type: 'text', text: JSON.stringify({
+              score,
+              confidence: 'high',
+              justification: `Score ${score} justification`,
+            })}],
+            usage: { input_tokens: 500, output_tokens: 200 },
+          });
+        }),
+      },
+    } as never;
+  }
+
+  it('returns all four dimension scores and a composite', async () => {
+    // 3 evaluations per dimension × 4 dimensions = 12 calls
+    const client = makeMockClient([80, 82, 78, 90, 88, 92, 70, 72, 68, 60, 62, 58]);
+    const context: EvaluationContext = {
+      groundTruth: 'test ground truth',
+      codeDiffs: 'test diffs',
+      coordinationArtifacts: '',
+    };
+
+    const result = await evaluateStandaloneQuality(client, context, {
+      model: 'test-model',
+      evaluationCount: 3,
+      maxTokens: 1024,
+    });
+
+    expect(result.correctness).toBeDefined();
+    expect(result.architecturalSoundness).toBeDefined();
+    expect(result.maintainability).toBeDefined();
+    expect(result.completeness).toBeDefined();
+    expect(result.composite).toBeGreaterThanOrEqual(0);
+    expect(result.composite).toBeLessThanOrEqual(100);
+
+    // Each dimension should have llm-judge method
+    expect(result.correctness.method).toBe('llm-judge');
+    expect(result.architecturalSoundness.method).toBe('llm-judge');
+    expect(result.maintainability.method).toBe('llm-judge');
+    expect(result.completeness.method).toBe('llm-judge');
+  });
+
+  it('computes composite as equal-weight average of 4 dimensions', async () => {
+    // All evaluations return the same score per dimension
+    const client = makeMockClient([80]);
+    const context: EvaluationContext = {
+      groundTruth: 'test',
+      codeDiffs: 'test',
+      coordinationArtifacts: '',
+    };
+
+    const result = await evaluateStandaloneQuality(client, context, {
+      model: 'test-model',
+      evaluationCount: 1,
+      maxTokens: 1024,
+    });
+
+    // All dimensions should be 80, so composite = 80
+    expect(result.composite).toBe(80);
   });
 });
