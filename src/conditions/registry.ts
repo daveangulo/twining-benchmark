@@ -5,6 +5,7 @@ import { SharedMarkdownCondition } from './shared-markdown.js';
 import { FileReloadGenericCondition } from './file-reload-generic.js';
 import { FileReloadStructuredCondition } from './file-reload-structured.js';
 import { FullTwiningCondition } from './full-twining.js';
+import { TwiningLiteCondition } from './twining-lite.js';
 
 /**
  * Registry of all available coordination conditions.
@@ -45,6 +46,12 @@ export const CONDITION_REGISTRY: Record<ConditionName, ConditionRegistryEntry> =
     description: 'Full Twining MCP server with blackboard, decision tracking, knowledge graph, and semantic search.',
     coordinationTools: ['Twining MCP (all tools)'],
     create: () => new FullTwiningCondition(),
+  },
+  'twining-lite': {
+    name: 'twining-lite',
+    description: 'Twining Lite — core blackboard and decision tools only (8 of 26 tools).',
+    coordinationTools: ['Twining MCP (core: blackboard, decisions, handoff)'],
+    create: () => new TwiningLiteCondition(),
   },
 };
 
