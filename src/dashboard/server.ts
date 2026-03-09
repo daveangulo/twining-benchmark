@@ -252,7 +252,7 @@ export function createDashboardServer(options: DashboardServerOptions): Express 
   app.use(express.static(distDir));
 
   // Catch-all for client-side routing — serve index.html
-  app.get('*', (_req: Request, res: Response) => {
+  app.get('{*path}', (_req: Request, res: Response) => {
     res.sendFile(join(distDir, 'index.html'), (err) => {
       if (err) {
         // SPA not built yet; return 404 for non-API routes
