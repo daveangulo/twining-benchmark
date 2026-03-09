@@ -4,6 +4,7 @@ import { createArchitectureCascadeScenario } from './architecture-cascade.js';
 import { createBugInvestigationScenario } from './bug-investigation.js';
 import { createMultiSessionBuildScenario } from './multi-session-build.js';
 import { createScaleStressTestScenario } from './scale-stress-test.js';
+import { createConflictResolutionScenario } from './conflict-resolution.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -68,6 +69,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createScaleStressTestScenario(),
+  },
+  'conflict-resolution': {
+    metadata: {
+      name: 'conflict-resolution',
+      description: 'Two agents implement notifications with contradictory architectures (event-driven vs direct calls). A third agent must detect the conflict, choose the better approach, and unify the codebase.',
+      estimatedDurationMinutes: 45,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 3,
+      scoringDimensions: ['conflict-detection', 'resolution-quality', 'decision-documentation'],
+      excludeFromAll: false,
+    },
+    create: () => createConflictResolutionScenario(),
   },
 };
 
