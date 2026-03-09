@@ -5,7 +5,7 @@ import type {
   EvaluatorPromptTemplate,
   EvaluatorRubric,
 } from '../types/analysis.js';
-import type { ScoreConfidence } from '../types/results.js';
+import type { ScoreConfidence, DimensionScore, StandaloneScoreResult } from '../types/results.js';
 import type { RawResults } from '../types/scenario.js';
 import type { ArchitecturalManifest } from '../types/target.js';
 
@@ -394,8 +394,154 @@ Score 100 = no redundancy; 0 = all work was redundant.`,
   },
 };
 
+// --- Standalone quality evaluator templates ---
+// These templates evaluate the final codebase as if one developer wrote it.
+// They do NOT reference multi-party workflows, delegation, or shared state.
+
 /**
- * Get all built-in evaluator templates.
+ * Template: Code correctness — evaluates whether the code is correct,
+ * handles edge cases, and is free of logical errors.
+ */
+export const CODE_CORRECTNESS_TEMPLATE: EvaluatorPromptTemplate = {
+  id: 'code-correctness-v1',
+  version: '1.0.0',
+  dimension: 'correctness',
+  template: `You are evaluating the quality of a codebase. Specifically, you are assessing the correctness of the implementation.
+
+## Ground Truth (Expected Architecture)
+{{GROUND_TRUTH}}
+
+## Code Changes (Diffs)
+{{CODE_DIFFS}}
+
+{{ADDITIONAL_CONTEXT}}
+
+## Your Task
+Evaluate the correctness of the code. Consider:
+1. Does the code produce the expected outputs for all inputs?
+2. Are edge cases handled properly (null values, empty collections, boundary conditions)?
+3. Are there logical errors, off-by-one bugs, or race conditions?
+4. Do error handling paths work correctly?
+5. Are types used correctly and consistently?`,
+  rubric: {
+    excellent:
+      'Code is fully correct. All logic is sound, edge cases are handled, error paths are robust, and no bugs are apparent.',
+    good: 'Code is mostly correct with minor issues. A few edge cases may be unhandled, but core logic is sound.',
+    acceptable:
+      'Code has some correctness issues. Several edge cases are missed or there are minor logical errors, but the main functionality works.',
+    poor: 'Code has significant correctness problems. Major logical errors, unhandled edge cases, or broken error handling that would cause failures in production.',
+  },
+};
+
+/**
+ * Template: Architectural soundness — evaluates separation of concerns,
+ * design patterns, interfaces, and abstraction quality.
+ */
+export const ARCHITECTURAL_SOUNDNESS_TEMPLATE: EvaluatorPromptTemplate = {
+  id: 'architectural-soundness-v1',
+  version: '1.0.0',
+  dimension: 'architecturalSoundness',
+  template: `You are evaluating the quality of a codebase. Specifically, you are assessing the architectural soundness of the implementation.
+
+## Ground Truth (Expected Architecture)
+{{GROUND_TRUTH}}
+
+## Code Changes (Diffs)
+{{CODE_DIFFS}}
+
+{{ADDITIONAL_CONTEXT}}
+
+## Your Task
+Evaluate the architectural soundness of the code. Consider:
+1. Is there clear separation of concerns between modules?
+2. Are appropriate design patterns used (e.g., dependency injection, repository pattern, strategy pattern)?
+3. Are interfaces and abstractions well-defined and at the right level?
+4. Is the dependency graph clean (no circular dependencies, minimal coupling)?
+5. Does the architecture match the expected design from the ground truth?`,
+  rubric: {
+    excellent:
+      'Architecture is exemplary. Clean separation of concerns, well-chosen patterns, clear abstractions, and minimal coupling. The design matches or exceeds the expected architecture.',
+    good: 'Architecture is solid with minor issues. Good separation of concerns and reasonable patterns, but some abstractions could be improved.',
+    acceptable:
+      'Architecture is adequate but has notable weaknesses. Some concerns are mixed, patterns are inconsistent, or abstractions are leaky.',
+    poor: 'Architecture is poor. No clear separation of concerns, inappropriate or missing design patterns, tangled dependencies, or significant deviation from expected design.',
+  },
+};
+
+/**
+ * Template: Maintainability — evaluates readability, naming conventions,
+ * code organization, and testability.
+ */
+export const MAINTAINABILITY_TEMPLATE: EvaluatorPromptTemplate = {
+  id: 'maintainability-v1',
+  version: '1.0.0',
+  dimension: 'maintainability',
+  template: `You are evaluating the quality of a codebase. Specifically, you are assessing the maintainability of the implementation.
+
+## Ground Truth (Expected Architecture)
+{{GROUND_TRUTH}}
+
+## Code Changes (Diffs)
+{{CODE_DIFFS}}
+
+{{ADDITIONAL_CONTEXT}}
+
+## Your Task
+Evaluate the maintainability of the code. Consider:
+1. Is the code readable and self-documenting?
+2. Are naming conventions consistent and descriptive?
+3. Is the code well-organized with logical file and module structure?
+4. Is the code testable (functions are pure where possible, dependencies are injectable)?
+5. Are there appropriate comments for complex logic?
+6. Is there consistent formatting and style throughout?`,
+  rubric: {
+    excellent:
+      'Code is highly maintainable. Excellent readability, consistent naming conventions, logical organization, and high testability. A new developer could easily understand and modify the codebase.',
+    good: 'Code is reasonably maintainable. Good readability and naming with minor inconsistencies. Most code is testable and well-organized.',
+    acceptable:
+      'Code is somewhat maintainable but has issues. Inconsistent naming, some hard-to-read sections, or tightly coupled code that is difficult to test.',
+    poor: 'Code is difficult to maintain. Poor readability, inconsistent or misleading names, disorganized structure, and low testability. Significant effort required to understand or modify.',
+  },
+};
+
+/**
+ * Template: Completeness — evaluates whether all requirements were
+ * fully implemented.
+ */
+export const COMPLETENESS_TEMPLATE: EvaluatorPromptTemplate = {
+  id: 'completeness-v1',
+  version: '1.0.0',
+  dimension: 'completeness',
+  template: `You are evaluating the quality of a codebase. Specifically, you are assessing the completeness of the implementation relative to the requirements.
+
+## Ground Truth (Expected Architecture)
+{{GROUND_TRUTH}}
+
+## Code Changes (Diffs)
+{{CODE_DIFFS}}
+
+{{ADDITIONAL_CONTEXT}}
+
+## Your Task
+Evaluate the completeness of the implementation. Consider:
+1. Are all required features implemented?
+2. Are all specified interfaces and contracts fulfilled?
+3. Are all expected architectural decisions reflected in the code?
+4. Are there any TODO comments or placeholder implementations?
+5. Is error handling complete (not just happy path)?
+6. Are all required tests present?`,
+  rubric: {
+    excellent:
+      'Implementation is fully complete. All requirements are met, all interfaces are implemented, error handling is thorough, and no placeholder code remains.',
+    good: 'Implementation is mostly complete. Core requirements are met with minor gaps. A few edge cases or secondary features may be missing.',
+    acceptable:
+      'Implementation is partially complete. Major features are present but some requirements are unmet, or there are significant placeholder implementations.',
+    poor: 'Implementation is substantially incomplete. Multiple required features are missing, many TODOs remain, or core requirements are unmet.',
+  },
+};
+
+/**
+ * Get all built-in evaluator templates (coordination-aware).
  */
 export function getBuiltInTemplates(): EvaluatorPromptTemplate[] {
   return [
@@ -404,6 +550,72 @@ export function getBuiltInTemplates(): EvaluatorPromptTemplate[] {
     ARCHITECTURAL_COHERENCE_TEMPLATE,
     REDUNDANCY_DETECTION_TEMPLATE,
   ];
+}
+
+/**
+ * Get all standalone quality evaluator templates.
+ */
+export function getStandaloneTemplates(): EvaluatorPromptTemplate[] {
+  return [
+    CODE_CORRECTNESS_TEMPLATE,
+    ARCHITECTURAL_SOUNDNESS_TEMPLATE,
+    MAINTAINABILITY_TEMPLATE,
+    COMPLETENESS_TEMPLATE,
+  ];
+}
+
+/**
+ * Evaluate standalone quality of a codebase using four independent dimensions.
+ * Returns scores for correctness, architectural soundness, maintainability,
+ * and completeness, plus a composite score (equal weights).
+ */
+export async function evaluateStandaloneQuality(
+  client: Anthropic,
+  context: EvaluationContext,
+  config: LlmJudgeConfig = DEFAULT_JUDGE_CONFIG,
+): Promise<StandaloneScoreResult> {
+  const [correctness, soundness, maintainability, completeness] = await Promise.all([
+    runAggregatedEvaluation(client, CODE_CORRECTNESS_TEMPLATE, context, config),
+    runAggregatedEvaluation(client, ARCHITECTURAL_SOUNDNESS_TEMPLATE, context, config),
+    runAggregatedEvaluation(client, MAINTAINABILITY_TEMPLATE, context, config),
+    runAggregatedEvaluation(client, COMPLETENESS_TEMPLATE, context, config),
+  ]);
+
+  const toDimensionScore = (result: AggregatedJudgeResult): DimensionScore => {
+    // Derive median confidence from evaluations
+    const confidences = result.evaluations.map((e) => e.confidence);
+    const confidenceOrder: Record<string, number> = { low: 0, medium: 1, high: 2 };
+    const sortedConfidences = [...confidences].sort(
+      (a, b) => (confidenceOrder[a] ?? 0) - (confidenceOrder[b] ?? 0),
+    );
+    const medianConfidence = sortedConfidences[Math.floor(sortedConfidences.length / 2)] ?? 'low';
+
+    // Collect justifications from all evaluations
+    const justifications = result.evaluations.map((e) => e.justification);
+
+    return {
+      value: result.medianScore,
+      confidence: medianConfidence as ScoreConfidence,
+      method: 'llm-judge',
+      justification: justifications.join(' | '),
+    };
+  };
+
+  const scores = {
+    correctness: toDimensionScore(correctness),
+    architecturalSoundness: toDimensionScore(soundness),
+    maintainability: toDimensionScore(maintainability),
+    completeness: toDimensionScore(completeness),
+  };
+
+  const composite =
+    (scores.correctness.value +
+      scores.architecturalSoundness.value +
+      scores.maintainability.value +
+      scores.completeness.value) /
+    4;
+
+  return { ...scores, composite };
 }
 
 /**
