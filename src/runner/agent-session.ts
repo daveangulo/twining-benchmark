@@ -331,6 +331,14 @@ export class AgentSessionManager {
    * Build SDK options from condition config and task.
    */
   private buildSdkOptions(task: AgentTask, abortController: AbortController): SDKOptions {
+    // Strip env vars that prevent nested Claude Code sessions.
+    // The SDK spawns `claude` as a subprocess — if CLAUDECODE is set
+    // (e.g., when running the harness from within Claude Code), the
+    // subprocess refuses to start with exit code 1.
+    const cleanEnv = { ...process.env };
+    delete cleanEnv['CLAUDECODE'];
+    delete cleanEnv['CLAUDE_CODE_ENTRYPOINT'];
+
     const options: SDKOptions = {
       cwd: this.workingDir,
       abortController,
@@ -340,6 +348,7 @@ export class AgentSessionManager {
         : this.agentConfig.permissionMode,
       allowedTools: this.agentConfig.allowedTools,
       persistSession: false,
+      env: cleanEnv,
     };
 
     // System prompt
@@ -357,9 +366,9 @@ export class AgentSessionManager {
       options.mcpServers = mcpServers;
     }
 
-    // Environment
+    // Merge condition-specific env vars on top of clean env
     if (this.agentConfig.env) {
-      options.env = { ...process.env, ...this.agentConfig.env };
+      Object.assign(options.env!, this.agentConfig.env);
     }
 
     return options;
