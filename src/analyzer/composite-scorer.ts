@@ -58,7 +58,7 @@ export interface CesBreakdown {
  * - integration_score = test_pass_rate × 100
  * - redundancy_score = 100 - (redundant_work_% × 100)
  * - coherence_score = (architectural_coherence / 5) × 100
- * - overhead_penalty = max(0, (coordination_overhead_ratio - 0.10)) × 200
+ * - overhead_penalty = coordination_overhead_ratio × 100
  */
 export function calculateCes(
   metrics: CesInputMetrics,
@@ -70,9 +70,9 @@ export function calculateCes(
   const redundancyScore = 100 - metrics.redundantWorkPct * 100;
   const coherenceScore = (metrics.architecturalCoherence / 5) * 100;
 
-  // Overhead penalty: kicks in above 10% overhead
-  const overheadPenalty =
-    Math.max(0, metrics.coordinationOverheadRatio - 0.10) * 200;
+  // Smooth linear penalty — provisional, pending empirical calibration from real runs.
+  // See: docs/plans/2026-03-08-benchmark-validity-fixes-design.md
+  const overheadPenalty = metrics.coordinationOverheadRatio * 100;
 
   // Weighted sum
   const weightedComponents = {
