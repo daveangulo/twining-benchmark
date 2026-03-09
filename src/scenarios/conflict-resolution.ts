@@ -244,7 +244,7 @@ export class ConflictResolutionScenario extends BaseScenario {
 
     // Collect all text from Agent C's tool calls and diffs
     const cText = [
-      transcriptC.toolCalls.map((tc) => `${tc.toolName} ${JSON.stringify(tc.input)}`).join('\n'),
+      transcriptC.toolCalls.map((tc) => `${tc.toolName} ${JSON.stringify(tc.parameters)}`).join('\n'),
       transcriptC.fileChanges.map((c) => c.diff ?? '').join('\n'),
     ].join('\n').toLowerCase();
 
