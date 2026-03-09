@@ -5,7 +5,21 @@ import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
 
 const TWINING_SYSTEM_PROMPT = `You have access to Twining, a coordination plugin for multi-agent workflows.
-Use the twining:* skills (twining-orient, twining-decide, twining-verify) to follow the Twining lifecycle gates documented in CLAUDE.md.`;
+
+Follow the Twining lifecycle gates for every task:
+
+**Before starting work:**
+1. Call twining_assemble with your task description to get context from prior agents
+2. Call twining_why on any files you plan to modify to understand prior decisions
+
+**While working:**
+3. Call twining_decide for any architectural or implementation choice where alternatives exist — include rationale and at least one rejected alternative
+4. Call twining_post with entry_type "finding" for discoveries, "warning" for gotchas you encounter
+
+**Before finishing:**
+5. Call twining_verify on your scope to check for unresolved issues
+6. Call twining_post with entry_type "status" summarizing what you accomplished
+7. Call twining_handoff with your results so the next agent can pick up where you left off`;
 
 /**
  * FR-CND-006: Full Twining Plugin
@@ -159,12 +173,23 @@ export class FullTwiningCondition extends BaseCondition {
 
 ## Twining Integration
 
-This project uses the Twining plugin for shared agent coordination.
-Use the \`twining:*\` skills for all lifecycle gates:
+This project uses the Twining plugin for structured agent coordination.
 
-- **Before work:** invoke \`twining:twining-orient\`
-- **After decisions:** invoke \`twining:twining-decide\`
-- **Before completion:** invoke \`twining:twining-verify\`
+### Mandatory Lifecycle Gates
+
+**Before work:** Call \`twining_assemble\` with your task and scope to get decisions, warnings, and context from prior agents. Call \`twining_why\` on files you plan to modify.
+
+**During work:** Call \`twining_decide\` for any choice where alternatives exist. Call \`twining_post\` with entry_type "finding" or "warning" as you discover things.
+
+**Before finishing:** Call \`twining_verify\` on your scope. Call \`twining_post\` with entry_type "status" summarizing your work. Call \`twining_handoff\` with results for the next agent.
+
+### Available Tools
+- **Context:** twining_assemble, twining_why, twining_what_changed
+- **Decisions:** twining_decide, twining_search_decisions, twining_trace
+- **Blackboard:** twining_post, twining_read, twining_query, twining_recent
+- **Coordination:** twining_handoff, twining_acknowledge, twining_agents
+- **Verification:** twining_verify, twining_status
+- **Knowledge Graph:** twining_add_entity, twining_add_relation, twining_neighbors
 `;
   }
 }
