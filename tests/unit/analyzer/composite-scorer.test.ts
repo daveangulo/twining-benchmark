@@ -258,6 +258,128 @@ describe('rankConditions', () => {
     expect(rankings[2]!.rank).toBe(3);
     expect(rankings[2]!.deltaVsBest).toBeCloseTo(-40, 0);
   });
+
+  it('produces pValue from Mann-Whitney U when rawScores provided', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88]],
+      ['low', [50, 52, 48]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // The lower-ranked condition (index 1) should have a Mann-Whitney pValue
+    expect(rankings[1]!.pValue).toBeDefined();
+    expect(typeof rankings[1]!.pValue).toBe('number');
+    // Best condition (rank 1) has no comparison, so no pValue
+    expect(rankings[0]!.pValue).toBeUndefined();
+  });
+
+  it('still produces zTestPValue as secondary', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 3, standardDeviation: 2 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 3, standardDeviation: 2 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88]],
+      ['low', [50, 52, 48]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // Both p-values should be present for the non-best condition
+    expect(rankings[1]!.pValue).toBeDefined();
+    expect(rankings[1]!.zTestPValue).toBeDefined();
+    expect(typeof rankings[1]!.zTestPValue).toBe('number');
+  });
+
+  it('determines significance by Mann-Whitney p-value when available', () => {
+    // Create two conditions with clearly separated scores so Mann-Whitney gives significant result
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+      makeScoredResult({ condition: 'high', composite: 91 }),
+      makeScoredResult({ condition: 'high', composite: 89 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 5, standardDeviation: 1.58 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+      makeScoredResult({ condition: 'low', composite: 51 }),
+      makeScoredResult({ condition: 'low', composite: 49 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 5, standardDeviation: 1.58 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88, 91, 89]],
+      ['low', [50, 52, 48, 51, 49]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // With completely non-overlapping distributions, Mann-Whitney should yield significance
+    expect(rankings[1]!.significance).toBe('significant');
+    expect(rankings[1]!.pValue).toBeLessThan(0.05);
+  });
+
+  it('falls back to z-test when rawScores not provided', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 3, standardDeviation: 2 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 3, standardDeviation: 2 };
+
+    // No rawScores provided
+    const rankings = rankConditions([aggHigh, aggLow]);
+
+    // Should still determine significance via z-test fallback
+    expect(rankings[1]!.pValue).toBeUndefined();
+    expect(rankings[1]!.zTestPValue).toBeDefined();
+    // With mean diff of 40 and small SD, z-test should find significance
+    expect(rankings[1]!.significance).toBe('significant');
+  });
 });
 
 describe('calculateEfficacyScore', () => {
