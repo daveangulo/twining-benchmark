@@ -438,4 +438,165 @@ describe('AgentSessionManager', () => {
     expect(transcript.timing.timeToFirstActionMs).toBe(-1);
     expect(transcript.toolCalls).toHaveLength(0);
   });
+
+  it('augments prompt with history prefix when persistHistory is true', async () => {
+    // First task: agent says something
+    const stream1 = createMockQueryStream([
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'I refactored the user service.' }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'msg-1',
+        session_id: 'sess-1',
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        result: 'Done',
+        duration_ms: 1000,
+        duration_api_ms: 800,
+        total_cost_usd: 0.002,
+        usage: { input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: 'result-1',
+        session_id: 'sess-1',
+      },
+    ]);
+
+    // Second task: should receive augmented prompt
+    const stream2 = createMockQueryStream([
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'I see the previous work.' }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'msg-2',
+        session_id: 'sess-2',
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        result: 'Done',
+        duration_ms: 1000,
+        duration_api_ms: 800,
+        total_cost_usd: 0.002,
+        usage: { input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: 'result-2',
+        session_id: 'sess-2',
+      },
+    ]);
+
+    mockQuery
+      .mockReturnValueOnce(stream1 as ReturnType<typeof sdkQuery>)
+      .mockReturnValueOnce(stream2 as ReturnType<typeof sdkQuery>);
+
+    const manager = new AgentSessionManager({
+      runId: 'run-persist',
+      scenario: 'test',
+      condition: 'persistent-history',
+      workingDir: '/tmp/test',
+      agentConfig: makeAgentConfig({ persistHistory: true }),
+    });
+
+    // Execute first task
+    await manager.executeTask(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
+
+    // Execute second task — should have history prefix
+    await manager.executeTask(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
+
+    // Check the second call to sdkQuery had augmented prompt
+    const secondCall = mockQuery.mock.calls[1]!;
+    const secondPrompt = (secondCall[0] as Record<string, unknown>).prompt as string;
+    expect(secondPrompt).toContain('=== Previous Developer 1 ===');
+    expect(secondPrompt).toContain('I refactored the user service.');
+    expect(secondPrompt).toContain('=== Your Task ===');
+    expect(secondPrompt).toContain('Second task');
+  });
+
+  it('does not augment prompt when persistHistory is false', async () => {
+    const stream1 = createMockQueryStream([
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'I did something.' }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'msg-1',
+        session_id: 'sess-1',
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        result: 'Done',
+        duration_ms: 1000,
+        duration_api_ms: 800,
+        total_cost_usd: 0.002,
+        usage: { input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: 'result-1',
+        session_id: 'sess-1',
+      },
+    ]);
+
+    const stream2 = createMockQueryStream([
+      {
+        type: 'assistant',
+        message: {
+          content: [{ type: 'text', text: 'Working on it.' }],
+        },
+        parent_tool_use_id: null,
+        uuid: 'msg-2',
+        session_id: 'sess-2',
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        num_turns: 1,
+        result: 'Done',
+        duration_ms: 1000,
+        duration_api_ms: 800,
+        total_cost_usd: 0.002,
+        usage: { input_tokens: 200, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+        modelUsage: {},
+        permission_denials: [],
+        uuid: 'result-2',
+        session_id: 'sess-2',
+      },
+    ]);
+
+    mockQuery
+      .mockReturnValueOnce(stream1 as ReturnType<typeof sdkQuery>)
+      .mockReturnValueOnce(stream2 as ReturnType<typeof sdkQuery>);
+
+    const manager = new AgentSessionManager({
+      runId: 'run-no-persist',
+      scenario: 'test',
+      condition: 'baseline',
+      workingDir: '/tmp/test',
+      agentConfig: makeAgentConfig(), // persistHistory defaults to undefined/false
+    });
+
+    await manager.executeTask(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
+    await manager.executeTask(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
+
+    // Second call should have unmodified prompt
+    const secondCall = mockQuery.mock.calls[1]!;
+    const secondPrompt = (secondCall[0] as Record<string, unknown>).prompt as string;
+    expect(secondPrompt).toBe('Second task');
+    expect(secondPrompt).not.toContain('Previous Developer');
+  });
 });

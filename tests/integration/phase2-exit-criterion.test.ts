@@ -132,9 +132,9 @@ describe('Phase 2 Exit Criterion', () => {
       }
     });
 
-    it('resolveConditionNames("all") returns all 6', () => {
+    it('resolveConditionNames("all") returns all 8', () => {
       const names = resolveConditionNames('all');
-      expect(names).toHaveLength(6);
+      expect(names).toHaveLength(8);
     });
   });
 
@@ -154,7 +154,7 @@ describe('Phase 2 Exit Criterion', () => {
       expect(result.totalCes).toBeCloseTo(90, 0);
     });
 
-    it('overhead penalty follows PRD formula: max(0, (ratio - 0.10)) * 200', () => {
+    it('overhead penalty follows smooth linear formula: ratio * 100', () => {
       const metrics: CesInputMetrics = {
         contradictionRate: 0,
         testPassRate: 1,
@@ -164,10 +164,10 @@ describe('Phase 2 Exit Criterion', () => {
       };
 
       const result = calculateCes(metrics);
-      // overhead_penalty = max(0, 0.25 - 0.10) * 200 = 30
-      expect(result.overheadPenalty).toBeCloseTo(30, 0);
-      // CES = 90 - 0.10*30 = 87
-      expect(result.totalCes).toBeCloseTo(87, 0);
+      // overhead_penalty = 0.25 * 100 = 25
+      expect(result.overheadPenalty).toBeCloseTo(25, 0);
+      // CES = 90 - 0.10*25 = 87.5
+      expect(result.totalCes).toBeCloseTo(87.5, 0);
     });
   });
 

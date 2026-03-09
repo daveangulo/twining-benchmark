@@ -22,6 +22,7 @@ import {
   withRetry,
   type RetryOptions,
 } from './error-handler.js';
+import { seededShuffle } from './shuffle.js';
 
 /**
  * Options for creating a run orchestrator.
@@ -207,12 +208,25 @@ export class RunOrchestrator {
     const iterations: IterationResult[] = [];
 
     try {
+      // Build execution tuples and optionally shuffle
+      type ExecutionTuple = { scenario: Scenario; condition: Condition; iteration: number };
+      const tuples: ExecutionTuple[] = [];
       for (const scenario of this.scenarios) {
-        const scenarioMeta = scenario.getMetadata();
-
         for (const condition of this.conditions) {
           for (let iteration = 0; iteration < this.runsPerPair; iteration++) {
-            const iterationKey = `${scenarioMeta.name}:${condition.name}:${iteration}`;
+            tuples.push({ scenario, condition, iteration });
+          }
+        }
+      }
+
+      const executionOrder = this.seed
+        ? seededShuffle(tuples, this.seed)
+        : tuples;
+
+      for (let orderIndex = 0; orderIndex < executionOrder.length; orderIndex++) {
+        const { scenario, condition, iteration } = executionOrder[orderIndex]!;
+        const scenarioMeta = scenario.getMetadata();
+        const iterationKey = `${scenarioMeta.name}:${condition.name}:${iteration}`;
 
             // Skip already-completed iterations when resuming
             if (completedIterationKeys.has(iterationKey)) {
@@ -274,8 +288,6 @@ export class RunOrchestrator {
               iteration,
               message: `Completed ${iterationKey}: ${result.sessions.length} sessions, ${result.errors.length} errors`,
             });
-          }
-        }
       }
 
       runMetadata.status = 'completed';

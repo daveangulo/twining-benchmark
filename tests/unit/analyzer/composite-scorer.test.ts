@@ -85,29 +85,43 @@ describe('calculateCes', () => {
     expect(result.integrationScore).toBe(0);
   });
 
-  it('overhead penalty kicks in above 10%', () => {
-    const noOverhead: CesInputMetrics = {
+  it('uses smooth linear overhead penalty without cliff', () => {
+    // 8% overhead should produce penalty of 8 (not 0 as old cliff formula)
+    const metrics: CesInputMetrics = {
       contradictionRate: 0,
       testPassRate: 1,
       redundantWorkPct: 0,
       architecturalCoherence: 5,
-      coordinationOverheadRatio: 0.05, // below threshold
+      coordinationOverheadRatio: 0.08,
     };
-
-    const withOverhead: CesInputMetrics = {
-      ...noOverhead,
-      coordinationOverheadRatio: 0.20, // 10% above threshold
-    };
-
-    const resultNoOverhead = calculateCes(noOverhead);
-    const resultWithOverhead = calculateCes(withOverhead);
-
-    expect(resultNoOverhead.overheadPenalty).toBe(0);
-    expect(resultWithOverhead.overheadPenalty).toBeCloseTo(20, 0); // (0.20 - 0.10) * 200
-    expect(resultWithOverhead.totalCes).toBeLessThan(resultNoOverhead.totalCes);
+    const ces = calculateCes(metrics);
+    expect(ces.overheadPenalty).toBeCloseTo(8);
   });
 
-  it('overhead penalty exactly at 10% threshold is zero', () => {
+  it('smooth linear overhead penalty is proportional at all levels', () => {
+    const lowOverhead: CesInputMetrics = {
+      contradictionRate: 0,
+      testPassRate: 1,
+      redundantWorkPct: 0,
+      architecturalCoherence: 5,
+      coordinationOverheadRatio: 0.05,
+    };
+
+    const highOverhead: CesInputMetrics = {
+      ...lowOverhead,
+      coordinationOverheadRatio: 0.20,
+    };
+
+    const resultLow = calculateCes(lowOverhead);
+    const resultHigh = calculateCes(highOverhead);
+
+    // 5% overhead = 5 penalty, 20% overhead = 20 penalty
+    expect(resultLow.overheadPenalty).toBeCloseTo(5, 0);
+    expect(resultHigh.overheadPenalty).toBeCloseTo(20, 0);
+    expect(resultHigh.totalCes).toBeLessThan(resultLow.totalCes);
+  });
+
+  it('overhead penalty at 10% is 10 (no cliff)', () => {
     const metrics: CesInputMetrics = {
       contradictionRate: 0,
       testPassRate: 1,
@@ -117,7 +131,7 @@ describe('calculateCes', () => {
     };
 
     const result = calculateCes(metrics);
-    expect(result.overheadPenalty).toBe(0);
+    expect(result.overheadPenalty).toBeCloseTo(10);
   });
 
   it('uses custom weights', () => {
@@ -174,7 +188,7 @@ describe('calculateCesFromScores', () => {
     expect(result.integrationScore).toBeCloseTo(90, 0);
     expect(result.redundancyScore).toBeCloseTo(70, 0);
     expect(result.coherenceScore).toBeCloseTo(60, 0);
-    expect(result.overheadPenalty).toBe(0); // 5% < 10%
+    expect(result.overheadPenalty).toBeCloseTo(5); // 5% * 100 = 5
   });
 
   it('defaults missing dimensions to 50', () => {
@@ -257,6 +271,128 @@ describe('rankConditions', () => {
     expect(rankings[2]!.condition).toBe('low');
     expect(rankings[2]!.rank).toBe(3);
     expect(rankings[2]!.deltaVsBest).toBeCloseTo(-40, 0);
+  });
+
+  it('produces pValue from Mann-Whitney U when rawScores provided', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88]],
+      ['low', [50, 52, 48]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // The lower-ranked condition (index 1) should have a Mann-Whitney pValue
+    expect(rankings[1]!.pValue).toBeDefined();
+    expect(typeof rankings[1]!.pValue).toBe('number');
+    // Best condition (rank 1) has no comparison, so no pValue
+    expect(rankings[0]!.pValue).toBeUndefined();
+  });
+
+  it('still produces zTestPValue as secondary', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 3, standardDeviation: 2 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 3, standardDeviation: 2 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88]],
+      ['low', [50, 52, 48]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // Both p-values should be present for the non-best condition
+    expect(rankings[1]!.pValue).toBeDefined();
+    expect(rankings[1]!.zTestPValue).toBeDefined();
+    expect(typeof rankings[1]!.zTestPValue).toBe('number');
+  });
+
+  it('determines significance by Mann-Whitney p-value when available', () => {
+    // Create two conditions with clearly separated scores so Mann-Whitney gives significant result
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+      makeScoredResult({ condition: 'high', composite: 91 }),
+      makeScoredResult({ condition: 'high', composite: 89 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 5, standardDeviation: 1.58 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+      makeScoredResult({ condition: 'low', composite: 51 }),
+      makeScoredResult({ condition: 'low', composite: 49 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 5, standardDeviation: 1.58 };
+
+    const rawScores = new Map<string, number[]>([
+      ['high', [90, 92, 88, 91, 89]],
+      ['low', [50, 52, 48, 51, 49]],
+    ]);
+
+    const rankings = rankConditions([aggHigh, aggLow], rawScores);
+
+    // With completely non-overlapping distributions, Mann-Whitney should yield significance
+    expect(rankings[1]!.significance).toBe('significant');
+    expect(rankings[1]!.pValue).toBeLessThan(0.05);
+  });
+
+  it('falls back to z-test when rawScores not provided', () => {
+    const aggHigh = aggregateResults([
+      makeScoredResult({ condition: 'high', composite: 90 }),
+      makeScoredResult({ condition: 'high', composite: 92 }),
+      makeScoredResult({ condition: 'high', composite: 88 }),
+    ]);
+    aggHigh.condition = 'high';
+    aggHigh.compositeScore = { ...aggHigh.compositeScore, mean: 90, n: 3, standardDeviation: 2 };
+
+    const aggLow = aggregateResults([
+      makeScoredResult({ condition: 'low', composite: 50 }),
+      makeScoredResult({ condition: 'low', composite: 52 }),
+      makeScoredResult({ condition: 'low', composite: 48 }),
+    ]);
+    aggLow.condition = 'low';
+    aggLow.compositeScore = { ...aggLow.compositeScore, mean: 50, n: 3, standardDeviation: 2 };
+
+    // No rawScores provided
+    const rankings = rankConditions([aggHigh, aggLow]);
+
+    // Should still determine significance via z-test fallback
+    expect(rankings[1]!.pValue).toBeUndefined();
+    expect(rankings[1]!.zTestPValue).toBeDefined();
+    // With mean diff of 40 and small SD, z-test should find significance
+    expect(rankings[1]!.significance).toBe('significant');
   });
 });
 

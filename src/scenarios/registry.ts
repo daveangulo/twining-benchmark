@@ -4,6 +4,9 @@ import { createArchitectureCascadeScenario } from './architecture-cascade.js';
 import { createBugInvestigationScenario } from './bug-investigation.js';
 import { createMultiSessionBuildScenario } from './multi-session-build.js';
 import { createScaleStressTestScenario } from './scale-stress-test.js';
+import { createConflictResolutionScenario } from './conflict-resolution.js';
+import { createConcurrentAgentsScenario } from './concurrent-agents.js';
+import { createContextRecoveryScenario } from './context-recovery.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -68,6 +71,42 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createScaleStressTestScenario(),
+  },
+  'conflict-resolution': {
+    metadata: {
+      name: 'conflict-resolution',
+      description: 'Two agents implement notifications with contradictory architectures (event-driven vs direct calls). A third agent must detect the conflict, choose the better approach, and unify the codebase.',
+      estimatedDurationMinutes: 45,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 3,
+      scoringDimensions: ['conflict-detection', 'resolution-quality', 'decision-documentation'],
+      excludeFromAll: false,
+    },
+    create: () => createConflictResolutionScenario(),
+  },
+  'concurrent-agents': {
+    metadata: {
+      name: 'concurrent-agents',
+      description: 'Three agents work in parallel (caching, audit logging, validation). A fourth merge agent resolves conflicts and ensures integration.',
+      estimatedDurationMinutes: 40,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 4,
+      scoringDimensions: ['merge-conflicts', 'architectural-consistency', 'completion'],
+      excludeFromAll: false,
+    },
+    create: () => createConcurrentAgentsScenario(),
+  },
+  'context-recovery': {
+    metadata: {
+      name: 'context-recovery',
+      description: 'Agent A works on analytics API, gets interrupted mid-task. Agent B recovers context and completes the work. Measures orientation efficiency and redundant rework.',
+      estimatedDurationMinutes: 30,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 2,
+      scoringDimensions: ['orientation-efficiency', 'redundant-rework', 'completion', 'context-accuracy'],
+      excludeFromAll: false,
+    },
+    create: () => createContextRecoveryScenario(),
   },
 };
 

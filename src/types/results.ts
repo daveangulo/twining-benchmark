@@ -20,6 +20,8 @@ export interface DimensionScore {
   method: ScoreMethod;
   /** Human-readable justification for the score */
   justification: string;
+  /** Quality of the data used for scoring */
+  dataQuality?: 'complete' | 'partial' | 'missing';
 }
 
 /**
@@ -61,6 +63,26 @@ export interface RunMetrics {
   compiles: boolean;
 }
 
+/** Standalone quality scores — evaluates output independent of coordination. */
+export interface StandaloneScoreResult {
+  correctness: DimensionScore;
+  architecturalSoundness: DimensionScore;
+  maintainability: DimensionScore;
+  completeness: DimensionScore;
+  /** Composite standalone score (0-100), equal weights */
+  composite: number;
+}
+
+/** Coordination lift — difference between coordination and standalone scores. */
+export interface CoordinationLift {
+  /** coordinationScore - standaloneScore (positive = coordination helped) */
+  lift: number;
+  /** Coordination composite score */
+  coordinationScore: number;
+  /** Standalone composite score */
+  standaloneScore: number;
+}
+
 /**
  * Scored results for a single iteration of a scenario/condition pair.
  * PRD Section 7.2.
@@ -76,6 +98,10 @@ export interface ScoredResults {
   metrics: RunMetrics;
   /** Weighted composite score (0-100) */
   composite: number;
+  /** Standalone quality scores (if LLM judge available) */
+  standaloneScores?: StandaloneScoreResult;
+  /** Coordination lift (if both coordination and standalone scores available) */
+  coordinationLift?: CoordinationLift;
 }
 
 /**
@@ -171,4 +197,8 @@ export interface ConditionRanking {
   deltaVsBest: number;
   /** Significance indicator vs. next-best */
   significance: 'significant' | 'suggestive' | 'not-distinguishable';
+  /** Mann-Whitney U p-value (primary) */
+  pValue?: number;
+  /** Z-test p-value (reference only, not appropriate for N < 30) */
+  zTestPValue?: number;
 }

@@ -35,9 +35,12 @@ describe('FullTwiningCondition', () => {
     await condition.setup(workDir);
 
     const content = await readFile(join(workDir, 'CLAUDE.md'), 'utf-8');
-    expect(content).toContain('twining:twining-orient');
-    expect(content).toContain('twining:twining-decide');
-    expect(content).toContain('twining:twining-verify');
+    expect(content).toContain('twining_assemble');
+    expect(content).toContain('twining_decide');
+    expect(content).toContain('twining_verify');
+    expect(content).toContain('twining_handoff');
+    expect(content).toContain('twining_why');
+    expect(content).toContain('twining_post');
   });
 
   it('agent config includes Twining MCP server', async () => {
@@ -90,12 +93,23 @@ describe('FullTwiningCondition', () => {
     expect(config.allowedTools).toContain('mcp__plugin_twining_twining__twining_verify');
   });
 
-  it('system prompt references Twining and CLAUDE.md', async () => {
+  it('system prompt references Twining', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
     expect(config.systemPrompt).toContain('Twining');
-    expect(config.systemPrompt).toContain('CLAUDE.md');
+  });
+
+  it('system prompt includes explicit lifecycle gate instructions', async () => {
+    await condition.setup(workDir);
+    const config = condition.getAgentConfig();
+
+    expect(config.systemPrompt).toContain('twining_assemble');
+    expect(config.systemPrompt).toContain('twining_decide');
+    expect(config.systemPrompt).toContain('twining_verify');
+    expect(config.systemPrompt).toContain('twining_handoff');
+    expect(config.systemPrompt).toContain('twining_why');
+    expect(config.systemPrompt).toContain('twining_post');
   });
 
   it('Twining project is isolated to the working directory', async () => {

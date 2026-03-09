@@ -13,8 +13,8 @@ import {
 } from '../../../src/scenarios/registry.js';
 
 describe('Condition Registry', () => {
-  it('has all 6 conditions', () => {
-    expect(getAllConditionNames()).toHaveLength(6);
+  it('has all 8 conditions', () => {
+    expect(getAllConditionNames()).toHaveLength(8);
   });
 
   it('has expected condition names', () => {
@@ -25,6 +25,8 @@ describe('Condition Registry', () => {
     expect(names).toContain('file-reload-generic');
     expect(names).toContain('file-reload-structured');
     expect(names).toContain('full-twining');
+    expect(names).toContain('twining-lite');
+    expect(names).toContain('persistent-history');
   });
 
   it('getCondition returns valid entries', () => {
@@ -40,7 +42,7 @@ describe('Condition Registry', () => {
 
   it('resolveConditionNames resolves "all"', () => {
     const names = resolveConditionNames('all');
-    expect(names).toHaveLength(6);
+    expect(names).toHaveLength(8);
   });
 
   it('resolveConditionNames resolves single names', () => {
@@ -68,8 +70,8 @@ describe('Condition Registry', () => {
 });
 
 describe('Scenario Registry', () => {
-  it('has all 5 scenarios', () => {
-    expect(getAllScenarioNames()).toHaveLength(5);
+  it('has all 8 scenarios', () => {
+    expect(getAllScenarioNames()).toHaveLength(8);
   });
 
   it('has expected scenario names', () => {
@@ -93,7 +95,7 @@ describe('Scenario Registry', () => {
 
   it('resolveScenarioNames resolves "all" excluding scale-stress-test', () => {
     const names = resolveScenarioNames('all');
-    expect(names).toHaveLength(4);
+    expect(names).toHaveLength(7);
     expect(names).not.toContain('scale-stress-test');
   });
 

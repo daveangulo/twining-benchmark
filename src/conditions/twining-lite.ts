@@ -4,35 +4,34 @@ import type { AgentConfiguration, McpServerConfig } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
 
-const TWINING_SYSTEM_PROMPT = `You have access to Twining, a coordination plugin for multi-agent workflows.
+const TWINING_LITE_SYSTEM_PROMPT = `You have access to Twining Lite, a coordination plugin with core blackboard and decision tools.
 
-Follow the Twining lifecycle gates for every task:
+Follow these coordination steps:
 
 **Before starting work:**
-1. Call twining_assemble with your task description to get context from prior agents
-2. Call twining_why on any files you plan to modify to understand prior decisions
+1. Call twining_query to check for context from prior agents
 
 **While working:**
-3. Call twining_decide for any architectural or implementation choice where alternatives exist — include rationale and at least one rejected alternative
-4. Call twining_post with entry_type "finding" for discoveries, "warning" for gotchas you encounter
+2. Call twining_decide for any architectural or implementation choice where alternatives exist
+3. Call twining_post with entry_type "finding" for discoveries, "warning" for gotchas
 
 **Before finishing:**
-5. Call twining_verify on your scope to check for unresolved issues
-6. Call twining_post with entry_type "status" summarizing what you accomplished
-7. Call twining_handoff with your results so the next agent can pick up where you left off`;
+4. Call twining_post with entry_type "status" summarizing what you accomplished
+5. Call twining_handoff with your results for the next agent`;
 
 /**
- * FR-CND-006: Full Twining Plugin
+ * FR-CND-007: Twining Lite
  *
- * Agents have CLAUDE.md plus the Twining plugin (MCP server, skills, hooks)
- * with all capabilities: blackboard, decision tracking, knowledge graph, and semantic search.
+ * Agents have CLAUDE.md plus the Twining plugin (MCP server) with only 8 core tools:
+ * blackboard (post, read, query, recent), decisions (decide, search_decisions),
+ * and handoff (handoff, acknowledge).
  *
  * The Twining project directory is isolated per run via --project flag.
  */
-export class FullTwiningCondition extends BaseCondition {
-  readonly name: ConditionName = 'full-twining';
+export class TwiningLiteCondition extends BaseCondition {
+  readonly name: ConditionName = 'twining-lite';
   readonly description =
-    'Full Twining MCP server with blackboard, decision tracking, knowledge graph, and semantic search.';
+    'Twining Lite — core blackboard and decision tools only (8 of 26 tools).';
 
   private projectDir = '';
 
@@ -46,10 +45,10 @@ export class FullTwiningCondition extends BaseCondition {
     // Use the working directory as the Twining project directory for isolation
     this.projectDir = workingDir;
 
-    // Write CLAUDE.md with Twining instructions
+    // Write CLAUDE.md with Twining Lite instructions
     const claudeMdPath = join(workingDir, 'CLAUDE.md');
     const content =
-      this.claudeMdContent ?? this.generateClaudeMdWithTwining();
+      this.claudeMdContent ?? this.generateClaudeMdWithTwiningLite();
     await writeFile(claudeMdPath, content, 'utf-8');
     setupFiles.push('CLAUDE.md');
 
@@ -66,7 +65,7 @@ export class FullTwiningCondition extends BaseCondition {
     };
 
     return {
-      systemPrompt: TWINING_SYSTEM_PROMPT,
+      systemPrompt: TWINING_LITE_SYSTEM_PROMPT,
       mcpServers: {
         twining: twiningServer,
       },
@@ -77,34 +76,13 @@ export class FullTwiningCondition extends BaseCondition {
         'Bash',
         'Glob',
         'Grep',
-        // All Twining tools
+        // Core Twining tools (8 of 26)
         'mcp__plugin_twining_twining__twining_post',
         'mcp__plugin_twining_twining__twining_read',
         'mcp__plugin_twining_twining__twining_query',
         'mcp__plugin_twining_twining__twining_recent',
         'mcp__plugin_twining_twining__twining_decide',
-        'mcp__plugin_twining_twining__twining_why',
-        'mcp__plugin_twining_twining__twining_trace',
-        'mcp__plugin_twining_twining__twining_reconsider',
-        'mcp__plugin_twining_twining__twining_override',
         'mcp__plugin_twining_twining__twining_search_decisions',
-        'mcp__plugin_twining_twining__twining_link_commit',
-        'mcp__plugin_twining_twining__twining_commits',
-        'mcp__plugin_twining_twining__twining_assemble',
-        'mcp__plugin_twining_twining__twining_summarize',
-        'mcp__plugin_twining_twining__twining_what_changed',
-        'mcp__plugin_twining_twining__twining_add_entity',
-        'mcp__plugin_twining_twining__twining_add_relation',
-        'mcp__plugin_twining_twining__twining_neighbors',
-        'mcp__plugin_twining_twining__twining_graph_query',
-        'mcp__plugin_twining_twining__twining_verify',
-        'mcp__plugin_twining_twining__twining_status',
-        'mcp__plugin_twining_twining__twining_archive',
-        'mcp__plugin_twining_twining__twining_export',
-        // Agent coordination tools
-        'mcp__plugin_twining_twining__twining_agents',
-        'mcp__plugin_twining_twining__twining_discover',
-        'mcp__plugin_twining_twining__twining_delegate',
         'mcp__plugin_twining_twining__twining_handoff',
         'mcp__plugin_twining_twining__twining_acknowledge',
       ],
@@ -129,11 +107,10 @@ export class FullTwiningCondition extends BaseCondition {
       'CLAUDE.md',
       '.twining/blackboard.jsonl',
       '.twining/decisions.jsonl',
-      '.twining/graph.json',
     ];
   }
 
-  private generateClaudeMdWithTwining(): string {
+  private generateClaudeMdWithTwiningLite(): string {
     return `# Project Guidelines
 
 ## Architecture
@@ -171,25 +148,29 @@ export class FullTwiningCondition extends BaseCondition {
 
 ---
 
-## Twining Integration
+## Twining Lite Integration
 
-This project uses the Twining plugin for structured agent coordination.
+This project uses Twining Lite for lightweight agent coordination.
+You have access to the following 8 Twining tools:
 
-### Mandatory Lifecycle Gates
+### Blackboard Tools
+- \`twining_post\` — Post entries (findings, warnings, status updates)
+- \`twining_read\` — Read specific blackboard entries
+- \`twining_query\` — Query the blackboard for context
+- \`twining_recent\` — Get recent blackboard entries
 
-**Before work:** Call \`twining_assemble\` with your task and scope to get decisions, warnings, and context from prior agents. Call \`twining_why\` on files you plan to modify.
+### Decision Tools
+- \`twining_decide\` — Record architectural/implementation decisions
+- \`twining_search_decisions\` — Search past decisions
 
-**During work:** Call \`twining_decide\` for any choice where alternatives exist. Call \`twining_post\` with entry_type "finding" or "warning" as you discover things.
+### Handoff Tools
+- \`twining_handoff\` — Hand off work to the next agent
+- \`twining_acknowledge\` — Acknowledge a handoff from a prior agent
 
-**Before finishing:** Call \`twining_verify\` on your scope. Call \`twining_post\` with entry_type "status" summarizing your work. Call \`twining_handoff\` with results for the next agent.
-
-### Available Tools
-- **Context:** twining_assemble, twining_why, twining_what_changed
-- **Decisions:** twining_decide, twining_search_decisions, twining_trace
-- **Blackboard:** twining_post, twining_read, twining_query, twining_recent
-- **Coordination:** twining_handoff, twining_acknowledge, twining_agents
-- **Verification:** twining_verify, twining_status
-- **Knowledge Graph:** twining_add_entity, twining_add_relation, twining_neighbors
+### Workflow
+1. **Before work:** Call \`twining_query\` to check for prior context
+2. **During work:** Use \`twining_decide\` for choices, \`twining_post\` for findings/warnings
+3. **After work:** Post a status summary and call \`twining_handoff\`
 `;
   }
 }

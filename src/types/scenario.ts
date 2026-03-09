@@ -12,7 +12,10 @@ export type ScenarioName =
   | 'architecture-cascade'
   | 'bug-investigation'
   | 'multi-session-build'
-  | 'scale-stress-test';
+  | 'scale-stress-test'
+  | 'conflict-resolution'
+  | 'concurrent-agents'
+  | 'context-recovery';
 
 /**
  * Metadata describing a scenario.
@@ -32,6 +35,8 @@ export interface ScenarioMetadata {
   scoringDimensions: string[];
   /** Whether this scenario is excluded from --scenario all */
   excludeFromAll: boolean;
+  /** How agent tasks are executed: sequentially (default) or in parallel */
+  executionMode?: 'sequential' | 'parallel';
 }
 
 /**

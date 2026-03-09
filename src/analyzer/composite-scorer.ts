@@ -1,6 +1,6 @@
 import type { ScoreWeights } from '../types/config.js';
 import { DEFAULT_SCORE_WEIGHTS as WEIGHTS } from '../types/config.js';
-import { normalCdf } from './statistics.js';
+import { normalCdf, mannWhitneyU } from './statistics.js';
 import type {
   DimensionScore,
   ScoredResults,
@@ -58,7 +58,7 @@ export interface CesBreakdown {
  * - integration_score = test_pass_rate × 100
  * - redundancy_score = 100 - (redundant_work_% × 100)
  * - coherence_score = (architectural_coherence / 5) × 100
- * - overhead_penalty = max(0, (coordination_overhead_ratio - 0.10)) × 200
+ * - overhead_penalty = coordination_overhead_ratio × 100
  */
 export function calculateCes(
   metrics: CesInputMetrics,
@@ -70,9 +70,9 @@ export function calculateCes(
   const redundancyScore = 100 - metrics.redundantWorkPct * 100;
   const coherenceScore = (metrics.architecturalCoherence / 5) * 100;
 
-  // Overhead penalty: kicks in above 10% overhead
-  const overheadPenalty =
-    Math.max(0, metrics.coordinationOverheadRatio - 0.10) * 200;
+  // Smooth linear penalty — provisional, pending empirical calibration from real runs.
+  // See: docs/plans/2026-03-08-benchmark-validity-fixes-design.md
+  const overheadPenalty = metrics.coordinationOverheadRatio * 100;
 
   // Weighted sum
   const weightedComponents = {
@@ -215,6 +215,7 @@ export function aggregateResults(
  */
 export function rankConditions(
   aggregated: AggregatedResults[],
+  rawScores?: Map<string, number[]>,
 ): ConditionRanking[] {
   // Sort by composite score descending
   const sorted = [...aggregated].sort(
@@ -226,13 +227,14 @@ export function rankConditions(
   return sorted.map((agg, index) => {
     // Determine significance vs next-best using composite scores
     let significance: ConditionRanking['significance'] = 'not-distinguishable';
+    let zTestPValue: number | undefined;
+    let mwPValue: number | undefined;
 
     if (index > 0) {
       const prev = sorted[index - 1]!;
-      // If we have enough data points, use Mann-Whitney comparison
+
+      // Z-test (reference only, not appropriate for N < 30)
       if (agg.compositeScore.n >= 3 && prev.compositeScore.n >= 3) {
-        // Reconstruct approximate values from summary stats for comparison
-        // In practice, the caller should provide raw values; here we use the p-value threshold
         const diff = prev.compositeScore.mean - agg.compositeScore.mean;
         const combinedSe = Math.sqrt(
           (prev.compositeScore.standardDeviation ** 2) / prev.compositeScore.n +
@@ -241,13 +243,25 @@ export function rankConditions(
 
         if (combinedSe > 0) {
           const z = diff / combinedSe;
-          // Approximate p-value from z-score
-          const pValue = 2 * (1 - normalCdf(Math.abs(z)));
-          if (pValue < 0.05) {
-            significance = 'significant';
-          } else if (pValue < 0.10) {
-            significance = 'suggestive';
-          }
+          zTestPValue = 2 * (1 - normalCdf(Math.abs(z)));
+        }
+      }
+
+      // Mann-Whitney U (primary) when raw scores are provided
+      const prevScores = rawScores?.get(prev.condition);
+      const currScores = rawScores?.get(agg.condition);
+      if (prevScores && currScores && prevScores.length >= 2 && currScores.length >= 2) {
+        const result = mannWhitneyU(prevScores, currScores);
+        mwPValue = result.pValue;
+      }
+
+      // Determine significance: prefer Mann-Whitney, fall back to z-test
+      const primaryPValue = mwPValue ?? zTestPValue;
+      if (primaryPValue !== undefined) {
+        if (primaryPValue < 0.05) {
+          significance = 'significant';
+        } else if (primaryPValue < 0.10) {
+          significance = 'suggestive';
         }
       }
     }
@@ -258,6 +272,8 @@ export function rankConditions(
       compositeScore: agg.compositeScore.mean,
       deltaVsBest: agg.compositeScore.mean - bestScore,
       significance,
+      pValue: mwPValue,
+      zTestPValue,
     };
   });
 }
