@@ -93,8 +93,7 @@ describe('TwiningLiteCondition', () => {
     expect(config.mcpServers).toHaveProperty('twining');
     const twiningServer = config.mcpServers['twining'];
     expect(twiningServer).toBeDefined();
-    expect(twiningServer!.command).toBe('npx');
-    expect(twiningServer!.args).toContain('twining-mcp');
+    expect(twiningServer!.command).toBe('twining-mcp');
     expect(twiningServer!.args).toContain('--project');
     expect(twiningServer!.args).toContain(workDir);
     expect(twiningServer!.env?.['TWINING_DASHBOARD']).toBe('0');

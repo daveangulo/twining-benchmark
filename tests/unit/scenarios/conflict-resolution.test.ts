@@ -161,15 +161,15 @@ describe('ConflictResolutionScenario', () => {
             toolCalls: [
               {
                 toolName: 'Read',
-                input: { file_path: 'src/events/event-bus.ts' },
-                output: 'event-driven bus with emit and subscribe',
+                parameters: { file_path: 'src/events/event-bus.ts' },
+                result: 'event-driven bus with emit and subscribe',
                 durationMs: 100,
                 turnIndex: 0,
               },
               {
                 toolName: 'Read',
-                input: { file_path: 'src/services/notification.service.ts' },
-                output: 'direct call pattern with service-to-service invocation',
+                parameters: { file_path: 'src/services/notification.service.ts' },
+                result: 'direct call pattern with service-to-service invocation',
                 durationMs: 100,
                 turnIndex: 1,
               },
@@ -215,8 +215,8 @@ describe('ConflictResolutionScenario', () => {
             toolCalls: [
               {
                 toolName: 'Read',
-                input: { file_path: 'src/events/event-bus.ts' },
-                output: 'found the event-driven pattern with emit and subscribe',
+                parameters: { file_path: 'src/events/event-bus.ts' },
+                result: 'found the event-driven pattern with emit and subscribe',
                 durationMs: 100,
                 turnIndex: 0,
               },
@@ -324,8 +324,8 @@ describe('ConflictResolutionScenario', () => {
             toolCalls: [
               {
                 toolName: 'Read',
-                input: {},
-                output: 'event-driven emit subscribe direct call service-to-service',
+                parameters: {},
+                result: 'event-driven emit subscribe direct call service-to-service',
                 durationMs: 100,
                 turnIndex: 0,
               },

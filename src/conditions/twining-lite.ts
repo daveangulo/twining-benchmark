@@ -57,8 +57,8 @@ export class TwiningLiteCondition extends BaseCondition {
 
   protected buildAgentConfig(): AgentConfiguration {
     const twiningServer: McpServerConfig = {
-      command: 'npx',
-      args: ['-y', 'twining-mcp', '--project', this.projectDir],
+      command: 'twining-mcp',
+      args: ['--project', this.projectDir],
       env: {
         TWINING_DASHBOARD: '0', // Disable dashboard during benchmarks
       },

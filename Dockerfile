@@ -21,6 +21,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# Pre-install twining-mcp so the full-twining condition doesn't need npx download at runtime
+RUN npm install -g twining-mcp
+
 COPY --from=build /app/dist ./dist
 
 # Volume mount point for persistent results
