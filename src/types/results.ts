@@ -20,6 +20,8 @@ export interface DimensionScore {
   method: ScoreMethod;
   /** Human-readable justification for the score */
   justification: string;
+  /** Quality of the data used for scoring */
+  dataQuality?: 'complete' | 'partial' | 'missing';
 }
 
 /**

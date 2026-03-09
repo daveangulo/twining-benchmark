@@ -360,6 +360,21 @@ export class ScaleStressTestScenario extends BaseScenario {
       };
     }
 
+    // Check for missing diff data across all transcripts
+    const allChanges = transcripts.flatMap((t) => t.fileChanges);
+    const allDiffs = allChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = allChanges.some((c) => c.diff === undefined);
+
+    if (hasMissingDiffs && allDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
+
     // Divide sessions into early half and late half
     const midpoint = Math.floor(transcripts.length / 2);
     const earlyTranscripts = transcripts.slice(0, midpoint);
@@ -412,6 +427,7 @@ export class ScaleStressTestScenario extends BaseScenario {
       method: 'automated',
       justification:
         `Pattern coherence: ${(coherence * 100).toFixed(1)}% (${intersection.length}/${union.size} patterns shared between early/late sessions). Late-session rework penalty: -${reworkPenalty}. Scale factor: ${this.scaleConfig.scaleFactor}.`,
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 
@@ -579,7 +595,8 @@ export class ScaleStressTestScenario extends BaseScenario {
     const counts: Record<string, number> = {};
 
     const allDiffs = transcripts
-      .flatMap((t) => t.fileChanges.map((fc) => fc.diff ?? ''))
+      .flatMap((t) => t.fileChanges.map((fc) => fc.diff))
+      .filter((d): d is string => d !== undefined)
       .join('\n');
 
     for (const pattern of patterns) {

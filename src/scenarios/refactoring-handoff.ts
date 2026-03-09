@@ -314,9 +314,18 @@ export class RefactoringHandoffScenario extends BaseScenario {
 
     // Check if Agent B's file changes reference the expected patterns
     const bChanges = transcriptB.fileChanges;
-    const bDiffs = bChanges
-      .map((c) => c.diff ?? '')
-      .join('\n');
+    const bDiffs = bChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = bChanges.some((c) => c.diff === undefined);
+
+    if (hasMissingDiffs && bDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
 
     for (const decision of groundTruth.decisions) {
       // Check expected patterns in Agent B's changes
@@ -352,6 +361,7 @@ export class RefactoringHandoffScenario extends BaseScenario {
         issues.length > 0
           ? `Consistency issues found: ${issues.join('; ')}`
           : 'Agent B aligned with Agent A\'s architectural choices.',
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 

@@ -453,8 +453,19 @@ export class BugInvestigationScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    const bDiffs = transcriptB.fileChanges.map((c) => c.diff ?? '').join('\n');
+    const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = transcriptB.fileChanges.some((c) => c.diff === undefined);
     const bFiles = transcriptB.fileChanges.map((c) => c.path);
+
+    if (hasMissingDiffs && bDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
 
     // Check: Was the bug file modified?
     const bugFix = groundTruth.decisions.find((d) => d.id === 'pagination-bug-fix');
@@ -503,6 +514,7 @@ export class BugInvestigationScenario extends BaseScenario {
       confidence: bDiffs.length > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 

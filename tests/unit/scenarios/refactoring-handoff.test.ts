@@ -386,6 +386,140 @@ describe('RefactoringHandoffScenario', () => {
       expect(scored.scores.completion.value).toBe(75);
     });
 
+    it('returns score 0 with dataQuality missing when diffs are undefined', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                // diff is intentionally omitted (undefined)
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/repositories/cached-user.repository.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                // diff is intentionally omitted (undefined)
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // Consistency should be 0 with dataQuality: 'missing' since Agent B has no diffs
+      expect(scored.scores.consistency.value).toBe(0);
+      expect(scored.scores.consistency.confidence).toBe('low');
+      expect(scored.scores.consistency.dataQuality).toBe('missing');
+      expect(scored.scores.consistency.justification).toContain('No diff data available');
+    });
+
+    it('sets dataQuality partial when some diffs are present and some missing', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+export interface IUserRepository {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/repositories/cached-user.repository.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+import { IUserRepository } from "./user.repository";\n+export class CachedUserRepository implements IUserRepository {\n+  private cache = new Map();\n',
+              },
+              {
+                path: 'src/services/user.service.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 2,
+                // diff is intentionally omitted (undefined) — partial data
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // Should have partial data quality since some diffs exist but some are missing
+      expect(scored.scores.consistency.dataQuality).toBe('partial');
+      // Score should still be computed from available diffs (not 0)
+      expect(scored.scores.consistency.value).toBeGreaterThan(0);
+    });
+
+    it('sets dataQuality complete when all diffs are present', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+export interface IUserRepository {\n+  findById(id: string): User | undefined;\n+}\n+export class UserRepository extends BaseRepository<User> implements IUserRepository {',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/repositories/cached-user.repository.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+import { IUserRepository } from "./user.repository";\n+export class CachedUserRepository implements IUserRepository {\n+  private cache = new Map();\n',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      expect(scored.scores.consistency.dataQuality).toBe('complete');
+    });
+
     it('extracts correct metrics from transcripts', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 

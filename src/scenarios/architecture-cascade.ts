@@ -376,7 +376,8 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     }
 
     // Detect A's chosen pattern from its diffs
-    const aDiffs = transcriptA.fileChanges.map((c) => c.diff ?? '').join('\n');
+    const aDiffs = transcriptA.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const aHasMissingDiffs = transcriptA.fileChanges.some((c) => c.diff === undefined);
     const decouplingDecision = groundTruth.decisions.find(
       (d) => d.id === 'decouple-notifications',
     );
@@ -389,6 +390,16 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
+    if (aHasMissingDiffs && aDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
+
     // Check which expected patterns A used
     const aPatterns = decouplingDecision.expectedPatterns.filter(
       (p) => new RegExp(p).test(aDiffs),
@@ -396,30 +407,43 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
     let bAligned = false;
     let cAligned = false;
+    let anyMissingDiffs = aHasMissingDiffs;
     const details: string[] = [];
 
     // Check if B follows A's patterns
     if (transcriptB) {
-      const bDiffs = transcriptB.fileChanges.map((c) => c.diff ?? '').join('\n');
-      bAligned = aPatterns.some((p) => new RegExp(p).test(bDiffs));
-      details.push(
-        bAligned
-          ? 'Agent B aligned with Agent A\'s pattern.'
-          : 'Agent B did NOT follow Agent A\'s architectural pattern.',
-      );
+      const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+      const bHasMissingDiffs = transcriptB.fileChanges.some((c) => c.diff === undefined);
+      if (bHasMissingDiffs) anyMissingDiffs = true;
+      if (bHasMissingDiffs && bDiffs.length === 0) {
+        details.push('Agent B has no diff data — git enrichment may have failed.');
+      } else {
+        bAligned = aPatterns.some((p) => new RegExp(p).test(bDiffs));
+        details.push(
+          bAligned
+            ? 'Agent B aligned with Agent A\'s pattern.'
+            : 'Agent B did NOT follow Agent A\'s architectural pattern.',
+        );
+      }
     } else {
       details.push('Agent B did not produce a transcript.');
     }
 
     // Check if C follows A's patterns
     if (transcriptC) {
-      const cDiffs = transcriptC.fileChanges.map((c) => c.diff ?? '').join('\n');
-      cAligned = aPatterns.some((p) => new RegExp(p).test(cDiffs));
-      details.push(
-        cAligned
-          ? 'Agent C aligned with Agent A\'s pattern.'
-          : 'Agent C did NOT follow Agent A\'s architectural pattern.',
-      );
+      const cDiffs = transcriptC.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+      const cHasMissingDiffs = transcriptC.fileChanges.some((c) => c.diff === undefined);
+      if (cHasMissingDiffs) anyMissingDiffs = true;
+      if (cHasMissingDiffs && cDiffs.length === 0) {
+        details.push('Agent C has no diff data — git enrichment may have failed.');
+      } else {
+        cAligned = aPatterns.some((p) => new RegExp(p).test(cDiffs));
+        details.push(
+          cAligned
+            ? 'Agent C aligned with Agent A\'s pattern.'
+            : 'Agent C did NOT follow Agent A\'s architectural pattern.',
+        );
+      }
     } else {
       details.push('Agent C did not produce a transcript.');
     }
@@ -438,6 +462,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       confidence: aPatterns.length > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
+      dataQuality: anyMissingDiffs ? (aDiffs.length > 0 ? 'partial' : 'missing') : 'complete',
     };
   }
 
@@ -460,8 +485,21 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    const bDiffs = transcriptB.fileChanges.map((c) => c.diff ?? '').join('\n');
-    const cDiffs = transcriptC.fileChanges.map((c) => c.diff ?? '').join('\n');
+    const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const bHasMissingDiffs = transcriptB.fileChanges.some((c) => c.diff === undefined);
+    const cDiffs = transcriptC.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const cHasMissingDiffs = transcriptC.fileChanges.some((c) => c.diff === undefined);
+    const hasMissingDiffs = bHasMissingDiffs || cHasMissingDiffs;
+
+    if (hasMissingDiffs && bDiffs.length === 0 && cDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
 
     // Define integration patterns to look for
     const integrationPatterns: Record<string, RegExp> = {
@@ -492,6 +530,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
         method: 'automated',
         justification:
           'No recognizable integration patterns detected in either B or C. Cannot assess consistency.',
+        dataQuality: hasMissingDiffs ? 'partial' : 'complete',
       };
     }
 
@@ -503,6 +542,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       confidence: bSet.size > 0 && cSet.size > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: `Agent B used patterns: [${bPatterns.join(', ')}]. Agent C used patterns: [${cPatterns.join(', ')}]. Overlap: ${intersection.length}/${union.size}.`,
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 
@@ -532,7 +572,8 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    const aDiffs = transcriptA.fileChanges.map((c) => c.diff ?? '').join('\n');
+    const aDiffs = transcriptA.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = transcriptA.fileChanges.some((c) => c.diff === undefined);
     const decouplingDecision = groundTruth.decisions.find(
       (d) => d.id === 'decouple-notifications',
     );
@@ -543,6 +584,16 @@ export class ArchitectureCascadeScenario extends BaseScenario {
         confidence: 'low',
         method: 'automated',
         justification: 'Ground truth missing decouple-notifications decision.',
+      };
+    }
+
+    if (hasMissingDiffs && aDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
       };
     }
 
@@ -593,6 +644,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       confidence: 'medium',
       method: 'automated',
       justification: details.join(' '),
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 

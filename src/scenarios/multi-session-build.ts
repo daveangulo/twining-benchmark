@@ -474,10 +474,19 @@ export class MultiSessionBuildScenario extends BaseScenario {
     }
 
     // Check: Do later sessions' diffs contain Session 1's design patterns?
-    const laterDiffs = rawResults.transcripts
-      .slice(1)
-      .flatMap((t) => t.fileChanges.map((c) => c.diff ?? ''))
-      .join('\n');
+    const laterChanges = rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges);
+    const laterDiffs = laterChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = laterChanges.some((c) => c.diff === undefined);
+
+    if (hasMissingDiffs && laterDiffs.length === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'No diff data available for scoring — git enrichment may have failed.',
+        dataQuality: 'missing',
+      };
+    }
 
     for (const decision of designDecisions) {
       const patternsFound = decision.expectedPatterns.filter(
@@ -513,6 +522,7 @@ export class MultiSessionBuildScenario extends BaseScenario {
       justification: details.length > 0
         ? details.join(' ')
         : 'Final implementation aligns well with Session 1 design.',
+      dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }
 
