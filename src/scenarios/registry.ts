@@ -6,6 +6,7 @@ import { createMultiSessionBuildScenario } from './multi-session-build.js';
 import { createScaleStressTestScenario } from './scale-stress-test.js';
 import { createConflictResolutionScenario } from './conflict-resolution.js';
 import { createConcurrentAgentsScenario } from './concurrent-agents.js';
+import { createContextRecoveryScenario } from './context-recovery.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -94,6 +95,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: false,
     },
     create: () => createConcurrentAgentsScenario(),
+  },
+  'context-recovery': {
+    metadata: {
+      name: 'context-recovery',
+      description: 'Agent A works on analytics API, gets interrupted mid-task. Agent B recovers context and completes the work. Measures orientation efficiency and redundant rework.',
+      estimatedDurationMinutes: 30,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 2,
+      scoringDimensions: ['orientation-efficiency', 'redundant-rework', 'completion', 'context-accuracy'],
+      excludeFromAll: false,
+    },
+    create: () => createContextRecoveryScenario(),
   },
 };
 

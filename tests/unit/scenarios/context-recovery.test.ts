@@ -1,0 +1,465 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  ContextRecoveryScenario,
+  CONTEXT_RECOVERY_GROUND_TRUTH,
+  createContextRecoveryScenario,
+} from '../../../src/scenarios/context-recovery.js';
+import type { WorkingDirectory } from '../../../src/types/target.js';
+import type { ConditionContext } from '../../../src/types/condition.js';
+import type { AgentTranscript } from '../../../src/types/transcript.js';
+import type { ScenarioRunner, RawResults } from '../../../src/types/scenario.js';
+
+/** Create a minimal working directory stub. */
+function makeWorkingDir(path = '/tmp/test-repo'): WorkingDirectory {
+  return {
+    path,
+    gitDir: `${path}/.git`,
+    cleanup: async () => {},
+  };
+}
+
+/** Create a minimal condition context stub. */
+function makeConditionContext(): ConditionContext {
+  return {
+    agentConfig: {
+      systemPrompt: '',
+      mcpServers: {},
+      allowedTools: ['Read', 'Edit', 'Write', 'Bash'],
+      permissionMode: 'acceptEdits',
+    },
+    setupFiles: [],
+    metadata: { conditionName: 'baseline' },
+  };
+}
+
+/** Create a mock transcript for testing scoring. */
+function makeTranscript(overrides: Partial<AgentTranscript> = {}): AgentTranscript {
+  return {
+    sessionId: 'test-session',
+    runId: 'test-run',
+    scenario: 'context-recovery',
+    condition: 'baseline',
+    taskIndex: 0,
+    prompt: 'Test prompt',
+    toolCalls: [],
+    fileChanges: [],
+    tokenUsage: { input: 1000, output: 500, cacheRead: 0, cacheCreation: 0, total: 1500, costUsd: 0.01 },
+    timing: {
+      startTime: '2026-03-08T10:00:00Z',
+      endTime: '2026-03-08T10:05:00Z',
+      durationMs: 300000,
+      timeToFirstActionMs: 10000,
+    },
+    exitReason: 'completed',
+    numTurns: 5,
+    stopReason: 'success',
+    contextWindowSize: 200000,
+    compactionCount: 0,
+    turnUsage: [],
+    ...overrides,
+  };
+}
+
+describe('ContextRecoveryScenario', () => {
+  let scenario: ContextRecoveryScenario;
+
+  beforeEach(() => {
+    scenario = new ContextRecoveryScenario();
+  });
+
+  afterEach(async () => {
+    await scenario.teardown();
+  });
+
+  describe('getMetadata()', () => {
+    it('returns correct scenario metadata', () => {
+      const meta = scenario.getMetadata();
+      expect(meta.name).toBe('context-recovery');
+      expect(meta.agentSessionCount).toBe(2);
+      expect(meta.scoringDimensions).toEqual([
+        'orientation-efficiency',
+        'redundant-rework',
+        'completion',
+        'context-accuracy',
+      ]);
+      expect(meta.excludeFromAll).toBe(false);
+      expect(meta.requiredTargetType).toBe('service-with-dependency');
+    });
+
+    it('is not excluded from --scenario all', () => {
+      const meta = scenario.getMetadata();
+      expect(meta.excludeFromAll).toBe(false);
+    });
+  });
+
+  describe('getAgentTasks()', () => {
+    it('throws if called before setup', () => {
+      expect(() => scenario.getAgentTasks()).toThrow('not set up');
+    });
+
+    it('returns 2 tasks in correct order (sequential)', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0].sequenceOrder).toBe(0);
+      expect(tasks[1].sequenceOrder).toBe(1);
+      expect(tasks[0].role).toBe('original-developer');
+      expect(tasks[1].role).toBe('recovery-agent');
+    });
+
+    it('Agent A has shorter timeout than Agent B', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks[0].timeoutMs).toBe(8 * 60 * 1000); // 8 minutes
+      expect(tasks[1].timeoutMs).toBe(15 * 60 * 1000); // 15 minutes
+      expect(tasks[0].timeoutMs).toBeLessThan(tasks[1].timeoutMs);
+    });
+
+    it('both prompts mention analytics', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks[0].prompt.toLowerCase()).toContain('analytics');
+      expect(tasks[1].prompt.toLowerCase()).toContain('analytics');
+    });
+
+    it('Agent B prompt mentions "previous developer" and "review"', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks[1].prompt.toLowerCase()).toContain('previous developer');
+      expect(tasks[1].prompt.toLowerCase()).toContain('review');
+    });
+
+    it('substitutes template variables in agent prompts', async () => {
+      const workDir = makeWorkingDir('/tmp/bench-99999');
+      await scenario.setup(workDir, makeConditionContext());
+
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks[0].prompt).toContain('/tmp/bench-99999');
+      expect(tasks[1].prompt).toContain('/tmp/bench-99999');
+      expect(tasks[0].prompt).not.toContain('{{');
+      expect(tasks[1].prompt).not.toContain('{{');
+    });
+  });
+
+  describe('score()', () => {
+    it('scores fast orientation highly', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface AnalyticsSummary { totalUsers: number; }',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            timing: {
+              startTime: '2026-03-08T10:00:00Z',
+              endTime: '2026-03-08T10:05:00Z',
+              durationMs: 300000,
+              timeToFirstActionMs: 15000, // 15 seconds — fast
+            },
+            fileChanges: [
+              {
+                path: 'src/services/analytics.service.ts',
+                changeType: 'added',
+                linesAdded: 50,
+                linesRemoved: 0,
+                diff: '+export class AnalyticsService {\n+  getSummary() {}\n+  getUserAnalytics() {}\n+  getTrends() {}\n+}',
+              },
+              {
+                path: 'tests/analytics.test.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+describe("analytics test", () => {})',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      expect(scored.scores['orientation-efficiency'].value).toBe(100);
+    });
+
+    it('scores slow orientation lower', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({
+            taskIndex: 1,
+            timing: {
+              startTime: '2026-03-08T10:00:00Z',
+              endTime: '2026-03-08T10:05:00Z',
+              durationMs: 300000,
+              timeToFirstActionMs: 150000, // 150 seconds — slow
+            },
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      expect(scored.scores['orientation-efficiency'].value).toBe(40);
+    });
+
+    it('penalizes redundant rework when B touches A files', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              { path: 'src/models/analytics.ts', changeType: 'added', linesAdded: 30, linesRemoved: 0 },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              { path: 'src/models/analytics.ts', changeType: 'modified', linesAdded: 35, linesRemoved: 30 },
+              { path: 'src/services/analytics.service.ts', changeType: 'added', linesAdded: 50, linesRemoved: 0 },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // 1 overlapping out of 2 B files = 50% rework, score = 50
+      expect(scored.scores['redundant-rework'].value).toBe(50);
+    });
+
+    it('gives full rework score when B only adds new files', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              { path: 'src/models/analytics.ts', changeType: 'added', linesAdded: 30, linesRemoved: 0 },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              { path: 'src/services/analytics.service.ts', changeType: 'added', linesAdded: 50, linesRemoved: 0 },
+              { path: 'tests/analytics.test.ts', changeType: 'added', linesAdded: 40, linesRemoved: 0 },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      expect(scored.scores['redundant-rework'].value).toBe(100);
+    });
+
+    it('scores completion based on pattern matching all 3 components', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface AnalyticsSummary {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/services/analytics.service.ts',
+                changeType: 'added',
+                linesAdded: 50,
+                linesRemoved: 0,
+                diff: '+export class AnalyticsService {}',
+              },
+              {
+                path: 'tests/analytics.test.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+describe("analytics test", () => {})',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      expect(scored.scores.completion.value).toBe(100);
+    });
+
+    it('gives partial completion when some components are missing', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface UserAnalytics {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // Only models found (1/3)
+      expect(scored.scores.completion.value).toBe(33);
+    });
+
+    it('produces a composite score as weighted average of 4 dimensions', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface AnalyticsSummary { totalUsers: number; }',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            timing: {
+              startTime: '2026-03-08T10:00:00Z',
+              endTime: '2026-03-08T10:05:00Z',
+              durationMs: 300000,
+              timeToFirstActionMs: 20000,
+            },
+            fileChanges: [
+              {
+                path: 'src/services/analytics.service.ts',
+                changeType: 'added',
+                linesAdded: 50,
+                linesRemoved: 0,
+                diff: '+export class AnalyticsService {}',
+              },
+              {
+                path: 'tests/analytics.test.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+describe("analytics test", () => {})',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      expect(scored.composite).toBeGreaterThan(0);
+      expect(scored.composite).toBeLessThanOrEqual(100);
+      // Verify it's actually a weighted average of the 4 dimensions
+      const expected =
+        scored.scores['orientation-efficiency'].value * 0.25 +
+        scored.scores['redundant-rework'].value * 0.25 +
+        scored.scores.completion.value * 0.25 +
+        scored.scores['context-accuracy'].value * 0.25;
+      expect(scored.composite).toBeCloseTo(expected);
+    });
+  });
+
+  describe('teardown()', () => {
+    it('is idempotent', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      await scenario.teardown();
+      await scenario.teardown(); // Should not throw
+    });
+
+    it('resets state so getAgentTasks throws', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      await scenario.teardown();
+      expect(() => scenario.getAgentTasks()).toThrow('not set up');
+    });
+  });
+});
+
+describe('CONTEXT_RECOVERY_GROUND_TRUTH', () => {
+  it('has all required decisions', () => {
+    const ids = CONTEXT_RECOVERY_GROUND_TRUTH.decisions.map((d) => d.id);
+    expect(ids).toContain('analytics-models');
+    expect(ids).toContain('analytics-service');
+    expect(ids).toContain('analytics-tests');
+  });
+
+  it('each decision has expected patterns', () => {
+    for (const decision of CONTEXT_RECOVERY_GROUND_TRUTH.decisions) {
+      expect(decision.expectedPatterns.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('createContextRecoveryScenario', () => {
+  it('returns a ContextRecoveryScenario instance', () => {
+    const s = createContextRecoveryScenario();
+    expect(s).toBeInstanceOf(ContextRecoveryScenario);
+  });
+});

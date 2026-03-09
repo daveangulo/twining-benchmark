@@ -14,7 +14,8 @@ export type ScenarioName =
   | 'multi-session-build'
   | 'scale-stress-test'
   | 'conflict-resolution'
-  | 'concurrent-agents';
+  | 'concurrent-agents'
+  | 'context-recovery';
 
 /**
  * Metadata describing a scenario.

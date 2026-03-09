@@ -70,8 +70,8 @@ describe('Condition Registry', () => {
 });
 
 describe('Scenario Registry', () => {
-  it('has all 7 scenarios', () => {
-    expect(getAllScenarioNames()).toHaveLength(7);
+  it('has all 8 scenarios', () => {
+    expect(getAllScenarioNames()).toHaveLength(8);
   });
 
   it('has expected scenario names', () => {
@@ -95,7 +95,7 @@ describe('Scenario Registry', () => {
 
   it('resolveScenarioNames resolves "all" excluding scale-stress-test', () => {
     const names = resolveScenarioNames('all');
-    expect(names).toHaveLength(6);
+    expect(names).toHaveLength(7);
     expect(names).not.toContain('scale-stress-test');
   });
 
