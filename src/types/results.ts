@@ -171,4 +171,8 @@ export interface ConditionRanking {
   deltaVsBest: number;
   /** Significance indicator vs. next-best */
   significance: 'significant' | 'suggestive' | 'not-distinguishable';
+  /** Mann-Whitney U p-value (primary) */
+  pValue?: number;
+  /** Z-test p-value (reference only, not appropriate for N < 30) */
+  zTestPValue?: number;
 }
