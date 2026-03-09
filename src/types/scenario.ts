@@ -12,7 +12,8 @@ export type ScenarioName =
   | 'architecture-cascade'
   | 'bug-investigation'
   | 'multi-session-build'
-  | 'scale-stress-test';
+  | 'scale-stress-test'
+  | 'concurrent-agents';
 
 /**
  * Metadata describing a scenario.
