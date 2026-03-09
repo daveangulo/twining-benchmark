@@ -12,6 +12,7 @@ import { SyntheticRepoTarget } from '../../targets/synthetic-repo/index.js';
 import { GeneratedRepoTarget } from '../../targets/generator/index.js';
 import { ExternalRepoTarget } from '../../targets/external/index.js';
 import { ResultsStore } from '../../results/store.js';
+import { IndexManager } from '../../results/index-manager.js';
 import type { ITestTarget } from '../../targets/target.interface.js';
 import type { CostEstimate } from '../../types/analysis.js';
 import type { ScenarioName } from '../../types/scenario.js';
@@ -293,6 +294,7 @@ export function createRunCommand(): Command {
         }
 
         const resultsStore = new ResultsStore(config.outputDirectory);
+        const indexManager = new IndexManager(config.outputDirectory);
 
         // Create orchestrator
         const orchestrator = new RunOrchestrator({
@@ -301,6 +303,7 @@ export function createRunCommand(): Command {
           conditions,
           target,
           resultsStore,
+          indexManager,
           runsPerPair: runs,
           seed: opts.seed,
           onProgress: (update: ProgressUpdate) => {

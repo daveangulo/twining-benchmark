@@ -12,6 +12,7 @@ import type {
   ScoredResults,
 } from '../types/index.js';
 import { ResultsStore } from '../results/store.js';
+import { IndexManager } from '../results/index-manager.js';
 import type { ITestTarget } from '../targets/target.interface.js';
 import { AgentSessionManager } from './agent-session.js';
 import { DataCollector, type CollectedSessionData } from './data-collector.js';
@@ -42,6 +43,8 @@ export interface OrchestratorOptions {
   resumeRunId?: string;
   /** Optional results store for persisting scored results */
   resultsStore?: ResultsStore;
+  /** Optional index manager for dashboard discovery */
+  indexManager?: IndexManager;
   /** Callback for progress updates */
   onProgress?: (update: ProgressUpdate) => void;
 }
@@ -113,6 +116,7 @@ export class RunOrchestrator {
   private readonly seed?: string;
   private readonly resumeRunId?: string;
   private readonly resultsStore?: ResultsStore;
+  private readonly indexManager?: IndexManager;
   private readonly onProgress?: (update: ProgressUpdate) => void;
   private evaluatorClient?: Anthropic;
 
@@ -125,6 +129,7 @@ export class RunOrchestrator {
     this.seed = options.seed;
     this.resumeRunId = options.resumeRunId;
     this.resultsStore = options.resultsStore;
+    this.indexManager = options.indexManager;
     this.onProgress = options.onProgress;
   }
 
@@ -185,6 +190,18 @@ export class RunOrchestrator {
     // Initialize results store if present
     if (this.resultsStore) {
       await this.resultsStore.initRun(runMetadata);
+    }
+
+    // Register in dashboard index
+    if (this.indexManager) {
+      await this.indexManager.addRun({
+        id: runId,
+        timestamp: runMetadata.timestamp,
+        scenarios: runMetadata.scenarios,
+        conditions: runMetadata.conditions,
+        status: 'running',
+        duration: 0,
+      });
     }
 
     const iterations: IterationResult[] = [];
@@ -278,6 +295,11 @@ export class RunOrchestrator {
     // Update results store with final metadata
     if (this.resultsStore) {
       await this.resultsStore.updateMetadata(runMetadata);
+    }
+
+    // Update dashboard index with final status
+    if (this.indexManager) {
+      await this.indexManager.updateRunStatus(runId, runMetadata.status);
     }
 
     this.emitProgress({
