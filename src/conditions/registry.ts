@@ -5,6 +5,7 @@ import { SharedMarkdownCondition } from './shared-markdown.js';
 import { FileReloadGenericCondition } from './file-reload-generic.js';
 import { FileReloadStructuredCondition } from './file-reload-structured.js';
 import { FullTwiningCondition } from './full-twining.js';
+import { PersistentHistoryCondition } from './persistent-history.js';
 
 /**
  * Registry of all available coordination conditions.
@@ -45,6 +46,12 @@ export const CONDITION_REGISTRY: Record<ConditionName, ConditionRegistryEntry> =
     description: 'Full Twining MCP server with blackboard, decision tracking, knowledge graph, and semantic search.',
     coordinationTools: ['Twining MCP (all tools)'],
     create: () => new FullTwiningCondition(),
+  },
+  'persistent-history': {
+    name: 'persistent-history',
+    description: 'Agents share conversation context via accumulated history. No coordination files or MCP servers.',
+    coordinationTools: [],
+    create: () => new PersistentHistoryCondition(),
   },
 };
 

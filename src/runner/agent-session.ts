@@ -188,6 +188,7 @@ export class AgentSessionManager {
   private readonly workingDir: string;
   private readonly agentConfig: AgentConfiguration;
   private readonly timeoutMs: number;
+  private conversationHistory: string[] = [];
 
   constructor(options: AgentSessionOptions) {
     this.runId = options.runId;
@@ -228,8 +229,17 @@ export class AgentSessionManager {
     }, effectiveTimeoutMs);
 
     try {
+      // Augment prompt with conversation history when persistHistory is enabled
+      let effectivePrompt = task.prompt;
+      if (this.agentConfig.persistHistory && this.conversationHistory.length > 0) {
+        const historyPrefix = this.conversationHistory
+          .map((h, i) => `=== Previous Developer ${i + 1} ===\n${h}`)
+          .join('\n\n');
+        effectivePrompt = `${historyPrefix}\n\n=== Your Task ===\n${task.prompt}`;
+      }
+
       const sdkOptions = this.buildSdkOptions(task, abortController);
-      const queryStream: Query = sdkQuery({ prompt: task.prompt, options: sdkOptions });
+      const queryStream: Query = sdkQuery({ prompt: effectivePrompt, options: sdkOptions });
 
       // Wrap iteration in a function so we can race it against the timeout
       const processStream = async (): Promise<void> => {
@@ -308,6 +318,14 @@ export class AgentSessionManager {
     const contextWindowSize = (modelUsage?.contextWindow as number) ?? 0;
     const turnUsage = sdkResult ? extractTurnUsage(sdkResult) : [];
 
+    // Accumulate conversation history for persistent-history conditions
+    if (this.agentConfig.persistHistory) {
+      const summary = this.extractConversationSummary(rawMessages);
+      if (summary) {
+        this.conversationHistory.push(summary);
+      }
+    }
+
     return this.buildTranscript({
       sessionId,
       taskIndex: task.sequenceOrder,
@@ -325,6 +343,41 @@ export class AgentSessionManager {
       compactionCount,
       turnUsage,
     });
+  }
+
+  /**
+   * Extract a summary of the conversation from assistant messages.
+   * Used for persistent-history accumulation.
+   */
+  private extractConversationSummary(messages: SDKMessage[]): string | null {
+    const assistantTexts: string[] = [];
+
+    for (const message of messages) {
+      if (message.type === 'assistant') {
+        const assistantMsg = message as SDKAssistantMessage;
+        const content = assistantMsg.message.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === 'text' && typeof block.text === 'string') {
+              assistantTexts.push(block.text);
+            }
+          }
+        }
+      }
+    }
+
+    if (assistantTexts.length === 0) {
+      return null;
+    }
+
+    // Use the last assistant message as the most relevant summary,
+    // but include earlier context if concise enough
+    const combined = assistantTexts.join('\n');
+    // Cap at ~4000 chars to avoid prompt bloat
+    if (combined.length > 4000) {
+      return combined.slice(combined.length - 4000);
+    }
+    return combined;
   }
 
   /**
