@@ -5,6 +5,7 @@ import { createBugInvestigationScenario } from './bug-investigation.js';
 import { createMultiSessionBuildScenario } from './multi-session-build.js';
 import { createScaleStressTestScenario } from './scale-stress-test.js';
 import { createConflictResolutionScenario } from './conflict-resolution.js';
+import { createConcurrentAgentsScenario } from './concurrent-agents.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -81,6 +82,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: false,
     },
     create: () => createConflictResolutionScenario(),
+  },
+  'concurrent-agents': {
+    metadata: {
+      name: 'concurrent-agents',
+      description: 'Three agents work in parallel (caching, audit logging, validation). A fourth merge agent resolves conflicts and ensures integration.',
+      estimatedDurationMinutes: 40,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 4,
+      scoringDimensions: ['merge-conflicts', 'architectural-consistency', 'completion'],
+      excludeFromAll: false,
+    },
+    create: () => createConcurrentAgentsScenario(),
   },
 };
 
