@@ -132,9 +132,9 @@ describe('Phase 2 Exit Criterion', () => {
       }
     });
 
-    it('resolveConditionNames("all") returns all 6', () => {
+    it('resolveConditionNames("all") returns all 7', () => {
       const names = resolveConditionNames('all');
-      expect(names).toHaveLength(6);
+      expect(names).toHaveLength(7);
     });
   });
 

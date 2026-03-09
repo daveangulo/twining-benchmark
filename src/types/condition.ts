@@ -9,7 +9,8 @@ export type ConditionName =
   | 'shared-markdown'
   | 'file-reload-generic'
   | 'file-reload-structured'
-  | 'full-twining';
+  | 'full-twining'
+  | 'twining-lite';
 
 /**
  * MCP server configuration for agent sessions.
