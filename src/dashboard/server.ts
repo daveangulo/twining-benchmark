@@ -246,7 +246,7 @@ export function createDashboardServer(options: DashboardServerOptions): Express 
 
   const distDir = resolve(
     import.meta.dirname ?? new URL('.', import.meta.url).pathname,
-    '../../dist/dashboard',
+    '../../dist/dashboard/public',
   );
 
   app.use(express.static(distDir));

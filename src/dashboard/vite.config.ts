@@ -6,7 +6,7 @@ export default defineConfig({
   plugins: [react()],
   root: resolve(__dirname, 'app'),
   build: {
-    outDir: resolve(__dirname, '../../dist/dashboard'),
+    outDir: resolve(__dirname, '../../dist/dashboard/public'),
     emptyOutDir: true,
   },
   server: {
