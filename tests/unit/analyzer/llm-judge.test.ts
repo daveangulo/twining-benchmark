@@ -3,6 +3,7 @@ import {
   buildEvaluatorPrompt,
   parseEvaluationResponse,
   runSingleEvaluation,
+  runAggregatedEvaluation,
   getBuiltInTemplates,
   getStandaloneTemplates,
   evaluateStandaloneQuality,
@@ -244,6 +245,81 @@ describe('runSingleEvaluation', () => {
 
     expect(result.score).toBe(75);
     expect(result.confidence).toBe('medium');
+  });
+});
+
+// --- runAggregatedEvaluation tests (mocked Anthropic client) ---
+
+describe('runAggregatedEvaluation', () => {
+  it('takes median of 3 evaluations', async () => {
+    let callCount = 0;
+    const scores = [60, 80, 70]; // median = 70
+    const mockClient = {
+      messages: {
+        create: vi.fn().mockImplementation(() => {
+          const score = scores[callCount++];
+          return Promise.resolve({
+            content: [{ type: 'text', text: JSON.stringify({ score, confidence: 'medium', justification: `eval ${callCount}` }) }],
+            usage: { input_tokens: 100, output_tokens: 50 },
+          });
+        }),
+      },
+    } as never;
+
+    const result = await runAggregatedEvaluation(
+      mockClient,
+      DECISION_CONSISTENCY_TEMPLATE,
+      { groundTruth: 'truth', codeDiffs: 'diffs', coordinationArtifacts: '' },
+    );
+
+    expect(result.medianScore).toBe(70);
+    expect(result.evaluationVariance).toBeGreaterThan(0);
+    expect(mockClient.messages.create).toHaveBeenCalledTimes(3);
+    expect(result.evaluations).toHaveLength(3);
+  });
+
+  it('returns 0 variance when all scores are identical', async () => {
+    const mockClient = {
+      messages: {
+        create: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: JSON.stringify({ score: 50, confidence: 'medium', justification: 'same' }) }],
+          usage: { input_tokens: 100, output_tokens: 50 },
+        }),
+      },
+    } as never;
+
+    const result = await runAggregatedEvaluation(
+      mockClient,
+      DECISION_CONSISTENCY_TEMPLATE,
+      { groundTruth: 'truth', codeDiffs: 'diffs', coordinationArtifacts: '' },
+    );
+
+    expect(result.medianScore).toBe(50);
+    expect(result.evaluationVariance).toBe(0);
+  });
+
+  it('handles unparseable LLM responses gracefully', async () => {
+    const mockClient = {
+      messages: {
+        create: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: 'not json at all' }],
+          usage: { input_tokens: 100, output_tokens: 50 },
+        }),
+      },
+    } as never;
+
+    const result = await runAggregatedEvaluation(
+      mockClient,
+      DECISION_CONSISTENCY_TEMPLATE,
+      { groundTruth: 'truth', codeDiffs: 'diffs', coordinationArtifacts: '' },
+    );
+
+    expect(result.medianScore).toBe(0);
+    expect(result.evaluations).toHaveLength(3);
+    for (const evaluation of result.evaluations) {
+      expect(evaluation.score).toBe(0);
+      expect(evaluation.confidence).toBe('low');
+    }
   });
 });
 
