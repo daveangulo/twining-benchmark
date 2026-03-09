@@ -10,7 +10,8 @@ export type ConditionName =
   | 'file-reload-generic'
   | 'file-reload-structured'
   | 'full-twining'
-  | 'twining-lite';
+  | 'twining-lite'
+  | 'persistent-history';
 
 /**
  * MCP server configuration for agent sessions.
@@ -38,6 +39,8 @@ export interface AgentConfiguration {
   permissionMode: 'acceptEdits' | 'plan' | 'full';
   /** Additional environment variables for the agent process */
   env?: Record<string, string>;
+  /** If true, pass previous agents' conversation as history prefix to subsequent agents */
+  persistHistory?: boolean;
 }
 
 /**

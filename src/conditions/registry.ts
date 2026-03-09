@@ -6,6 +6,7 @@ import { FileReloadGenericCondition } from './file-reload-generic.js';
 import { FileReloadStructuredCondition } from './file-reload-structured.js';
 import { FullTwiningCondition } from './full-twining.js';
 import { TwiningLiteCondition } from './twining-lite.js';
+import { PersistentHistoryCondition } from './persistent-history.js';
 
 /**
  * Registry of all available coordination conditions.
@@ -52,6 +53,12 @@ export const CONDITION_REGISTRY: Record<ConditionName, ConditionRegistryEntry> =
     description: 'Twining Lite — core blackboard and decision tools only (8 of 26 tools).',
     coordinationTools: ['Twining MCP (core: blackboard, decisions, handoff)'],
     create: () => new TwiningLiteCondition(),
+  },
+  'persistent-history': {
+    name: 'persistent-history',
+    description: 'Agents share conversation context via accumulated history. No coordination files or MCP servers.',
+    coordinationTools: [],
+    create: () => new PersistentHistoryCondition(),
   },
 };
 
