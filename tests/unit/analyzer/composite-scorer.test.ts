@@ -85,29 +85,43 @@ describe('calculateCes', () => {
     expect(result.integrationScore).toBe(0);
   });
 
-  it('overhead penalty kicks in above 10%', () => {
-    const noOverhead: CesInputMetrics = {
+  it('uses smooth linear overhead penalty without cliff', () => {
+    // 8% overhead should produce penalty of 8 (not 0 as old cliff formula)
+    const metrics: CesInputMetrics = {
       contradictionRate: 0,
       testPassRate: 1,
       redundantWorkPct: 0,
       architecturalCoherence: 5,
-      coordinationOverheadRatio: 0.05, // below threshold
+      coordinationOverheadRatio: 0.08,
     };
-
-    const withOverhead: CesInputMetrics = {
-      ...noOverhead,
-      coordinationOverheadRatio: 0.20, // 10% above threshold
-    };
-
-    const resultNoOverhead = calculateCes(noOverhead);
-    const resultWithOverhead = calculateCes(withOverhead);
-
-    expect(resultNoOverhead.overheadPenalty).toBe(0);
-    expect(resultWithOverhead.overheadPenalty).toBeCloseTo(20, 0); // (0.20 - 0.10) * 200
-    expect(resultWithOverhead.totalCes).toBeLessThan(resultNoOverhead.totalCes);
+    const ces = calculateCes(metrics);
+    expect(ces.overheadPenalty).toBeCloseTo(8);
   });
 
-  it('overhead penalty exactly at 10% threshold is zero', () => {
+  it('smooth linear overhead penalty is proportional at all levels', () => {
+    const lowOverhead: CesInputMetrics = {
+      contradictionRate: 0,
+      testPassRate: 1,
+      redundantWorkPct: 0,
+      architecturalCoherence: 5,
+      coordinationOverheadRatio: 0.05,
+    };
+
+    const highOverhead: CesInputMetrics = {
+      ...lowOverhead,
+      coordinationOverheadRatio: 0.20,
+    };
+
+    const resultLow = calculateCes(lowOverhead);
+    const resultHigh = calculateCes(highOverhead);
+
+    // 5% overhead = 5 penalty, 20% overhead = 20 penalty
+    expect(resultLow.overheadPenalty).toBeCloseTo(5, 0);
+    expect(resultHigh.overheadPenalty).toBeCloseTo(20, 0);
+    expect(resultHigh.totalCes).toBeLessThan(resultLow.totalCes);
+  });
+
+  it('overhead penalty at 10% is 10 (no cliff)', () => {
     const metrics: CesInputMetrics = {
       contradictionRate: 0,
       testPassRate: 1,
@@ -117,7 +131,7 @@ describe('calculateCes', () => {
     };
 
     const result = calculateCes(metrics);
-    expect(result.overheadPenalty).toBe(0);
+    expect(result.overheadPenalty).toBeCloseTo(10);
   });
 
   it('uses custom weights', () => {
@@ -174,7 +188,7 @@ describe('calculateCesFromScores', () => {
     expect(result.integrationScore).toBeCloseTo(90, 0);
     expect(result.redundancyScore).toBeCloseTo(70, 0);
     expect(result.coherenceScore).toBeCloseTo(60, 0);
-    expect(result.overheadPenalty).toBe(0); // 5% < 10%
+    expect(result.overheadPenalty).toBeCloseTo(5); // 5% * 100 = 5
   });
 
   it('defaults missing dimensions to 50', () => {
