@@ -272,8 +272,8 @@ export async function startDashboardServer(
   const app = createDashboardServer(options);
 
   return new Promise<void>((resolvePromise) => {
-    app.listen(options.port, () => {
-      console.log(`Dashboard server listening on http://localhost:${options.port}`);
+    app.listen(options.port, '0.0.0.0', () => {
+      console.log(`Dashboard server listening on http://0.0.0.0:${options.port}`);
       resolvePromise();
     });
   });
