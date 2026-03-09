@@ -535,6 +535,10 @@ export class RunOrchestrator {
     const completed = scenarioIdx * this.conditions.length * this.runsPerPair
       + conditionIdx * this.runsPerPair
       + iteration;
+    // For iteration-complete, count the current iteration as done
+    if (update.type === 'iteration-complete') {
+      return Math.min(100, ((completed + 1) / totalIterations) * 100);
+    }
     return Math.min(100, (completed / totalIterations) * 100);
   }
 }
