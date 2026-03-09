@@ -32,6 +32,8 @@ export interface ScenarioMetadata {
   scoringDimensions: string[];
   /** Whether this scenario is excluded from --scenario all */
   excludeFromAll: boolean;
+  /** How agent tasks are executed: sequentially (default) or in parallel */
+  executionMode?: 'sequential' | 'parallel';
 }
 
 /**

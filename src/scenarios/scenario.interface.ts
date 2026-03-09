@@ -133,11 +133,20 @@ export abstract class BaseScenario implements Scenario {
       throw new Error('Scenario not set up. Call setup() first.');
     }
 
+    const metadata = this.buildMetadata();
+
+    if (metadata.executionMode === 'parallel') {
+      return this.executeParallel(runner, this.tasks);
+    }
+    return this.executeSequential(runner, this.tasks);
+  }
+
+  private async executeSequential(runner: ScenarioRunner, tasks: AgentTask[]): Promise<RawResults> {
     const transcripts: AgentTranscript[] = [];
     const errors: string[] = [];
     let allCompleted = true;
 
-    for (const task of this.tasks) {
+    for (const task of tasks) {
       try {
         const transcript = await runner.runAgentTask(task);
         transcripts.push(transcript);
@@ -180,7 +189,60 @@ export abstract class BaseScenario implements Scenario {
 
     return {
       transcripts,
-      finalWorkingDir: this.context.workingDir.path,
+      finalWorkingDir: this.context!.workingDir.path,
+      allSessionsCompleted: allCompleted,
+      errors,
+    };
+  }
+
+  private async executeParallel(runner: ScenarioRunner, tasks: AgentTask[]): Promise<RawResults> {
+    const results = await Promise.allSettled(
+      tasks.map((task) => runner.runAgentTask(task)),
+    );
+
+    const transcripts: AgentTranscript[] = [];
+    const errors: string[] = [];
+    let allCompleted = true;
+
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i]!;
+      const task = tasks[i]!;
+      if (result.status === 'fulfilled') {
+        transcripts.push(result.value);
+        if (result.value.exitReason === 'error') {
+          allCompleted = false;
+          errors.push(`Task ${task.sequenceOrder}: ${result.value.error}`);
+        }
+      } else {
+        allCompleted = false;
+        const message = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        errors.push(`Task ${task.sequenceOrder} failed: ${message}`);
+        // Push placeholder transcript so indexes stay aligned
+        transcripts.push({
+          sessionId: `error-${task.sequenceOrder}`,
+          runId: '',
+          scenario: this.buildMetadata().name,
+          condition: '',
+          taskIndex: task.sequenceOrder,
+          prompt: task.prompt,
+          toolCalls: [],
+          fileChanges: [],
+          tokenUsage: { input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0, costUsd: 0 },
+          timing: { startTime: new Date().toISOString(), endTime: new Date().toISOString(), durationMs: 0, timeToFirstActionMs: 0 },
+          exitReason: 'error',
+          error: message,
+          numTurns: 0,
+          stopReason: null,
+          contextWindowSize: 0,
+          compactionCount: 0,
+          turnUsage: [],
+        });
+      }
+    }
+
+    return {
+      transcripts,
+      finalWorkingDir: this.context!.workingDir.path,
       allSessionsCompleted: allCompleted,
       errors,
     };
