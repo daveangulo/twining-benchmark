@@ -143,9 +143,21 @@ All 8 coordination conditions form a progression from no coordination to full Tw
 
 ### Scoring
 
+#### Primary Metrics
+
+Results display surfaces these metrics prominently, before any composite score:
+
+| Metric | What It Shows |
+|--------|---------------|
+| **Success Rate** | % of iterations where all agent sessions completed |
+| **Test Pass Rate** | Tests passing / total tests |
+| **Cost** | Mean API cost per run (USD) |
+| **Time** | Mean wall time per run |
+| **Compilation** | Whether the final codebase compiles |
+
 #### Dual-Rubric Evaluation
 
-Each run produces two independent scores:
+Each run also produces two independent LLM-as-judge scores:
 
 **Coordination Score (CES)** — Evaluates inter-agent coordination quality using 4 dimensions:
 
@@ -168,13 +180,23 @@ Each run produces two independent scores:
 
 **Coordination Lift** = CES - Standalone Score. Positive means coordination helped; negative means overhead hurt net quality.
 
+#### Blinded Evaluation
+
+LLM-as-judge evaluation uses **blind mode** to prevent bias:
+- Condition identity (name, tool names) is stripped from the context
+- Coordination artifacts (`.twining/`, `COORDINATION.md`, etc.) are removed
+- Standalone quality evaluation always runs fully blinded
+- The judge evaluates code quality without knowing which coordination system produced it
+
 #### Statistical Analysis
 
-- **Mann-Whitney U** (primary): Non-parametric significance test, appropriate for small samples
-- **Z-test** (secondary reference): Reported alongside for familiarity, flagged as inappropriate for N < 30
-- **Cohen's d**: Effect size magnitude between condition pairs
+- **Cohen's d** (primary): Effect size magnitude — leads all comparison tables with interpretation (negligible/small/medium/large)
+- **Holm-Bonferroni correction**: Adjusted p-values control family-wise error rate across multiple comparisons
+- **Mann-Whitney U**: Non-parametric significance test, appropriate for small samples
+- **Z-test** (secondary reference): Reported alongside, flagged as inappropriate for N < 30
 - **95% confidence intervals**: For all metrics
 - **Variance flagging**: Metrics where stddev exceeds 20% of mean
+- **Key Effect Sizes**: Top 5 largest Cohen's d values highlighted in results summary
 
 ### Test Targets
 
@@ -187,7 +209,7 @@ Each run produces two independent scores:
 ## Development
 
 ```bash
-npm test              # Run all 627 tests
+npm test              # Run all 659 tests
 npm run test:watch    # Watch mode
 npm run lint          # Type-check
 npm run build         # Compile to dist/
@@ -271,6 +293,10 @@ Extend `BaseScenario` and register in `src/scenarios/registry.ts`. Set `executio
 ### Adding a Target
 
 Implement `ITestTarget` from `src/targets/target.interface.ts`.
+
+## Known Limitations
+
+See [`docs/benchmark-limitations.md`](docs/benchmark-limitations.md) for a full list of known limitations that should accompany published results, including: hand-designed CES weights, same-family judge model, synthetic TypeScript target, and small sample sizes.
 
 ## License
 
