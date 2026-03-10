@@ -24,6 +24,14 @@ export interface EvaluationContext {
 }
 
 /**
+ * Options for controlling evaluation behavior.
+ */
+export interface EvaluationOptions {
+  /** Strip condition identity and coordination artifacts to prevent bias */
+  blindMode?: boolean;
+}
+
+/**
  * Configuration for the LLM judge.
  */
 export interface LlmJudgeConfig {
@@ -42,6 +50,35 @@ const DEFAULT_JUDGE_CONFIG: LlmJudgeConfig = {
 };
 
 /**
+ * Strip condition-revealing paths and tool names from code diffs.
+ */
+export function blindCodeDiffs(diffs: string): string {
+  return diffs
+    // Strip paths that reveal condition identity
+    .replace(/\.twining\/[^\s]*/g, 'coordination-state/data')
+    .replace(/COORDINATION\.md/g, 'coordination-file')
+    .replace(/CONTEXT\.md/g, 'coordination-file')
+    .replace(/coordination\//g, 'coordination-dir/')
+    // Strip tool names that reveal condition
+    .replace(/twining_\w+/g, 'coordination_tool')
+    .replace(/mcp__plugin_twining_twining__\w+/g, 'coordination_tool');
+}
+
+/**
+ * Strip condition identity and coordination artifacts from an evaluation context
+ * to prevent bias where the judge rewards documentation quality or
+ * condition-specific artifacts rather than code quality.
+ */
+export function blindContext(context: EvaluationContext): EvaluationContext {
+  return {
+    groundTruth: context.groundTruth,
+    codeDiffs: blindCodeDiffs(context.codeDiffs),
+    coordinationArtifacts: '',
+    additionalContext: context.additionalContext,
+  };
+}
+
+/**
  * Run a single LLM-as-judge evaluation (FR-ANL-002).
  */
 export async function runSingleEvaluation(
@@ -49,8 +86,10 @@ export async function runSingleEvaluation(
   template: EvaluatorPromptTemplate,
   context: EvaluationContext,
   config: LlmJudgeConfig = DEFAULT_JUDGE_CONFIG,
+  options: EvaluationOptions = {},
 ): Promise<LlmJudgeEvaluation> {
-  const prompt = buildEvaluatorPrompt(template, context);
+  const effectiveContext = options.blindMode ? blindContext(context) : context;
+  const prompt = buildEvaluatorPrompt(template, effectiveContext);
 
   const response = await client.messages.create({
     model: config.model,
@@ -84,6 +123,7 @@ export async function runAggregatedEvaluation(
   template: EvaluatorPromptTemplate,
   context: EvaluationContext,
   config: LlmJudgeConfig = DEFAULT_JUDGE_CONFIG,
+  options: EvaluationOptions = {},
 ): Promise<AggregatedJudgeResult> {
   const evaluations: LlmJudgeEvaluation[] = [];
 
@@ -93,6 +133,7 @@ export async function runAggregatedEvaluation(
       template,
       context,
       config,
+      options,
     );
     evaluations.push(evaluation);
   }
@@ -574,11 +615,12 @@ export async function evaluateStandaloneQuality(
   context: EvaluationContext,
   config: LlmJudgeConfig = DEFAULT_JUDGE_CONFIG,
 ): Promise<StandaloneScoreResult> {
+  const blindOptions: EvaluationOptions = { blindMode: true };
   const [correctness, soundness, maintainability, completeness] = await Promise.all([
-    runAggregatedEvaluation(client, CODE_CORRECTNESS_TEMPLATE, context, config),
-    runAggregatedEvaluation(client, ARCHITECTURAL_SOUNDNESS_TEMPLATE, context, config),
-    runAggregatedEvaluation(client, MAINTAINABILITY_TEMPLATE, context, config),
-    runAggregatedEvaluation(client, COMPLETENESS_TEMPLATE, context, config),
+    runAggregatedEvaluation(client, CODE_CORRECTNESS_TEMPLATE, context, config, blindOptions),
+    runAggregatedEvaluation(client, ARCHITECTURAL_SOUNDNESS_TEMPLATE, context, config, blindOptions),
+    runAggregatedEvaluation(client, MAINTAINABILITY_TEMPLATE, context, config, blindOptions),
+    runAggregatedEvaluation(client, COMPLETENESS_TEMPLATE, context, config, blindOptions),
   ]);
 
   const toDimensionScore = (result: AggregatedJudgeResult): DimensionScore => {

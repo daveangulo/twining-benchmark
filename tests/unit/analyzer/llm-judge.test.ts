@@ -8,6 +8,8 @@ import {
   getStandaloneTemplates,
   evaluateStandaloneQuality,
   buildEvaluationContextFromResults,
+  blindContext,
+  blindCodeDiffs,
   DECISION_CONSISTENCY_TEMPLATE,
   INTEGRATION_QUALITY_TEMPLATE,
   ARCHITECTURAL_COHERENCE_TEMPLATE,
@@ -566,6 +568,108 @@ describe('getStandaloneTemplates', () => {
     expect(dimensions).toContain('architecturalSoundness');
     expect(dimensions).toContain('maintainability');
     expect(dimensions).toContain('completeness');
+  });
+});
+
+// --- Blinded evaluation tests ---
+
+describe('blinded evaluation', () => {
+  it('blindContext strips coordination artifacts', () => {
+    const ctx: EvaluationContext = {
+      groundTruth: 'test',
+      codeDiffs: 'diff --git a/.twining/decisions.jsonl b/.twining/decisions.jsonl\n+twining_decide called',
+      coordinationArtifacts: 'COORDINATION.md content here',
+    };
+    const blinded = blindContext(ctx);
+    expect(blinded.coordinationArtifacts).toBe('');
+    expect(blinded.codeDiffs).not.toContain('.twining/');
+    expect(blinded.codeDiffs).not.toContain('twining_decide');
+    expect(blinded.codeDiffs).toContain('coordination_tool');
+  });
+
+  it('blindContext preserves groundTruth and additionalContext', () => {
+    const ctx: EvaluationContext = {
+      groundTruth: 'important ground truth',
+      codeDiffs: 'some diffs',
+      coordinationArtifacts: 'artifacts',
+      additionalContext: 'extra context',
+    };
+    const blinded = blindContext(ctx);
+    expect(blinded.groundTruth).toBe('important ground truth');
+    expect(blinded.additionalContext).toBe('extra context');
+  });
+
+  it('blindCodeDiffs strips condition-revealing paths', () => {
+    const diffs = 'modified COORDINATION.md\nmodified coordination/STATE.md\ncalled twining_assemble';
+    const blinded = blindCodeDiffs(diffs);
+    expect(blinded).not.toContain('COORDINATION.md');
+    expect(blinded).not.toContain('twining_assemble');
+    expect(blinded).toContain('coordination-file');
+    expect(blinded).toContain('coordination_tool');
+  });
+
+  it('blindCodeDiffs strips CONTEXT.md references', () => {
+    const diffs = 'modified CONTEXT.md with updates';
+    const blinded = blindCodeDiffs(diffs);
+    expect(blinded).not.toContain('CONTEXT.md');
+    expect(blinded).toContain('coordination-file');
+  });
+
+  it('blindCodeDiffs strips .twining/ paths', () => {
+    const diffs = 'diff --git a/.twining/graph.json b/.twining/graph.json';
+    const blinded = blindCodeDiffs(diffs);
+    expect(blinded).not.toContain('.twining/');
+    expect(blinded).toContain('coordination-state/data');
+  });
+
+  it('blindCodeDiffs strips mcp plugin tool names', () => {
+    const diffs = 'called mcp__plugin_twining_twining__twining_assemble with args';
+    const blinded = blindCodeDiffs(diffs);
+    expect(blinded).not.toContain('mcp__plugin_twining_twining__twining_assemble');
+    expect(blinded).toContain('coordination_tool');
+  });
+
+  it('blindCodeDiffs strips coordination/ directory paths', () => {
+    const diffs = 'modified coordination/shared-state.json';
+    const blinded = blindCodeDiffs(diffs);
+    expect(blinded).not.toMatch(/coordination\/shared/);
+    expect(blinded).toContain('coordination-dir/');
+  });
+
+  it('evaluateStandaloneQuality always uses blind mode', async () => {
+    const mockClient = {
+      messages: {
+        create: vi.fn().mockResolvedValue({
+          content: [{ type: 'text', text: JSON.stringify({
+            score: 75,
+            confidence: 'high',
+            justification: 'Good quality',
+          })}],
+          usage: { input_tokens: 500, output_tokens: 200 },
+        }),
+      },
+    } as never;
+
+    const context: EvaluationContext = {
+      groundTruth: 'test ground truth',
+      codeDiffs: 'diff with .twining/decisions.jsonl and twining_decide calls',
+      coordinationArtifacts: 'COORDINATION.md content that should be stripped',
+    };
+
+    await evaluateStandaloneQuality(mockClient, context, {
+      model: 'test-model',
+      evaluationCount: 1,
+      maxTokens: 1024,
+    });
+
+    // Verify all calls had blinded context (no coordination artifacts, no twining paths)
+    const createFn = (mockClient as { messages: { create: ReturnType<typeof vi.fn> } }).messages.create;
+    for (const call of createFn.mock.calls) {
+      const prompt = (call as [{ messages: Array<{ content: string }> }])[0].messages[0]!.content;
+      expect(prompt).not.toContain('.twining/');
+      expect(prompt).not.toContain('twining_decide');
+      expect(prompt).not.toContain('COORDINATION.md content that should be stripped');
+    }
   });
 });
 
