@@ -137,8 +137,8 @@ All 8 coordination conditions form a progression from no coordination to full Tw
 | `shared-markdown` | CLAUDE.md + shared COORDINATION.md for freeform agent notes. |
 | `file-reload-generic` | Simulates `/clear` + CONTEXT.md reload. Zero conversation history per agent. |
 | `file-reload-structured` | GSD/BMAD-style framework: role files, STATE.md, PLAN.md, decisions.md, handoff.md. |
-| `full-twining` | Full Twining MCP server (26 tools): blackboard, decisions, knowledge graph, verification, handoff. Agents follow explicit lifecycle gates (assemble → decide → verify → handoff). |
-| `twining-lite` | Twining MCP with 8 core tools only: blackboard (post/read/query/recent), decisions (decide/search), and handoff (handoff/acknowledge). Tests whether the full suite is necessary. |
+| `full-twining` | Twining plugin installed (same as a real user). Plugin provides MCP server (32 tools), hooks, skills, and behavioral instructions. No extra harness guidance. |
+| `twining-lite` | Twining plugin installed with allowedTools restricted to 8 core tools: blackboard, decisions, and handoff. Tests whether the full tool suite is necessary. |
 | `persistent-history` | Agents share accumulated conversation context instead of starting fresh. Tests whether the /clear pattern helps or hurts. |
 
 ### Scoring
