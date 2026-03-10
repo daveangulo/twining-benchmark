@@ -102,7 +102,7 @@ export class TwiningLiteCondition extends BaseCondition {
     return [
       'CLAUDE.md',
       '.twining/blackboard.jsonl',
-      '.twining/decisions.jsonl',
+      '.twining/decisions/index.json',
     ];
   }
 

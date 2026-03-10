@@ -135,8 +135,9 @@ export class FullTwiningCondition extends BaseCondition {
     return [
       'CLAUDE.md',
       '.twining/blackboard.jsonl',
-      '.twining/decisions.jsonl',
-      '.twining/graph.json',
+      '.twining/decisions/index.json',
+      '.twining/graph/entities.json',
+      '.twining/graph/relations.json',
     ];
   }
 
