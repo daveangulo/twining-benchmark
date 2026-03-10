@@ -173,6 +173,14 @@ export function compareConditions(
     significance = 'not-distinguishable';
   }
 
+  // Compute Cohen's d effect size
+  let effectSize: number | undefined;
+  let effectInterpretation: PairwiseComparison['effectInterpretation'];
+  if (valuesA.length >= 2 && valuesB.length >= 2) {
+    effectSize = cohensD(valuesA, valuesB);
+    effectInterpretation = interpretEffectSize(effectSize);
+  }
+
   return {
     conditionA,
     conditionB,
@@ -180,6 +188,8 @@ export function compareConditions(
     deltaPercent,
     pValue,
     adjustedPValue: pValue, // Will be corrected by Holm-Bonferroni in batch
+    effectSize,
+    effectInterpretation,
     significance,
   };
 }

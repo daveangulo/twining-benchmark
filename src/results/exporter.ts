@@ -312,15 +312,20 @@ function buildComparisonMarkdown(
       }
     }
 
-    // Pairwise significance
+    // Pairwise comparisons table (effect sizes first, p-values de-emphasized)
     if (scenarioComparisons.length > 0) {
       sections.push('');
-      sections.push('**Pairwise Significance:**');
+      sections.push('**Pairwise Comparisons:**');
       sections.push('');
+      sections.push('| Condition A | Condition B | Delta | Cohen\'s d | Effect | Adj. p-value | Sig. |');
+      sections.push('|---|---|---|---|---|---|---|');
       for (const comp of scenarioComparisons) {
         const dir = comp.deltaPercent > 0 ? '+' : '';
+        const d = comp.effectSize != null ? comp.effectSize.toFixed(2) : 'N/A';
+        const effect = comp.effectInterpretation ?? 'N/A';
+        const adjP = comp.adjustedPValue != null ? comp.adjustedPValue.toFixed(3) : comp.pValue.toFixed(3);
         sections.push(
-          `- ${comp.conditionA} vs ${comp.conditionB} (${comp.metric}): ${dir}${comp.deltaPercent.toFixed(1)}% ${sigIndicator(comp.significance)} (p=${comp.pValue.toFixed(3)})`,
+          `| ${comp.conditionA} | ${comp.conditionB} | ${dir}${comp.deltaPercent.toFixed(1)}% | ${d} | ${effect} | ${adjP} | ${sigIndicator(comp.significance)} |`,
         );
       }
     }
@@ -455,6 +460,33 @@ export function exportMarkdown(report: BenchmarkReport): string {
     for (const f of findings) {
       sections.push(`- ${f}`);
     }
+    sections.push('');
+  }
+
+  // Key Effect Sizes — top 5 largest Cohen's d values
+  const comparisonsWithEffectSize = report.comparisons
+    .filter((c) => c.effectSize != null)
+    .sort((a, b) => Math.abs(b.effectSize!) - Math.abs(a.effectSize!))
+    .slice(0, 5);
+
+  if (comparisonsWithEffectSize.length > 0) {
+    sections.push('## Key Effect Sizes', '');
+    sections.push('```');
+    sections.push('Key Effect Sizes');
+    sections.push('\u2500'.repeat(51));
+
+    for (const comp of comparisonsWithEffectSize) {
+      const label = `${comp.conditionA} vs ${comp.conditionB}:`;
+      const d = comp.effectSize!;
+      const interp = comp.effectInterpretation ?? 'N/A';
+      const dir = comp.deltaPercent > 0 ? '+' : '';
+      const deltaStr = `${dir}${comp.deltaPercent.toFixed(1)}%`;
+      sections.push(
+        `${pad(label, 38)} d = ${padLeft(d.toFixed(2), 5)} (${pad(interp, 10)}) ${padLeft(deltaStr, 8)}`,
+      );
+    }
+
+    sections.push('```');
     sections.push('');
   }
 
