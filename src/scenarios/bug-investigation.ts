@@ -305,16 +305,17 @@ export class BugInvestigationScenario extends BaseScenario {
       };
     }
 
-    // Files A investigated (read or modified)
-    const aFiles = new Set<string>();
+    // Files A investigated (read or modified) — normalize to basenames
+    // so paths from different working directories can still match.
+    const aFileBasenames = new Set<string>();
     for (const tc of transcriptA.toolCalls) {
       if (tc.toolName === 'Read' || tc.toolName === 'Edit') {
         const filePath = tc.parameters['file_path'] as string | undefined;
-        if (filePath) aFiles.add(filePath);
+        if (filePath) aFileBasenames.add(this.normalizeFilePath(filePath));
       }
     }
     for (const fc of transcriptA.fileChanges) {
-      aFiles.add(fc.path);
+      aFileBasenames.add(this.normalizeFilePath(fc.path));
     }
 
     // Files B checked early (first 25% of tool calls)
@@ -324,42 +325,77 @@ export class BugInvestigationScenario extends BaseScenario {
     let recoveredFiles = 0;
     for (const tc of bEarlyCalls) {
       const filePath = tc.parameters['file_path'] as string | undefined;
-      if (filePath && aFiles.has(filePath)) {
+      if (filePath && aFileBasenames.has(this.normalizeFilePath(filePath))) {
         recoveredFiles++;
       }
     }
 
-    // Also check if B reads coordination/notes files
-    const bReadsNotes = transcriptB.toolCalls.some((tc) => {
+    // Check if B uses coordination context — file-based OR tool-based.
+    // File-based: reads files with coordination-related names.
+    // Tool-based: uses Twining assemble/read/acknowledge to recover prior context.
+    const bReadsCoordinationFiles = transcriptB.toolCalls.some((tc) => {
       const fp = tc.parameters['file_path'] as string | undefined;
       return fp && /(?:note|finding|investigation|context|coordination|handoff)/i.test(fp);
     });
 
+    const bUsesCoordinationTools = transcriptB.toolCalls.some((tc) =>
+      /twining_assemble|twining_read|twining_acknowledge|twining_recent|twining_query/.test(
+        tc.toolName,
+      ),
+    );
+
+    const bRecoversPriorContext = bReadsCoordinationFiles || bUsesCoordinationTools;
+
     let score = 0;
     const details: string[] = [];
 
-    if (aFiles.size === 0) {
+    if (aFileBasenames.size === 0) {
       score = 50;
       details.push('Agent A did not investigate any files — baseline score.');
     } else {
-      const recoveryRatio = recoveredFiles / Math.min(aFiles.size, bEarlyCallCount);
+      const recoveryRatio = recoveredFiles / Math.min(aFileBasenames.size, bEarlyCallCount);
       score = Math.round(recoveryRatio * 80);
       details.push(
-        `Agent B accessed ${recoveredFiles} of ${aFiles.size} files A investigated in early calls.`,
+        `Agent B accessed ${recoveredFiles} of ${aFileBasenames.size} files A investigated in early calls.`,
       );
     }
 
-    if (bReadsNotes) {
+    if (bRecoversPriorContext) {
       score = Math.min(100, score + 20);
-      details.push('Agent B checked investigation notes/coordination files.');
+      if (bReadsCoordinationFiles) {
+        details.push('Agent B checked investigation notes/coordination files.');
+      }
+      if (bUsesCoordinationTools) {
+        details.push('Agent B used coordination tools to recover prior context.');
+      }
     }
 
     return {
       value: Math.min(100, score),
-      confidence: aFiles.size > 0 ? 'medium' : 'low',
+      confidence: aFileBasenames.size > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
     };
+  }
+
+  /**
+   * Normalize a file path for cross-session comparison.
+   * Strips the working directory prefix (temp dirs differ between agents)
+   * leaving a relative path like "src/services/foo.ts".
+   */
+  private normalizeFilePath(filePath: string): string {
+    // Strip common temp-dir prefixes to get relative path
+    const match = filePath.match(
+      /(?:twining-bench-[A-Za-z0-9]+|benchmark-\w+)[/\\](.*)/,
+    );
+    if (match?.[1]) return match[1];
+
+    // If already relative, return as-is
+    if (!filePath.startsWith('/')) return filePath;
+
+    // Last resort: use basename + parent directory for uniqueness
+    const parts = filePath.split('/');
+    return parts.slice(-2).join('/');
   }
 
   /**

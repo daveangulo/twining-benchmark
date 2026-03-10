@@ -13,6 +13,7 @@ import type {
   RawResults,
   ScoredResults,
 } from '../types/index.js';
+import { runTests } from './test-runner.js';
 import { ResultsStore } from '../results/store.js';
 import { IndexManager } from '../results/index-manager.js';
 import type { ITestTarget } from '../targets/target.interface.js';
@@ -482,6 +483,17 @@ export class RunOrchestrator {
           scoredResults.runId = runId;
           scoredResults.condition = condition.name;
           scoredResults.iteration = iteration;
+
+          // Run tests on the final working directory state
+          try {
+            const testResults = await runTests(workingDir.path);
+            scoredResults.metrics.testsPass = testResults.pass;
+            scoredResults.metrics.testsFail = testResults.fail;
+            scoredResults.metrics.compiles = testResults.compiles;
+          } catch (testErr: unknown) {
+            const msg = testErr instanceof Error ? testErr.message : String(testErr);
+            errors.push(`Test execution failed: ${msg}`);
+          }
         } catch (scoreErr: unknown) {
           const msg = scoreErr instanceof Error ? scoreErr.message : String(scoreErr);
           errors.push(`Scoring failed: ${msg}`);
