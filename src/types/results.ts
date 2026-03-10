@@ -132,6 +132,8 @@ export interface PairwiseComparison {
   deltaPercent: number;
   /** p-value from statistical significance test */
   pValue: number;
+  /** Holm-Bonferroni corrected p-value */
+  adjustedPValue: number;
   /** Significance level interpretation */
   significance: 'significant' | 'suggestive' | 'not-distinguishable';
 }

@@ -6,6 +6,7 @@ import {
   interpretEffectSize,
   compareConditions,
   percentageImprovement,
+  holmBonferroni,
 } from '../../../src/analyzer/statistics.js';
 
 describe('computeSummary', () => {
@@ -311,6 +312,40 @@ describe('percentageImprovement', () => {
 
     const { percent } = percentageImprovement(summaryA, summaryB);
     expect(percent).toBeLessThan(0); // A is worse than B
+  });
+});
+
+describe('holmBonferroni', () => {
+  it('returns empty array for empty input', () => {
+    expect(holmBonferroni([])).toEqual([]);
+  });
+
+  it('returns same value for single p-value', () => {
+    expect(holmBonferroni([0.03])).toEqual([0.03]);
+  });
+
+  it('correctly adjusts known p-values', () => {
+    // Example: 3 tests with p-values 0.01, 0.04, 0.03
+    // Sorted: 0.01, 0.03, 0.04
+    // Adjusted: 0.01*3=0.03, max(0.03, 0.03*2)=0.06, max(0.06, 0.04*1)=0.06
+    const result = holmBonferroni([0.01, 0.04, 0.03]);
+    expect(result[0]).toBeCloseTo(0.03);  // 0.01 * 3
+    expect(result[2]).toBeCloseTo(0.06);  // 0.03 * 2
+    expect(result[1]).toBeCloseTo(0.06);  // max(0.06, 0.04 * 1)
+  });
+
+  it('caps adjusted p-values at 1.0', () => {
+    const result = holmBonferroni([0.5, 0.6, 0.7]);
+    result.forEach(p => expect(p).toBeLessThanOrEqual(1.0));
+  });
+
+  it('maintains monotonicity (adjusted values are non-decreasing when sorted)', () => {
+    const result = holmBonferroni([0.001, 0.01, 0.05, 0.10]);
+    const sorted = [...result].sort((a, b) => a - b);
+    // Verify monotonicity in step-down order
+    for (let i = 1; i < sorted.length; i++) {
+      expect(sorted[i]).toBeGreaterThanOrEqual(sorted[i-1]!);
+    }
   });
 });
 

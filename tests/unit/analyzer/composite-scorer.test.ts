@@ -507,6 +507,36 @@ describe('generatePairwiseComparisons', () => {
     expect(comparisons).toHaveLength(3);
   });
 
+  it('applies Holm-Bonferroni correction and includes adjustedPValue', () => {
+    const results1 = [makeScoredResult({ condition: 'a', composite: 80 }), makeScoredResult({ condition: 'a', composite: 85 })];
+    const results2 = [makeScoredResult({ condition: 'b', composite: 60 }), makeScoredResult({ condition: 'b', composite: 65 })];
+    const results3 = [makeScoredResult({ condition: 'c', composite: 70 }), makeScoredResult({ condition: 'c', composite: 75 })];
+
+    const agg1 = aggregateResults(results1); agg1.condition = 'a';
+    const agg2 = aggregateResults(results2); agg2.condition = 'b';
+    const agg3 = aggregateResults(results3); agg3.condition = 'c';
+
+    const comparisons = generatePairwiseComparisons(
+      [agg1, agg2, agg3],
+      'composite',
+      (agg) => {
+        if (agg.condition === 'a') return [80, 85];
+        if (agg.condition === 'b') return [60, 65];
+        return [70, 75];
+      },
+    );
+
+    // All comparisons should have adjustedPValue
+    for (const c of comparisons) {
+      expect(c.adjustedPValue).toBeDefined();
+      expect(typeof c.adjustedPValue).toBe('number');
+      // Adjusted p-value should be >= raw p-value
+      expect(c.adjustedPValue).toBeGreaterThanOrEqual(c.pValue);
+      // Adjusted p-value should be <= 1.0
+      expect(c.adjustedPValue).toBeLessThanOrEqual(1.0);
+    }
+  });
+
   it('skips comparisons with fewer than 2 values', () => {
     const agg1 = aggregateResults([makeScoredResult({ condition: 'a', composite: 80 })]);
     agg1.condition = 'a';
