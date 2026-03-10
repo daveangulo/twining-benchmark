@@ -8,17 +8,21 @@ import type { ConditionName } from '../types/index.js';
  * Resolve the Twining plugin path.
  * Checks common install locations; falls back to a known cache path.
  */
-function resolveTwiningPluginPath(): string {
+export function resolveTwiningPluginPath(): string {
+  // 1. Explicit env var (used in Docker/Fly.io)
+  if (process.env['TWINING_PLUGIN_PATH']) {
+    return process.env['TWINING_PLUGIN_PATH'];
+  }
+
   const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
 
-  // Check installed_plugins.json for the actual path
+  // 2. Check installed_plugins.json for the marketplace-installed path
   try {
     const fs = require('node:fs');
     const pluginsFile = join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
     const data = JSON.parse(fs.readFileSync(pluginsFile, 'utf-8'));
     const twiningEntries = data.plugins?.['twining@twining-marketplace'];
     if (twiningEntries && twiningEntries.length > 0) {
-      // Prefer user-scoped, fall back to any
       const userEntry = twiningEntries.find((e: any) => e.scope === 'user');
       const entry = userEntry ?? twiningEntries[0];
       if (entry?.installPath) return entry.installPath;
@@ -27,8 +31,8 @@ function resolveTwiningPluginPath(): string {
     // Fall through to default
   }
 
-  // Default fallback
-  return join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
+  // 3. Default fallback
+  return join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.5');
 }
 
 /**

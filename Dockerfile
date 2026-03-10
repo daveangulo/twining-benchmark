@@ -21,8 +21,11 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-# Pre-install twining-mcp so the full-twining condition doesn't need npx download at runtime
+# Pre-install twining-mcp globally for the plugin's .mcp.json (uses npx -y twining-mcp)
 RUN npm install -g twining-mcp
+
+# Clone Twining plugin from GitHub so the SDK can load it
+RUN git clone --depth 1 https://github.com/daveangulo/twining-mcp.git /opt/twining-plugin
 
 COPY --from=build /app/dist ./dist
 
@@ -32,6 +35,7 @@ VOLUME /data/benchmark-results
 
 ENV RESULTS_DIR=/data/benchmark-results
 ENV NODE_ENV=production
+ENV TWINING_PLUGIN_PATH=/opt/twining-plugin/plugin
 
 EXPOSE 3838
 

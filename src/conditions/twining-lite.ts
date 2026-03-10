@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
+import { resolveTwiningPluginPath } from './full-twining.js';
 
 // No custom system prompt — plugin provides all instructions via hooks, skills, and BEHAVIORS.md.
 // The allowedTools restriction limits agents to 8 core tools.
@@ -44,26 +45,11 @@ export class TwiningLiteCondition extends BaseCondition {
   }
 
   protected buildAgentConfig(): AgentConfiguration {
-    // Reuse same plugin path resolution as full-twining
-    const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
-    let pluginPath: string;
-    try {
-      const fs = require('node:fs');
-      const pluginsFile = join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
-      const data = JSON.parse(fs.readFileSync(pluginsFile, 'utf-8'));
-      const entries = data.plugins?.['twining@twining-marketplace'];
-      const userEntry = entries?.find((e: any) => e.scope === 'user');
-      const entry = userEntry ?? entries?.[0];
-      pluginPath = entry?.installPath ?? join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
-    } catch {
-      pluginPath = join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
-    }
-
     return {
       systemPrompt: '', // Plugin provides instructions; allowedTools restricts to 8 core tools
       mcpServers: {}, // Plugin handles MCP server
       plugins: [
-        { type: 'local', path: pluginPath },
+        { type: 'local', path: resolveTwiningPluginPath() },
       ],
       allowedTools: [
         'Read',
