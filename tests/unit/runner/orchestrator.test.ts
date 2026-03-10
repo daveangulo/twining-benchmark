@@ -69,7 +69,7 @@ vi.mock('../../../src/runner/agent-session.js', () => {
 });
 
 // Import after mock setup
-const { RunOrchestrator } = await import('../../../src/runner/orchestrator.js');
+const { RunOrchestrator, captureEnvironment } = await import('../../../src/runner/orchestrator.js');
 
 function makeConfig(overrides: Partial<BenchmarkConfig> = {}): BenchmarkConfig {
   return {
@@ -307,6 +307,14 @@ describe('RunOrchestrator', () => {
 
     expect(result.runMetadata.environment.nodeVersion).toBe(process.version);
     expect(result.runMetadata.environment.platform).toBe(process.platform);
+  });
+
+  it('captureEnvironment includes reproducibility metadata', () => {
+    const env = captureEnvironment();
+    expect(env.harnessVersion).toBeDefined();
+    expect(env.harnessCommitSha).toBeDefined();
+    expect(env.evaluatorModel).toBeDefined();
+    expect(env.twiningMcpVersion).toBeDefined();
   });
 
   it('sets status to partial when interrupted mid-run', async () => {

@@ -1,5 +1,7 @@
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { execSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { v4 as uuidv4 } from 'uuid';
 import Anthropic from '@anthropic-ai/sdk';
 import type {
@@ -87,14 +89,36 @@ export interface OrchestrationResult {
   iterations: IterationResult[];
 }
 
+const require = createRequire(import.meta.url);
+
 /**
  * Capture the current environment for reproducibility (NFR-004).
  */
-function captureEnvironment(): RunEnvironment {
+export function captureEnvironment(): RunEnvironment {
+  let harnessCommitSha = 'unknown';
+  try {
+    harnessCommitSha = execSync('git rev-parse HEAD', { encoding: 'utf-8' }).trim();
+  } catch {
+    // Not in a git repo or git not available
+  }
+
+  let twiningMcpVersion = 'unknown';
+  try {
+    twiningMcpVersion = execSync('twining-mcp --version', { encoding: 'utf-8' }).trim();
+  } catch {
+    // twining-mcp not installed or not available
+  }
+
+  const pkg = require('../../package.json') as { version: string };
+
   return {
     nodeVersion: process.version,
     platform: process.platform,
     claudeModel: process.env['ANTHROPIC_MODEL'] ?? 'claude-sonnet-4-5-20250929',
+    evaluatorModel: process.env['EVALUATOR_MODEL'] ?? 'claude-sonnet-4-5-20250929',
+    harnessVersion: pkg.version,
+    harnessCommitSha,
+    twiningMcpVersion,
   };
 }
 

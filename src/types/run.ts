@@ -16,6 +16,16 @@ export interface RunEnvironment {
   claudeModel: string;
   /** Twining version, if the full-twining condition is used */
   twiningVersion?: string;
+  /** Model used for LLM-as-judge evaluation */
+  evaluatorModel: string;
+  /** Harness version from package.json */
+  harnessVersion: string;
+  /** Git commit SHA of the harness at run time */
+  harnessCommitSha: string;
+  /** Installed twining-mcp version (if available) */
+  twiningMcpVersion: string;
+  /** Run seed if provided */
+  runSeed?: string;
 }
 
 /**
