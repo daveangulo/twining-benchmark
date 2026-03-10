@@ -276,10 +276,12 @@ export class ContextRecoveryScenario extends BaseScenario {
 
     if (bFiles.length === 0) {
       return {
-        value: 100,
+        value: 0,
         confidence: 'low',
         method: 'automated',
-        justification: 'Agent B made no file changes, so no rework is possible.',
+        justification:
+          'Agent B made no file changes — cannot measure rework. ' +
+          'Score 0 (no data) rather than 100 (no rework).',
       };
     }
 

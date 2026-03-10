@@ -253,7 +253,12 @@ export abstract class BaseScenario implements Scenario {
     groundTruth: ArchitecturalManifest,
     evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
-    return this.doScore(rawResults, groundTruth, evaluatorClient);
+    // Prefer scenario-specific ground truth (set during setup) over the
+    // target-level ground truth passed by the orchestrator.  Scenarios like
+    // architecture-cascade define their own decisions that don't exist in the
+    // target's global manifest.
+    const effectiveGroundTruth = this.context?.groundTruth ?? groundTruth;
+    return this.doScore(rawResults, effectiveGroundTruth, evaluatorClient);
   }
 
   async teardown(): Promise<void> {
