@@ -31,16 +31,17 @@ describe('FullTwiningCondition', () => {
     expect(ctx.setupFiles).toContain('CLAUDE.md');
   });
 
-  it('CLAUDE.md contains Twining usage instructions', async () => {
+  it('CLAUDE.md contains project guidelines (no Twining-specific instructions)', async () => {
     await condition.setup(workDir);
 
     const content = await readFile(join(workDir, 'CLAUDE.md'), 'utf-8');
-    expect(content).toContain('twining_assemble');
-    expect(content).toContain('twining_decide');
-    expect(content).toContain('twining_verify');
-    expect(content).toContain('twining_handoff');
-    expect(content).toContain('twining_why');
-    expect(content).toContain('twining_post');
+    // Project guidelines are present
+    expect(content).toContain('repository pattern');
+    expect(content).toContain('TypeScript strict mode');
+    expect(content).toContain('vitest');
+    // No Twining-specific instructions (plugin handles those)
+    expect(content).not.toContain('twining_assemble');
+    expect(content).not.toContain('Twining Integration');
   });
 
   it('agent config uses Twining plugin (not raw MCP server)', async () => {
@@ -94,23 +95,11 @@ describe('FullTwiningCondition', () => {
     expect(config.allowedTools).toContain('mcp__plugin_twining_twining__twining_verify');
   });
 
-  it('system prompt references Twining', async () => {
+  it('system prompt is empty (plugin provides all instructions)', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.systemPrompt).toContain('Twining');
-  });
-
-  it('system prompt includes explicit lifecycle gate instructions', async () => {
-    await condition.setup(workDir);
-    const config = condition.getAgentConfig();
-
-    expect(config.systemPrompt).toContain('twining_assemble');
-    expect(config.systemPrompt).toContain('twining_decide');
-    expect(config.systemPrompt).toContain('twining_verify');
-    expect(config.systemPrompt).toContain('twining_handoff');
-    expect(config.systemPrompt).toContain('twining_why');
-    expect(config.systemPrompt).toContain('twining_post');
+    expect(config.systemPrompt).toBe('');
   });
 
   it('Twining plugin is configured with a local path', async () => {

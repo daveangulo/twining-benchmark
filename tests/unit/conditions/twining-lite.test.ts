@@ -70,20 +70,11 @@ describe('TwiningLiteCondition', () => {
     expect(config.allowedTools).toContain('Grep');
   });
 
-  it('system prompt references twining_query, twining_decide, twining_handoff', async () => {
+  it('system prompt is empty (plugin provides all instructions)', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.systemPrompt).toContain('twining_query');
-    expect(config.systemPrompt).toContain('twining_decide');
-    expect(config.systemPrompt).toContain('twining_handoff');
-  });
-
-  it('system prompt does NOT reference twining_verify', async () => {
-    await condition.setup(workDir);
-    const config = condition.getAgentConfig();
-
-    expect(config.systemPrompt).not.toContain('twining_verify');
+    expect(config.systemPrompt).toBe('');
   });
 
   it('uses Twining plugin (not raw MCP server)', async () => {
@@ -105,19 +96,16 @@ describe('TwiningLiteCondition', () => {
     expect(ctx.setupFiles).toContain('CLAUDE.md');
   });
 
-  it('CLAUDE.md contains Twining Lite tool list', async () => {
+  it('CLAUDE.md contains project guidelines (no Twining-specific instructions)', async () => {
     await condition.setup(workDir);
 
     const content = await readFile(join(workDir, 'CLAUDE.md'), 'utf-8');
-    expect(content).toContain('Twining Lite');
-    expect(content).toContain('twining_post');
-    expect(content).toContain('twining_read');
-    expect(content).toContain('twining_query');
-    expect(content).toContain('twining_recent');
-    expect(content).toContain('twining_decide');
-    expect(content).toContain('twining_search_decisions');
-    expect(content).toContain('twining_handoff');
-    expect(content).toContain('twining_acknowledge');
+    // Project guidelines are present
+    expect(content).toContain('repository pattern');
+    expect(content).toContain('TypeScript strict mode');
+    // No Twining-specific instructions (plugin handles those)
+    expect(content).not.toContain('Twining Lite');
+    expect(content).not.toContain('twining_post');
   });
 
   it('teardown cleans up .twining directory', async () => {

@@ -4,20 +4,8 @@ import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
 
-const TWINING_LITE_SYSTEM_PROMPT = `You have access to Twining Lite, a coordination plugin with core blackboard and decision tools.
-
-Follow these coordination steps:
-
-**Before starting work:**
-1. Call twining_query to check for context from prior agents
-
-**While working:**
-2. Call twining_decide for any architectural or implementation choice where alternatives exist
-3. Call twining_post with entry_type "finding" for discoveries, "warning" for gotchas
-
-**Before finishing:**
-4. Call twining_post with entry_type "status" summarizing what you accomplished
-5. Call twining_handoff with your results for the next agent`;
+// No custom system prompt — plugin provides all instructions via hooks, skills, and BEHAVIORS.md.
+// The allowedTools restriction limits agents to 8 core tools.
 
 /**
  * FR-CND-007: Twining Lite
@@ -72,7 +60,7 @@ export class TwiningLiteCondition extends BaseCondition {
     }
 
     return {
-      systemPrompt: TWINING_LITE_SYSTEM_PROMPT,
+      systemPrompt: '', // Plugin provides instructions; allowedTools restricts to 8 core tools
       mcpServers: {}, // Plugin handles MCP server
       plugins: [
         { type: 'local', path: pluginPath },
@@ -153,32 +141,6 @@ export class TwiningLiteCondition extends BaseCondition {
 - Commit atomically per logical change
 - Write descriptive commit messages explaining the "why"
 - Run tests before committing
-
----
-
-## Twining Lite Integration
-
-This project uses Twining Lite for lightweight agent coordination.
-You have access to the following 8 Twining tools:
-
-### Blackboard Tools
-- \`twining_post\` — Post entries (findings, warnings, status updates)
-- \`twining_read\` — Read specific blackboard entries
-- \`twining_query\` — Query the blackboard for context
-- \`twining_recent\` — Get recent blackboard entries
-
-### Decision Tools
-- \`twining_decide\` — Record architectural/implementation decisions
-- \`twining_search_decisions\` — Search past decisions
-
-### Handoff Tools
-- \`twining_handoff\` — Hand off work to the next agent
-- \`twining_acknowledge\` — Acknowledge a handoff from a prior agent
-
-### Workflow
-1. **Before work:** Call \`twining_query\` to check for prior context
-2. **During work:** Use \`twining_decide\` for choices, \`twining_post\` for findings/warnings
-3. **After work:** Post a status summary and call \`twining_handoff\`
 `;
   }
 }
