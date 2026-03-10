@@ -689,7 +689,7 @@ The primary visualization: side-by-side comparison of coordination conditions.
 ### NFR-001: Performance
 
 - [ ] A single scenario/condition run (1 iteration) completes within 20 minutes maximum.
-- [ ] A full benchmark suite (5 scenarios × 6 conditions × 3 runs = 90 runs) completes within 16 hours.
+- [ ] A full benchmark suite (8 scenarios × 8 conditions × 3 runs = 192 runs) completes within 16 hours.
 - [ ] The dashboard loads and renders results for 50+ runs within 3 seconds.
 - [ ] Analyzer scoring for a single run completes within 2 minutes.
 
@@ -972,7 +972,7 @@ This is the key comparison for teams currently using GSD, BMAD, or similar file-
 | **File Reload (structured) vs. Twining** | Does Twining's dynamic search, graph, and structured tooling outperform structured file-based coordination? This is the key value proposition question for teams already using frameworks. |
 | **Twining vs. ALL file-based conditions** | Is there a meaningful gap between the best file-based approach and Twining? If the gap is small, Twining's value prop is primarily convenience. If the gap is large, Twining provides capabilities that files cannot replicate. |
 
-**Interpretation rule:** The dashboard should produce a clear ranking of all 6 conditions per scenario, with pairwise significance tests for adjacent pairs in the ranking. This lets a reader see exactly where each approach falls and whether the differences are real.
+**Interpretation rule:** The dashboard should produce a clear ranking of all 8 conditions per scenario, with pairwise significance tests for adjacent pairs in the ranking. This lets a reader see exactly where each approach falls and whether the differences are real.
 
 #### Step 5: Evaluate Scale Degradation (Scale Stress Test Only)
 
@@ -998,7 +998,7 @@ Where:
 - `integration_score` = test_pass_rate × 100
 - `redundancy_score` = 100 - (redundant_work_% × 100)
 - `coherence_score` = (architectural_coherence / 5) × 100
-- `overhead_penalty` = max(0, (coordination_overhead_ratio - 0.10)) × 200 (penalty kicks in above 10% overhead)
+- `overhead_penalty` = coordination_overhead_ratio × 100 (smooth linear penalty, provisional — pending empirical calibration)
 
 Default weights: w₁=0.25, w₂=0.30, w₃=0.20, w₄=0.15, w₅=0.10 (configurable per scenario).
 
@@ -1131,7 +1131,7 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 
 - CLI skeleton with `init`, `run`, `scenarios list`, `conditions list` commands
 - Target interface + pre-built synthetic repo
-- Condition interface + all 6 conditions implemented (baseline, CLAUDE.md, shared markdown, generic file reload, structured framework reload, full Twining)
+- Condition interface + all 8 conditions implemented (baseline, CLAUDE.md, shared markdown, generic file reload, structured framework reload, full Twining, Twining Lite, persistent history)
 - Agent session management (start, monitor, terminate, capture output)
 - Basic data collection (git diffs, token counts, timing)
 
@@ -1143,7 +1143,7 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 
 **Deliverables:**
 
-- All 5 scenarios implemented (including scale stress test)
+- All 8 scenarios implemented (including scale stress test, concurrent agents, conflict resolution, context recovery)
 - Automated code analysis (churn, pattern detection, test results)
 - LLM-as-judge evaluation framework
 - Statistical aggregation
@@ -1151,7 +1151,7 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 
 **Exit Criteria:**
 
-- [x] All 5 scenarios produce scored results across all 6 conditions.
+- [x] All 8 scenarios produce scored results across all 8 conditions.
 - [x] `twining-bench results show latest` displays the full KPI summary template from Section 9.3.
 
 ### Phase 3: Dashboard & Export — COMPLETE
@@ -1193,7 +1193,7 @@ Phase 0 must produce one of these outcomes before proceeding to Phase 1:
 | LLM non-determinism makes results noisy | High | High | Phase 0 validates signal detectability first. Multiple runs per pair, statistical aggregation, seed control, report confidence intervals |
 | ~~Claude Code CLI may not support programmatic session management~~ | ~~High~~ | ~~Medium~~ | **RESOLVED.** Claude Agent SDK (`@anthropic-ai/claude-agent-sdk`) provides full programmatic control with MCP injection, streaming, and structured output. |
 | LLM-as-judge evaluation is itself variable | Medium | High | Triple evaluation with median, versioned rubrics, calibration against human-scored examples |
-| Token costs for full suite may be high (~5M+ tokens for 6 conditions) | Medium | Medium | Phase 0 estimates costs. Cost estimation in `--dry-run`, budget caps in config, option to run subset of scenarios |
+| Token costs for full suite may be high (~75M+ tokens for 8 conditions) | Medium | Medium | Phase 0 estimates costs. Cost estimation in `--dry-run`, budget caps in config, option to run subset of scenarios |
 | Twining itself may not be stable enough for benchmarking | Medium | Medium | Phase 0 tests Twining condition. Phase 1 benchmarks use baseline/CLAUDE.md/markdown. Full Twining condition added when stable |
 | File-based conditions (GSD/BMAD pattern) are hard to standardise — real frameworks have very different structures | Medium | Medium | Keep the structured condition generic (checklist + handoff + decisions) rather than mimicking a specific framework. Document that it represents the pattern, not a specific tool |
 | Scale stress test is expensive and time-consuming | Medium | High | Scale test runs only at explicit request (`--scenario scale-stress`), not included in default "all scenarios" |

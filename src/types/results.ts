@@ -132,6 +132,12 @@ export interface PairwiseComparison {
   deltaPercent: number;
   /** p-value from statistical significance test */
   pValue: number;
+  /** Holm-Bonferroni corrected p-value */
+  adjustedPValue: number;
+  /** Cohen's d effect size */
+  effectSize?: number;
+  /** Effect size interpretation */
+  effectInterpretation?: 'negligible' | 'small' | 'medium' | 'large';
   /** Significance level interpretation */
   significance: 'significant' | 'suggestive' | 'not-distinguishable';
 }
@@ -184,6 +190,8 @@ export interface BenchmarkReport {
   efficacyScore: number;
   /** Auto-generated key findings */
   keyFindings: string[];
+  /** Per-condition success rates (fraction 0-1 of iterations where compiles was true) */
+  conditionSuccessRates?: Record<string, number>;
 }
 
 /**

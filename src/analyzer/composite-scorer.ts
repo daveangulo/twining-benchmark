@@ -9,7 +9,7 @@ import type {
   ConditionRanking,
   PairwiseComparison,
 } from '../types/results.js';
-import { computeSummary, compareConditions } from './statistics.js';
+import { computeSummary, compareConditions, holmBonferroni } from './statistics.js';
 
 /**
  * Raw metric inputs for CES calculation.
@@ -351,6 +351,23 @@ export function generatePairwiseComparisons(
         );
       }
     }
+  }
+
+  // Apply Holm-Bonferroni correction across all comparisons
+  if (comparisons.length > 0) {
+    const rawPValues = comparisons.map(c => c.pValue);
+    const adjustedPValues = holmBonferroni(rawPValues);
+    comparisons.forEach((c, i) => {
+      c.adjustedPValue = adjustedPValues[i]!;
+      // Re-determine significance from adjusted p-value
+      if (c.adjustedPValue < 0.05) {
+        c.significance = 'significant';
+      } else if (c.adjustedPValue < 0.10) {
+        c.significance = 'suggestive';
+      } else {
+        c.significance = 'not-distinguishable';
+      }
+    });
   }
 
   return comparisons;

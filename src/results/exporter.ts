@@ -116,6 +116,100 @@ export function generateKeyFindings(report: BenchmarkReport): string[] {
   return findings;
 }
 
+// ─── Primary Metrics Table ─────────────────────────────────────────
+
+/**
+ * Format milliseconds into Xm Ys format.
+ */
+function formatTime(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+}
+
+/**
+ * Build a primary metrics table showing success rate, test pass rate, cost, and time
+ * for each condition. Groups by condition across all scenarios.
+ */
+export function buildPrimaryMetricsTable(
+  aggregated: AggregatedResults[],
+  conditionSuccessRates?: Record<string, number>,
+): string {
+  if (aggregated.length === 0) return '';
+
+  // Group by condition, merging across scenarios
+  const conditions = [...new Set(aggregated.map(a => a.condition))];
+
+  const lines: string[] = [];
+  lines.push('## Primary Metrics');
+  lines.push('');
+  lines.push('```');
+  lines.push('Primary Metrics (per condition)');
+  lines.push('───────────────────────────────────────────────────');
+
+  const colWidths = { condition: 23, success: 9, tests: 8, cost: 9, time: 10 };
+  const header =
+    pad('Condition', colWidths.condition) +
+    pad('Success', colWidths.success) +
+    pad('Tests', colWidths.tests) +
+    pad('Cost', colWidths.cost) +
+    pad('Time', colWidths.time);
+  lines.push(header);
+
+  for (const cond of conditions) {
+    const condResults = aggregated.filter(a => a.condition === cond);
+
+    // Compute mean metrics across scenarios for this condition
+    let totalTestsPass = 0;
+    let totalTestsFail = 0;
+    let totalCost = 0;
+    let totalWallTime = 0;
+    let count = 0;
+
+    for (const r of condResults) {
+      totalTestsPass += r.metricSummaries.testsPass.mean;
+      totalTestsFail += r.metricSummaries.testsFail.mean;
+      totalCost += r.metricSummaries.costUsd.mean;
+      totalWallTime += r.metricSummaries.wallTimeMs.mean;
+      count++;
+    }
+
+    const avgTestsPass = count > 0 ? totalTestsPass / count : 0;
+    const avgTestsFail = count > 0 ? totalTestsFail / count : 0;
+    const avgCost = count > 0 ? totalCost / count : 0;
+    const avgWallTime = count > 0 ? totalWallTime / count : 0;
+
+    const successRate = conditionSuccessRates?.[cond];
+    const successStr = successRate !== undefined
+      ? `${Math.round(successRate * 100)}%`
+      : '—';
+
+    const totalTests = avgTestsPass + avgTestsFail;
+    const testsStr = totalTests > 0
+      ? `${Math.round(avgTestsPass)}/${Math.round(totalTests)}`
+      : '—';
+
+    const costStr = avgCost > 0 ? `$${avgCost.toFixed(2)}` : '—';
+    const timeStr = avgWallTime > 0 ? formatTime(avgWallTime) : '—';
+
+    lines.push(
+      pad(cond, colWidths.condition) +
+      pad(successStr, colWidths.success) +
+      pad(testsStr, colWidths.tests) +
+      pad(costStr, colWidths.cost) +
+      pad(timeStr, colWidths.time),
+    );
+  }
+
+  lines.push('```');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
 // ─── Markdown Export (FR-DSH-005) ──────────────────────────────────
 
 /**
@@ -218,15 +312,20 @@ function buildComparisonMarkdown(
       }
     }
 
-    // Pairwise significance
+    // Pairwise comparisons table (effect sizes first, p-values de-emphasized)
     if (scenarioComparisons.length > 0) {
       sections.push('');
-      sections.push('**Pairwise Significance:**');
+      sections.push('**Pairwise Comparisons:**');
       sections.push('');
+      sections.push('| Condition A | Condition B | Delta | Cohen\'s d | Effect | Adj. p-value | Sig. |');
+      sections.push('|---|---|---|---|---|---|---|');
       for (const comp of scenarioComparisons) {
         const dir = comp.deltaPercent > 0 ? '+' : '';
+        const d = comp.effectSize != null ? comp.effectSize.toFixed(2) : 'N/A';
+        const effect = comp.effectInterpretation ?? 'N/A';
+        const adjP = comp.adjustedPValue != null ? comp.adjustedPValue.toFixed(3) : comp.pValue.toFixed(3);
         sections.push(
-          `- ${comp.conditionA} vs ${comp.conditionB} (${comp.metric}): ${dir}${comp.deltaPercent.toFixed(1)}% ${sigIndicator(comp.significance)} (p=${comp.pValue.toFixed(3)})`,
+          `| ${comp.conditionA} | ${comp.conditionB} | ${dir}${comp.deltaPercent.toFixed(1)}% | ${d} | ${effect} | ${adjP} | ${sigIndicator(comp.significance)} |`,
         );
       }
     }
@@ -331,6 +430,15 @@ export function exportMarkdown(report: BenchmarkReport): string {
     '',
   );
 
+  // Primary metrics table (before CES)
+  const primaryMetrics = buildPrimaryMetricsTable(
+    report.aggregated,
+    report.conditionSuccessRates,
+  );
+  if (primaryMetrics) {
+    sections.push(primaryMetrics);
+  }
+
   // Ranking table
   sections.push('## Condition Ranking (by Composite Effectiveness Score)', '');
   sections.push('```');
@@ -352,6 +460,33 @@ export function exportMarkdown(report: BenchmarkReport): string {
     for (const f of findings) {
       sections.push(`- ${f}`);
     }
+    sections.push('');
+  }
+
+  // Key Effect Sizes — top 5 largest Cohen's d values
+  const comparisonsWithEffectSize = report.comparisons
+    .filter((c) => c.effectSize != null)
+    .sort((a, b) => Math.abs(b.effectSize!) - Math.abs(a.effectSize!))
+    .slice(0, 5);
+
+  if (comparisonsWithEffectSize.length > 0) {
+    sections.push('## Key Effect Sizes', '');
+    sections.push('```');
+    sections.push('Key Effect Sizes');
+    sections.push('\u2500'.repeat(51));
+
+    for (const comp of comparisonsWithEffectSize) {
+      const label = `${comp.conditionA} vs ${comp.conditionB}:`;
+      const d = comp.effectSize!;
+      const interp = comp.effectInterpretation ?? 'N/A';
+      const dir = comp.deltaPercent > 0 ? '+' : '';
+      const deltaStr = `${dir}${comp.deltaPercent.toFixed(1)}%`;
+      sections.push(
+        `${pad(label, 38)} d = ${padLeft(d.toFixed(2), 5)} (${pad(interp, 10)}) ${padLeft(deltaStr, 8)}`,
+      );
+    }
+
+    sections.push('```');
     sections.push('');
   }
 

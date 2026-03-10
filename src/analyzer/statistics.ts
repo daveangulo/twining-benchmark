@@ -173,12 +173,23 @@ export function compareConditions(
     significance = 'not-distinguishable';
   }
 
+  // Compute Cohen's d effect size
+  let effectSize: number | undefined;
+  let effectInterpretation: PairwiseComparison['effectInterpretation'];
+  if (valuesA.length >= 2 && valuesB.length >= 2) {
+    effectSize = cohensD(valuesA, valuesB);
+    effectInterpretation = interpretEffectSize(effectSize);
+  }
+
   return {
     conditionA,
     conditionB,
     metric: metricName,
     deltaPercent,
     pValue,
+    adjustedPValue: pValue, // Will be corrected by Holm-Bonferroni in batch
+    effectSize,
+    effectInterpretation,
     significance,
   };
 }
@@ -312,6 +323,30 @@ export function wilcoxonSignedRank(
     zScore: z,
     pValue: Math.min(pValue, 1.0),
   };
+}
+
+/**
+ * Apply Holm-Bonferroni correction to a set of p-values.
+ * Controls family-wise error rate for multiple comparisons.
+ * Returns adjusted p-values (same order as input).
+ */
+export function holmBonferroni(pValues: number[]): number[] {
+  const n = pValues.length;
+  if (n === 0) return [];
+  if (n === 1) return [...pValues];
+
+  // Create indexed array and sort by p-value ascending
+  const indexed = pValues.map((p, i) => ({ p, i }));
+  indexed.sort((a, b) => a.p - b.p);
+
+  const adjusted = new Array<number>(n);
+  let maxSoFar = 0;
+  for (let rank = 0; rank < n; rank++) {
+    const corrected = indexed[rank]!.p * (n - rank);
+    maxSoFar = Math.max(maxSoFar, corrected);
+    adjusted[indexed[rank]!.i] = Math.min(maxSoFar, 1.0);
+  }
+  return adjusted;
 }
 
 // --- Internal helpers ---
