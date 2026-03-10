@@ -133,6 +133,19 @@ export function buildReport(
     keyFindings: [],
   };
 
+  // Compute per-condition success rates from raw scores
+  const conditionGroups = new Map<string, ScoredResults[]>();
+  for (const s of scores) {
+    const arr = conditionGroups.get(s.condition) ?? [];
+    arr.push(s);
+    conditionGroups.set(s.condition, arr);
+  }
+  report.conditionSuccessRates = {};
+  for (const [cond, items] of conditionGroups) {
+    const successCount = items.filter(s => s.metrics.compiles).length;
+    report.conditionSuccessRates[cond] = items.length > 0 ? successCount / items.length : 0;
+  }
+
   // Auto-generate key findings
   report.keyFindings = generateKeyFindings(report);
 

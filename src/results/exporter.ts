@@ -116,6 +116,100 @@ export function generateKeyFindings(report: BenchmarkReport): string[] {
   return findings;
 }
 
+// ─── Primary Metrics Table ─────────────────────────────────────────
+
+/**
+ * Format milliseconds into Xm Ys format.
+ */
+function formatTime(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
+}
+
+/**
+ * Build a primary metrics table showing success rate, test pass rate, cost, and time
+ * for each condition. Groups by condition across all scenarios.
+ */
+export function buildPrimaryMetricsTable(
+  aggregated: AggregatedResults[],
+  conditionSuccessRates?: Record<string, number>,
+): string {
+  if (aggregated.length === 0) return '';
+
+  // Group by condition, merging across scenarios
+  const conditions = [...new Set(aggregated.map(a => a.condition))];
+
+  const lines: string[] = [];
+  lines.push('## Primary Metrics');
+  lines.push('');
+  lines.push('```');
+  lines.push('Primary Metrics (per condition)');
+  lines.push('───────────────────────────────────────────────────');
+
+  const colWidths = { condition: 23, success: 9, tests: 8, cost: 9, time: 10 };
+  const header =
+    pad('Condition', colWidths.condition) +
+    pad('Success', colWidths.success) +
+    pad('Tests', colWidths.tests) +
+    pad('Cost', colWidths.cost) +
+    pad('Time', colWidths.time);
+  lines.push(header);
+
+  for (const cond of conditions) {
+    const condResults = aggregated.filter(a => a.condition === cond);
+
+    // Compute mean metrics across scenarios for this condition
+    let totalTestsPass = 0;
+    let totalTestsFail = 0;
+    let totalCost = 0;
+    let totalWallTime = 0;
+    let count = 0;
+
+    for (const r of condResults) {
+      totalTestsPass += r.metricSummaries.testsPass.mean;
+      totalTestsFail += r.metricSummaries.testsFail.mean;
+      totalCost += r.metricSummaries.costUsd.mean;
+      totalWallTime += r.metricSummaries.wallTimeMs.mean;
+      count++;
+    }
+
+    const avgTestsPass = count > 0 ? totalTestsPass / count : 0;
+    const avgTestsFail = count > 0 ? totalTestsFail / count : 0;
+    const avgCost = count > 0 ? totalCost / count : 0;
+    const avgWallTime = count > 0 ? totalWallTime / count : 0;
+
+    const successRate = conditionSuccessRates?.[cond];
+    const successStr = successRate !== undefined
+      ? `${Math.round(successRate * 100)}%`
+      : '—';
+
+    const totalTests = avgTestsPass + avgTestsFail;
+    const testsStr = totalTests > 0
+      ? `${Math.round(avgTestsPass)}/${Math.round(totalTests)}`
+      : '—';
+
+    const costStr = avgCost > 0 ? `$${avgCost.toFixed(2)}` : '—';
+    const timeStr = avgWallTime > 0 ? formatTime(avgWallTime) : '—';
+
+    lines.push(
+      pad(cond, colWidths.condition) +
+      pad(successStr, colWidths.success) +
+      pad(testsStr, colWidths.tests) +
+      pad(costStr, colWidths.cost) +
+      pad(timeStr, colWidths.time),
+    );
+  }
+
+  lines.push('```');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
 // ─── Markdown Export (FR-DSH-005) ──────────────────────────────────
 
 /**
@@ -330,6 +424,15 @@ export function exportMarkdown(report: BenchmarkReport): string {
     `> **CONFIDENCE:** ${confidenceLevel} (p < ${bestPValue < 0.001 ? '0.001' : bestPValue.toFixed(2)}, ${iterations} runs, ${varianceStatus})`,
     '',
   );
+
+  // Primary metrics table (before CES)
+  const primaryMetrics = buildPrimaryMetricsTable(
+    report.aggregated,
+    report.conditionSuccessRates,
+  );
+  if (primaryMetrics) {
+    sections.push(primaryMetrics);
+  }
 
   // Ranking table
   sections.push('## Condition Ranking (by Composite Effectiveness Score)', '');
