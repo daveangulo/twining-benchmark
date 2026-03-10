@@ -173,12 +173,22 @@ export function compareConditions(
     significance = 'not-distinguishable';
   }
 
+  // Compute Cohen's d effect size
+  let effectSize: number | undefined;
+  let effectInterpretation: PairwiseComparison['effectInterpretation'];
+  if (valuesA.length >= 2 && valuesB.length >= 2) {
+    effectSize = cohensD(valuesA, valuesB);
+    effectInterpretation = interpretEffectSize(effectSize);
+  }
+
   return {
     conditionA,
     conditionB,
     metric: metricName,
     deltaPercent,
     pValue,
+    effectSize,
+    effectInterpretation,
     significance,
   };
 }

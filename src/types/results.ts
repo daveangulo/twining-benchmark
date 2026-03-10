@@ -132,6 +132,12 @@ export interface PairwiseComparison {
   deltaPercent: number;
   /** p-value from statistical significance test */
   pValue: number;
+  /** Holm-Bonferroni adjusted p-value */
+  adjustedPValue?: number;
+  /** Cohen's d effect size */
+  effectSize?: number;
+  /** Effect size interpretation */
+  effectInterpretation?: 'negligible' | 'small' | 'medium' | 'large';
   /** Significance level interpretation */
   significance: 'significant' | 'suggestive' | 'not-distinguishable';
 }
