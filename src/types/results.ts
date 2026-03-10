@@ -186,6 +186,8 @@ export interface BenchmarkReport {
   efficacyScore: number;
   /** Auto-generated key findings */
   keyFindings: string[];
+  /** Per-condition success rates (fraction 0-1 of iterations where compiles was true) */
+  conditionSuccessRates?: Record<string, number>;
 }
 
 /**
