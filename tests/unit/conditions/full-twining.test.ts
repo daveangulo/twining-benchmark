@@ -20,7 +20,7 @@ describe('FullTwiningCondition', () => {
 
   it('has correct name and description', () => {
     expect(condition.name).toBe('full-twining');
-    expect(condition.description).toContain('Twining MCP');
+    expect(condition.description).toContain('Twining plugin');
     expect(condition.description).toContain('blackboard');
     expect(condition.description).toContain('knowledge graph');
   });
@@ -43,16 +43,18 @@ describe('FullTwiningCondition', () => {
     expect(content).toContain('twining_post');
   });
 
-  it('agent config includes Twining MCP server', async () => {
+  it('agent config uses Twining plugin (not raw MCP server)', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.mcpServers).toHaveProperty('twining');
-    const twiningServer = config.mcpServers['twining'];
-    expect(twiningServer).toBeDefined();
-    expect(twiningServer!.command).toBe('twining-mcp');
-    expect(twiningServer!.args).toContain('--project');
-    expect(twiningServer!.env?.['TWINING_DASHBOARD']).toBe('0');
+    // Plugin handles MCP server — mcpServers should be empty
+    expect(Object.keys(config.mcpServers)).toHaveLength(0);
+
+    // Plugin should be configured
+    expect(config.plugins).toBeDefined();
+    expect(config.plugins).toHaveLength(1);
+    expect(config.plugins![0]!.type).toBe('local');
+    expect(config.plugins![0]!.path).toContain('twining');
   });
 
   it('agent config allows all Twining tools', async () => {
@@ -111,13 +113,12 @@ describe('FullTwiningCondition', () => {
     expect(config.systemPrompt).toContain('twining_post');
   });
 
-  it('Twining project is isolated to the working directory', async () => {
+  it('Twining plugin is configured with a local path', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
-    const twiningServer = config.mcpServers['twining'];
 
-    expect(twiningServer!.args).toContain('--project');
-    expect(twiningServer!.args).toContain(workDir);
+    expect(config.plugins).toBeDefined();
+    expect(config.plugins![0]!.path).toContain('twining');
   });
 
   it('teardown cleans up .twining directory', async () => {
@@ -155,11 +156,10 @@ describe('FullTwiningCondition', () => {
     await customCondition.teardown();
   });
 
-  it('dashboard is disabled in the MCP server config', async () => {
+  it('mcpServers is empty (plugin handles MCP)', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
-    const twiningServer = config.mcpServers['twining'];
 
-    expect(twiningServer!.env?.['TWINING_DASHBOARD']).toBe('0');
+    expect(Object.keys(config.mcpServers)).toHaveLength(0);
   });
 });

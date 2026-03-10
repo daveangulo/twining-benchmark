@@ -86,17 +86,18 @@ describe('TwiningLiteCondition', () => {
     expect(config.systemPrompt).not.toContain('twining_verify');
   });
 
-  it('MCP servers configured with twining server', async () => {
+  it('uses Twining plugin (not raw MCP server)', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.mcpServers).toHaveProperty('twining');
-    const twiningServer = config.mcpServers['twining'];
-    expect(twiningServer).toBeDefined();
-    expect(twiningServer!.command).toBe('twining-mcp');
-    expect(twiningServer!.args).toContain('--project');
-    expect(twiningServer!.args).toContain(workDir);
-    expect(twiningServer!.env?.['TWINING_DASHBOARD']).toBe('0');
+    // Plugin handles MCP server — mcpServers should be empty
+    expect(Object.keys(config.mcpServers)).toHaveLength(0);
+
+    // Plugin should be configured
+    expect(config.plugins).toBeDefined();
+    expect(config.plugins).toHaveLength(1);
+    expect(config.plugins![0]!.type).toBe('local');
+    expect(config.plugins![0]!.path).toContain('twining');
   });
 
   it('creates CLAUDE.md during setup', async () => {

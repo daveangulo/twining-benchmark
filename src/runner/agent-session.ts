@@ -419,6 +419,13 @@ export class AgentSessionManager {
       options.mcpServers = mcpServers;
     }
 
+    // Plugins
+    if (this.agentConfig.plugins && this.agentConfig.plugins.length > 0) {
+      options.plugins = this.agentConfig.plugins;
+      // Load project settings so CLAUDE.md is picked up
+      options.settingSources = ['project'];
+    }
+
     // Merge condition-specific env vars on top of clean env
     if (this.agentConfig.env) {
       Object.assign(options.env!, this.agentConfig.env);

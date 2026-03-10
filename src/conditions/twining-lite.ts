@@ -1,6 +1,6 @@
 import { writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { AgentConfiguration, McpServerConfig } from '../types/index.js';
+import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
 
@@ -56,19 +56,27 @@ export class TwiningLiteCondition extends BaseCondition {
   }
 
   protected buildAgentConfig(): AgentConfiguration {
-    const twiningServer: McpServerConfig = {
-      command: 'twining-mcp',
-      args: ['--project', this.projectDir],
-      env: {
-        TWINING_DASHBOARD: '0', // Disable dashboard during benchmarks
-      },
-    };
+    // Reuse same plugin path resolution as full-twining
+    const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
+    let pluginPath: string;
+    try {
+      const fs = require('node:fs');
+      const pluginsFile = join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
+      const data = JSON.parse(fs.readFileSync(pluginsFile, 'utf-8'));
+      const entries = data.plugins?.['twining@twining-marketplace'];
+      const userEntry = entries?.find((e: any) => e.scope === 'user');
+      const entry = userEntry ?? entries?.[0];
+      pluginPath = entry?.installPath ?? join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
+    } catch {
+      pluginPath = join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
+    }
 
     return {
       systemPrompt: TWINING_LITE_SYSTEM_PROMPT,
-      mcpServers: {
-        twining: twiningServer,
-      },
+      mcpServers: {}, // Plugin handles MCP server
+      plugins: [
+        { type: 'local', path: pluginPath },
+      ],
       allowedTools: [
         'Read',
         'Edit',
@@ -76,7 +84,7 @@ export class TwiningLiteCondition extends BaseCondition {
         'Bash',
         'Glob',
         'Grep',
-        // Core Twining tools (8 of 26)
+        // Core Twining tools only (8 of 32) — plugin prefix
         'mcp__plugin_twining_twining__twining_post',
         'mcp__plugin_twining_twining__twining_read',
         'mcp__plugin_twining_twining__twining_query',

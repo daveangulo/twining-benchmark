@@ -1,8 +1,35 @@
 import { writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import type { AgentConfiguration, McpServerConfig } from '../types/index.js';
+import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
 import type { ConditionName } from '../types/index.js';
+
+/**
+ * Resolve the Twining plugin path.
+ * Checks common install locations; falls back to a known cache path.
+ */
+function resolveTwiningPluginPath(): string {
+  const homeDir = process.env['HOME'] ?? process.env['USERPROFILE'] ?? '';
+
+  // Check installed_plugins.json for the actual path
+  try {
+    const fs = require('node:fs');
+    const pluginsFile = join(homeDir, '.claude', 'plugins', 'installed_plugins.json');
+    const data = JSON.parse(fs.readFileSync(pluginsFile, 'utf-8'));
+    const twiningEntries = data.plugins?.['twining@twining-marketplace'];
+    if (twiningEntries && twiningEntries.length > 0) {
+      // Prefer user-scoped, fall back to any
+      const userEntry = twiningEntries.find((e: any) => e.scope === 'user');
+      const entry = userEntry ?? twiningEntries[0];
+      if (entry?.installPath) return entry.installPath;
+    }
+  } catch {
+    // Fall through to default
+  }
+
+  // Default fallback
+  return join(homeDir, '.claude', 'plugins', 'cache', 'twining-marketplace', 'twining', '1.1.4');
+}
 
 const TWINING_SYSTEM_PROMPT = `You have access to Twining, a coordination plugin for multi-agent workflows.
 
@@ -24,15 +51,16 @@ Follow the Twining lifecycle gates for every task:
 /**
  * FR-CND-006: Full Twining Plugin
  *
- * Agents have CLAUDE.md plus the Twining plugin (MCP server, skills, hooks)
- * with all capabilities: blackboard, decision tracking, knowledge graph, and semantic search.
+ * Agents have CLAUDE.md plus the Twining plugin loaded via SDK plugin system.
+ * The plugin provides: MCP server, skills, hooks, agents, and BEHAVIORS.md —
+ * the full infrastructure that guides agents through lifecycle gates.
  *
- * The Twining project directory is isolated per run via --project flag.
+ * The plugin's MCP server uses --project <cwd> for isolation (set via SDK cwd).
  */
 export class FullTwiningCondition extends BaseCondition {
   readonly name: ConditionName = 'full-twining';
   readonly description =
-    'Full Twining MCP server with blackboard, decision tracking, knowledge graph, and semantic search.';
+    'Full Twining plugin with skills, hooks, and MCP server — blackboard, decision tracking, knowledge graph, and semantic search.';
 
   private projectDir = '';
 
@@ -57,19 +85,12 @@ export class FullTwiningCondition extends BaseCondition {
   }
 
   protected buildAgentConfig(): AgentConfiguration {
-    const twiningServer: McpServerConfig = {
-      command: 'twining-mcp',
-      args: ['--project', this.projectDir],
-      env: {
-        TWINING_DASHBOARD: '0', // Disable dashboard during benchmarks
-      },
-    };
-
     return {
       systemPrompt: TWINING_SYSTEM_PROMPT,
-      mcpServers: {
-        twining: twiningServer,
-      },
+      mcpServers: {}, // Plugin handles MCP server
+      plugins: [
+        { type: 'local', path: resolveTwiningPluginPath() },
+      ],
       allowedTools: [
         'Read',
         'Edit',
@@ -77,7 +98,7 @@ export class FullTwiningCondition extends BaseCondition {
         'Bash',
         'Glob',
         'Grep',
-        // All Twining tools
+        // All Twining tools (plugin prefix: mcp__plugin_twining_twining__)
         'mcp__plugin_twining_twining__twining_post',
         'mcp__plugin_twining_twining__twining_read',
         'mcp__plugin_twining_twining__twining_query',
@@ -101,12 +122,15 @@ export class FullTwiningCondition extends BaseCondition {
         'mcp__plugin_twining_twining__twining_status',
         'mcp__plugin_twining_twining__twining_archive',
         'mcp__plugin_twining_twining__twining_export',
-        // Agent coordination tools
         'mcp__plugin_twining_twining__twining_agents',
         'mcp__plugin_twining_twining__twining_discover',
         'mcp__plugin_twining_twining__twining_delegate',
         'mcp__plugin_twining_twining__twining_handoff',
         'mcp__plugin_twining_twining__twining_acknowledge',
+        'mcp__plugin_twining_twining__twining_dismiss',
+        'mcp__plugin_twining_twining__twining_prune_graph',
+        'mcp__plugin_twining_twining__twining_register',
+        'mcp__plugin_twining_twining__twining_promote',
       ],
       permissionMode: 'acceptEdits',
     };

@@ -39,6 +39,8 @@ export interface AgentConfiguration {
   permissionMode: 'acceptEdits' | 'plan' | 'full';
   /** Additional environment variables for the agent process */
   env?: Record<string, string>;
+  /** Plugins to load for this condition (SDK plugin system) */
+  plugins?: Array<{ type: 'local'; path: string }>;
   /** If true, pass previous agents' conversation as history prefix to subsequent agents */
   persistHistory?: boolean;
 }
