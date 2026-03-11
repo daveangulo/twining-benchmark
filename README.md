@@ -9,8 +9,10 @@ The harness runs controlled experiments where multiple Claude agents collaborate
 ### Prerequisites
 
 - Node.js >= 20.0.0
-- An Anthropic API key (set as `ANTHROPIC_API_KEY` environment variable)
 - Claude Code installed (`npm install -g @anthropic-ai/claude-code`)
+- **Authentication** (one of):
+  - Anthropic API key (`ANTHROPIC_API_KEY` environment variable), or
+  - Claude Max/Pro subscription (`claude auth login` — no API key needed, flat monthly cost)
 
 ### Install
 
@@ -68,7 +70,7 @@ The harness can run on Fly.io for long-running benchmark suites.
 # Deploy to Fly.io (requires fly CLI installed)
 npx twining-bench cloud deploy
 
-# Set your API key as a secret
+# Set your API key as a secret (only needed for API mode, not subscription plans)
 fly secrets set ANTHROPIC_API_KEY=sk-ant-...
 ```
 
@@ -209,12 +211,12 @@ LLM-as-judge evaluation uses **blind mode** to prevent bias:
 ## Development
 
 ```bash
-npm test              # Run all 659 tests
+npm test              # Run all tests
 npm run test:watch    # Watch mode
 npm run lint          # Type-check
 npm run build         # Compile to dist/
 
-# End-to-end smoke test (requires ANTHROPIC_API_KEY, ~10 min, ~$5)
+# End-to-end smoke test (~10 min, ~$5 on API or free on subscription)
 npx twining-bench smoke-test
 
 # CI-gated e2e test
@@ -229,6 +231,7 @@ twining-benchmark-harness/
 │   ├── runner/
 │   │   ├── orchestrator.ts           # Run orchestration with seeded order
 │   │   ├── agent-session.ts          # Claude Agent SDK wrapper
+│   │   ├── test-runner.ts            # Post-iteration tsc + vitest execution
 │   │   ├── smoke-test.ts             # E2E smoke test runner
 │   │   ├── shuffle.ts                # Seeded Fisher-Yates shuffle
 │   │   ├── data-collector.ts         # Git diff, transcript, artifact capture
@@ -249,6 +252,7 @@ twining-benchmark-harness/
 │   ├── unit/                         # 38 test files
 │   ├── integration/                  # 2 integration test files
 │   └── e2e/                          # CI-gated smoke test
+├── scripts/                          # Smoke test and analysis scripts
 ├── Dockerfile                        # Multi-stage build for Fly.io
 ├── fly.toml                          # Fly.io config (4 CPU, 4GB RAM)
 └── PRD.md                            # Full product requirements
@@ -277,7 +281,8 @@ CLI flags override config values. Use `--budget` to set cost ceiling for full ru
 
 | Variable | Purpose |
 |----------|---------|
-| `ANTHROPIC_API_KEY` | Required. API key for agent sessions and LLM-as-judge. |
+| `ANTHROPIC_API_KEY` | API key for agent sessions and LLM-as-judge. Not required if authenticated via `claude auth login`. |
+| `TWINING_PLUGIN_PATH` | Override path to Twining plugin directory. Set automatically in Docker (`/opt/twining-plugin/plugin`). |
 | `RUN_E2E` | Set to `true` to enable CI-gated end-to-end tests. |
 
 ## Extending the Harness
