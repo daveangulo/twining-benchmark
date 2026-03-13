@@ -26,7 +26,7 @@ import { BaseScenario } from './scenario.interface.js';
 import {
   buildEvaluationContextFromResults,
   runSingleEvaluation,
-  INTEGRATION_QUALITY_TEMPLATE,
+  BUG_RESOLUTION_TEMPLATE,
 } from '../analyzer/llm-judge.js';
 
 /** Agent A timeout: 5 minutes (hard cutoff mid-investigation) */
@@ -143,38 +143,36 @@ Important:
 const AGENT_B_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} working on a codebase at {{repo_path}}.
 
 ## Codebase Orientation
-This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
-- \`src/utils/pagination.ts\` — Pagination utility (check here for the off-by-one offset calculation)
-- \`src/services/search.service.ts\` — Search service that uses pagination
-- \`tests/\` — existing test files (add your regression test here)
+This is a TypeScript service (~1,140 lines, ~24 files).
 
 Directory structure:
 \`\`\`
 src/
   models/        # Data models
   services/      # Business logic (search service)
-  utils/         # Shared utilities (pagination)
+  utils/         # Shared utilities
   repositories/  # Data access layer
 tests/           # Test files
 \`\`\`
 
-Your task: Continue the investigation into the search results pagination bug. Fix it and add a regression test.
+Your task: Continue a bug investigation that was started by a previous developer.
 
-Context: A previous developer was investigating a bug where page 2 of search results sometimes shows duplicate items from page 1. They may have left notes or partial findings. Check \`src/utils/pagination.ts\` for the off-by-one offset calculation.
+A previous developer was investigating a bug in the search/listing functionality where users
+reported seeing duplicate or missing results. Their session was interrupted before they could
+finish.
 
 Specifically:
-1. Check for any investigation notes, comments, or partial fixes left by the previous developer.
-2. Look at \`src/utils/pagination.ts\` — the offset calculation likely has an off-by-one error.
-3. Fix the pagination bug so that page 2+ results never contain duplicates from previous pages.
-4. Add a regression test that specifically catches this pagination offset bug.
+1. Check for any investigation notes, comments, or findings left by the previous developer.
+2. Review the previous developer's changes or coordination artifacts to understand what they discovered.
+3. Based on their findings (and your own investigation if needed), locate and fix the bug.
+4. Add a regression test that specifically catches this bug.
 5. Ensure the regression test fails against the original buggy code and passes with the fix.
 6. Make sure all existing tests still pass.
 
 Important:
-- Check if there are any notes or findings from the previous investigation before starting fresh.
+- Check for prior investigation context before starting from scratch.
 - Don't redo work that's already been done — build on existing findings.
-- The fix should be minimal and targeted — don't refactor unrelated code.
-- Make sure the codebase compiles and tests pass when you're done.`;
+- The fix should be minimal and targeted — don't refactor unrelated code.`;
 
 export class BugInvestigationScenario extends BaseScenario {
   protected buildMetadata(): ScenarioMetadata {
@@ -244,7 +242,7 @@ export class BugInvestigationScenario extends BaseScenario {
     let resolution: DimensionScore;
     if (evaluatorClient) {
       const evalCtx = buildEvaluationContextFromResults(rawResults, groundTruth);
-      const result = await runSingleEvaluation(evaluatorClient, INTEGRATION_QUALITY_TEMPLATE, evalCtx);
+      const result = await runSingleEvaluation(evaluatorClient, BUG_RESOLUTION_TEMPLATE, evalCtx);
       resolution = {
         value: result.score,
         confidence: result.confidence,
@@ -423,7 +421,7 @@ export class BugInvestigationScenario extends BaseScenario {
     for (const tc of transcriptA.toolCalls) {
       if (tc.toolName === 'Read') {
         const filePath = tc.parameters['file_path'] as string | undefined;
-        if (filePath) aReadFiles.add(filePath);
+        if (filePath) aReadFiles.add(this.normalizeFilePath(filePath));
       }
     }
 
@@ -432,7 +430,7 @@ export class BugInvestigationScenario extends BaseScenario {
     for (const tc of transcriptB.toolCalls) {
       if (tc.toolName === 'Read') {
         const filePath = tc.parameters['file_path'] as string | undefined;
-        if (filePath) bReadFiles.add(filePath);
+        if (filePath) bReadFiles.add(this.normalizeFilePath(filePath));
       }
     }
 

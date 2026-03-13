@@ -104,9 +104,10 @@ describe('OrderService', () => {
       const updated = await service.updateOrderStatus(order.id, 'confirmed');
       expect(updated.status).toBe('confirmed');
 
+      // order:created goes through EventBus, status-changed goes through CallbackRegistry
       const events = eventBus.getEventLog();
-      expect(events).toHaveLength(2); // created + status-changed
-      expect(events[1]?.type).toBe('order:status-changed');
+      expect(events).toHaveLength(1); // only created
+      expect(events[0]?.type).toBe('order:created');
     });
 
     it('should reject invalid status transition', async () => {

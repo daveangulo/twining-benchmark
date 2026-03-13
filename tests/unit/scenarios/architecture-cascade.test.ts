@@ -137,19 +137,20 @@ describe('ArchitectureCascadeScenario', () => {
       const tasks = scenario.getAgentTasks();
 
       expect(tasks[0].prompt).toContain('notification system');
-      expect(tasks[0].prompt).toContain('decoupled');
-      expect(tasks[0].prompt).toContain('architectural decision');
+      expect(tasks[0].prompt).toContain('ONE approach');
+      expect(tasks[0].prompt).toContain('EventBus');
+      expect(tasks[0].prompt).toContain('CallbackRegistry');
     });
 
-    it('Agent B and C prompts do NOT reference Agent A decision', async () => {
+    it('Agent B and C prompts do NOT reference specific pattern choice', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
       const tasks = scenario.getAgentTasks();
 
-      // B and C must discover A's decision — prompts should not mention specifics
-      expect(tasks[1].prompt).not.toContain('event-driven');
-      expect(tasks[1].prompt).not.toContain('EventEmitter');
-      expect(tasks[2].prompt).not.toContain('event-driven');
-      expect(tasks[2].prompt).not.toContain('EventEmitter');
+      // B and C must discover A's decision — prompts should not mention EventBus or CallbackRegistry
+      expect(tasks[1].prompt).not.toContain('EventBus');
+      expect(tasks[1].prompt).not.toContain('CallbackRegistry');
+      expect(tasks[2].prompt).not.toContain('EventBus');
+      expect(tasks[2].prompt).not.toContain('CallbackRegistry');
 
       // But they should mention integrating with existing architecture
       expect(tasks[1].prompt).toContain('existing notification architecture');
@@ -440,6 +441,22 @@ describe('ARCHITECTURE_CASCADE_GROUND_TRUTH', () => {
       expect(decision.expectedPatterns.length).toBeGreaterThan(0);
       expect(decision.affectedFiles.length).toBeGreaterThan(0);
     }
+  });
+
+  it('accepts both EventBus and CallbackRegistry patterns', () => {
+    const decoupleDecision = ARCHITECTURE_CASCADE_GROUND_TRUTH.decisions.find(
+      (d) => d.id === 'decouple-notifications',
+    )!;
+
+    // EventBus patterns
+    expect(decoupleDecision.expectedPatterns).toContain('EventBus');
+    expect(decoupleDecision.expectedPatterns).toContain('emit');
+    expect(decoupleDecision.expectedPatterns).toContain('subscribe');
+
+    // CallbackRegistry patterns
+    expect(decoupleDecision.expectedPatterns).toContain('CallbackRegistry');
+    expect(decoupleDecision.expectedPatterns).toContain('register');
+    expect(decoupleDecision.expectedPatterns).toContain('notify');
   });
 });
 

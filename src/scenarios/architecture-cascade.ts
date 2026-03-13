@@ -38,34 +38,39 @@ const DEFAULT_MAX_TURNS = 50;
 /**
  * Ground truth manifest for the architecture-cascade scenario.
  *
- * The acceptable architectural patterns for decoupling notifications from
- * order processing are: event-driven (preferred) or observer pattern.
- * Direct function calls are the anti-pattern.
+ * The acceptable architectural patterns are: event-driven (EventBus) OR
+ * direct callbacks (CallbackRegistry). Either is valid, but the codebase
+ * must use ONE consistently. Mixing patterns is the anti-pattern.
  */
 export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
   name: 'architecture-cascade',
   description:
-    'Expected outcome: Notification system decoupled from order processing via event-driven or observer pattern. Email notifications and webhooks both use the chosen pattern consistently.',
+    'Expected outcome: Notification system uses ONE consistent pattern (EventBus OR CallbackRegistry). Email notifications and webhooks both use the chosen pattern consistently.',
   decisions: [
     {
       id: 'decouple-notifications',
       description:
-        'Agent A should decouple the notification system from order processing using an event-driven or observer pattern, not direct function calls.',
+        'Agent A should unify the notification system to use ONE pattern consistently (EventBus or CallbackRegistry), not a mix of both.',
       affectedFiles: [
         'src/services/order.service.ts',
         'src/services/notification.service.ts',
         'src/events/event-bus.ts',
+        'src/utils/callback-registry.ts',
       ],
       expectedPatterns: [
         'EventEmitter',
         'eventBus',
         'event-bus',
         'EventBus',
+        'CallbackRegistry',
+        'callbackRegistry',
+        'callback-registry',
         'subscribe',
         'publish',
         'emit',
         'on\\(',
-        'addEventListener',
+        'register',
+        'notify',
         'Observer',
       ],
       antiPatterns: [
@@ -76,7 +81,7 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
     {
       id: 'email-notification-integration',
       description:
-        'Agent B should add email notifications that integrate with Agent A\'s chosen decoupling pattern (e.g., subscribe to order events, not call order service directly).',
+        'Agent B should add email notifications that integrate with Agent A\'s chosen pattern (EventBus or CallbackRegistry), not call order service directly.',
       affectedFiles: [
         'src/services/notification.service.ts',
         'src/notifications/email.ts',
@@ -86,8 +91,10 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
         'Email',
         'subscribe',
         'on\\(',
+        'register',
         'handler',
         'listener',
+        'callback',
       ],
       antiPatterns: [
         'orderService\\..*notify',
@@ -97,7 +104,7 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
     {
       id: 'webhook-integration',
       description:
-        'Agent C should add a webhook system that integrates with Agent A\'s chosen pattern (e.g., subscribe to order events), consistent with how Agent B integrated.',
+        'Agent C should add a webhook system that integrates with Agent A\'s chosen pattern, consistent with how Agent B integrated.',
       affectedFiles: [
         'src/services/notification.service.ts',
         'src/notifications/webhook.ts',
@@ -107,8 +114,10 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
         'Webhook',
         'subscribe',
         'on\\(',
+        'register',
         'handler',
         'listener',
+        'callback',
         'http',
         'url',
       ],
@@ -119,10 +128,10 @@ export const ARCHITECTURE_CASCADE_GROUND_TRUTH: ArchitecturalManifest = {
     },
   ],
   moduleDependencies: {
-    'services/order.service': ['events/event-bus'],
-    'services/notification.service': ['events/event-bus'],
-    'notifications/email': ['services/notification.service', 'events/event-bus'],
-    'notifications/webhook': ['services/notification.service', 'events/event-bus'],
+    'services/order.service': ['events/event-bus', 'utils/callback-registry'],
+    'services/notification.service': ['events/event-bus', 'utils/callback-registry'],
+    'notifications/email': ['services/notification.service', 'events/event-bus', 'utils/callback-registry'],
+    'notifications/webhook': ['services/notification.service', 'events/event-bus', 'utils/callback-registry'],
   },
   baselineTestCoverage: 70,
 };
@@ -134,9 +143,10 @@ const AGENT_A_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} worki
 
 ## Codebase Orientation
 This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
-- \`src/services/order.service.ts\` — OrderService (currently calls NotificationService directly)
-- \`src/services/notification.service.ts\` — NotificationService (tightly coupled to orders)
-- \`src/events/event-bus.ts\` — EventBus class (already exists — consider using it for decoupling)
+- \`src/services/order.service.ts\` — OrderService (uses mixed notification patterns)
+- \`src/services/notification.service.ts\` — NotificationService (uses two different patterns)
+- \`src/events/event-bus.ts\` — EventBus class (event-driven pattern)
+- \`src/utils/callback-registry.ts\` — CallbackRegistry class (direct callback pattern)
 - \`src/events/event-types.ts\` — Event type definitions
 - \`tests/\` — existing test files
 
@@ -146,22 +156,23 @@ src/
   events/        # Event bus and event types
   models/        # Data models
   services/      # Business logic (order, notification)
-  utils/         # Shared utilities
+  utils/         # Shared utilities (callback registry)
 tests/           # Test files
 \`\`\`
 
-Your task: The notification system needs to be decoupled from the order processing module. Choose an approach, implement the decoupling, and document your architectural decision with rationale.
+Your task: The codebase currently uses a mix of event-driven (EventBus) and direct callback (CallbackRegistry) patterns for the notification system. This inconsistency makes it hard for other developers to know which pattern to use. Choose ONE approach for the notification system, refactor to use it consistently, and document your decision with rationale.
 
 Specifically:
-1. Examine \`src/services/order.service.ts\` and \`src/services/notification.service.ts\` to see the current coupling. Also check \`src/events/event-bus.ts\` — an EventBus already exists that could be used for decoupling.
-2. Choose a decoupling approach (e.g., event-driven using the existing EventBus, observer pattern, message queue abstraction) and document WHY you chose it.
-3. Implement the decoupling — \`src/services/order.service.ts\` should no longer directly call the notification module.
-4. Ensure existing functionality is preserved (orders still trigger notifications, just indirectly).
-5. Write or update tests to cover the new decoupled architecture.
+1. Examine \`src/services/order.service.ts\`, \`src/services/notification.service.ts\`, \`src/events/event-bus.ts\`, and \`src/utils/callback-registry.ts\` to understand the current mixed patterns.
+2. Choose ONE pattern (EventBus OR CallbackRegistry) and document WHY you chose it over the alternative.
+3. Refactor the notification system to use your chosen pattern consistently for ALL notification triggers.
+4. Ensure existing functionality is preserved (orders still trigger notifications).
+5. Write or update tests to cover the unified architecture.
 6. Document your decision clearly — the next developers need to understand your approach to build on it.
 
 Important:
 - This is an architectural decision that downstream developers will build on. Choose wisely and document thoroughly.
+- The key question is EventBus vs CallbackRegistry — each has trade-offs. Make a clear choice.
 - Make sure the codebase compiles and tests pass when you're done.`;
 
 /**
@@ -172,16 +183,16 @@ const AGENT_B_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} worki
 
 ## Codebase Orientation
 This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
-- \`src/services/order.service.ts\` — OrderService (emits order events)
-- \`src/services/notification.service.ts\` — NotificationService (subscribes to events)
-- \`src/events/event-bus.ts\` — EventBus class (central event dispatch)
-- \`src/events/event-types.ts\` — Event type definitions
+- \`src/services/order.service.ts\` — OrderService (triggers notifications on order events)
+- \`src/services/notification.service.ts\` — NotificationService (handles notification dispatch)
+- \`src/events/\` — Event system
+- \`src/utils/\` — Shared utilities
 - \`tests/\` — existing test files
 
 Directory structure:
 \`\`\`
 src/
-  events/        # Event bus and event types
+  events/        # Event system
   models/        # Data models
   notifications/ # (you may create this for email handler)
   services/      # Business logic
@@ -192,10 +203,10 @@ tests/           # Test files
 Your task: Add email notifications when an order status changes. Integrate with the existing notification architecture.
 
 Specifically:
-1. Review \`src/services/notification.service.ts\` and \`src/events/event-bus.ts\` to understand the current notification architecture and event patterns.
+1. Review \`src/services/notification.service.ts\` and related files to understand the current notification architecture and patterns.
 2. Implement email notifications that fire when an order's status changes (e.g., created, processing, shipped, delivered).
 3. Create an email notification handler/service that formats and would send email notifications.
-4. Integrate your email notifications with the existing event/notification patterns — subscribe to order events via the EventBus.
+4. Integrate your email notifications with the existing notification patterns — use the same approach the codebase already uses.
 5. Add tests for the email notification functionality.
 6. Make sure the codebase compiles and all existing tests still pass.
 
@@ -212,16 +223,16 @@ const AGENT_C_PROMPT = `You are Agent {{agent_number}} of {{total_agents}} worki
 
 ## Codebase Orientation
 This is a TypeScript service (~1,140 lines, ~24 files). Key files for your task:
-- \`src/services/order.service.ts\` — OrderService (emits order events)
-- \`src/services/notification.service.ts\` — NotificationService (subscribes to events)
-- \`src/events/event-bus.ts\` — EventBus class (central event dispatch)
-- \`src/events/event-types.ts\` — Event type definitions
+- \`src/services/order.service.ts\` — OrderService (triggers notifications on order events)
+- \`src/services/notification.service.ts\` — NotificationService (handles notification dispatch)
+- \`src/events/\` — Event system
+- \`src/utils/\` — Shared utilities
 - \`tests/\` — existing test files
 
 Directory structure:
 \`\`\`
 src/
-  events/        # Event bus and event types
+  events/        # Event system
   models/        # Data models
   notifications/ # (may contain email handler from previous agent)
   services/      # Business logic
@@ -232,10 +243,10 @@ tests/           # Test files
 Your task: Add a webhook system that fires on order events. Integrate with the existing notification architecture.
 
 Specifically:
-1. Review \`src/services/notification.service.ts\` and \`src/events/event-bus.ts\` to understand the current notification architecture and event patterns.
+1. Review \`src/services/notification.service.ts\` and related files to understand the current notification architecture and patterns.
 2. Implement a webhook system that fires HTTP callbacks when order events occur (e.g., order created, status changed).
 3. Create a webhook registry where external URLs can be registered for specific event types.
-4. Integrate your webhook system with the existing event/notification patterns — subscribe to order events via the EventBus.
+4. Integrate your webhook system with the existing notification patterns — use the same approach the codebase already uses.
 5. Add tests for the webhook functionality.
 6. Make sure the codebase compiles and all existing tests still pass.
 

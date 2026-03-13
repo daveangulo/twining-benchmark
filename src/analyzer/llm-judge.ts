@@ -435,6 +435,43 @@ Score 100 = no redundancy; 0 = all work was redundant.`,
   },
 };
 
+/**
+ * Template: Bug resolution — evaluates whether agents successfully identified
+ * and fixed a bug with appropriate regression testing.
+ */
+export const BUG_RESOLUTION_TEMPLATE: EvaluatorPromptTemplate = {
+  id: 'bug-resolution-v1',
+  version: '1.0.0',
+  dimension: 'resolution',
+  template: `You are evaluating whether agents successfully resolved a bug. Assess the quality of their investigation and fix.
+
+## Ground Truth (Expected Bug and Fix)
+{{GROUND_TRUTH}}
+
+## Code Changes (Diffs from all agent sessions)
+{{CODE_DIFFS}}
+
+## Coordination Artifacts
+{{COORDINATION_ARTIFACTS}}
+
+{{ADDITIONAL_CONTEXT}}
+
+## Your Task
+Evaluate whether the agents successfully resolved the bug. Consider:
+1. Was the root cause correctly identified?
+2. Was the fix correct and minimal (not a workaround)?
+3. Was a regression test added that would catch future recurrences?
+4. Does the fix preserve existing functionality (no regressions)?`,
+  rubric: {
+    excellent:
+      'Correct root cause identified, correct and minimal fix applied, regression test added that catches the specific bug, no regressions introduced.',
+    good: 'Bug fixed correctly but missing regression test, or fix is broader than strictly needed.',
+    acceptable:
+      'Bug is fixed but root cause is unclear or the fix is a workaround rather than a proper correction.',
+    poor: 'Bug not fixed, wrong root cause identified, or fix introduces new regressions.',
+  },
+};
+
 // --- Standalone quality evaluator templates ---
 // These templates evaluate the final codebase as if one developer wrote it.
 // They do NOT reference multi-party workflows, delegation, or shared state.

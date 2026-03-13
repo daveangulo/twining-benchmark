@@ -4,6 +4,7 @@ import {
   NotificationService,
   resetNotificationIdCounter,
 } from '../../src/services/notification.service.js';
+import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
 import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
 
 describe('NotificationService', () => {
@@ -12,6 +13,7 @@ describe('NotificationService', () => {
 
   beforeEach(() => {
     eventBus = new EventBus();
+    statusChangeCallbacks.clear();
     service = new NotificationService(eventBus);
     resetNotificationIdCounter();
   });
@@ -87,7 +89,7 @@ describe('NotificationService', () => {
   });
 
   describe('order:status-changed handler', () => {
-    it('should send notification on status change', async () => {
+    it('should send notification on status change', () => {
       const event: OrderStatusChangedEvent = {
         type: 'order:status-changed',
         order: {
@@ -104,7 +106,7 @@ describe('NotificationService', () => {
         timestamp: new Date(),
       };
 
-      await eventBus.emit(event);
+      statusChangeCallbacks.notify(event);
 
       const notifications = service.getNotifications();
       expect(notifications).toHaveLength(1);
@@ -115,10 +117,10 @@ describe('NotificationService', () => {
   });
 
   describe('notification management', () => {
-    it('should count notifications', async () => {
+    it('should count notifications', () => {
       expect(service.getNotificationCount()).toBe(0);
 
-      await eventBus.emit({
+      statusChangeCallbacks.notify({
         type: 'order:status-changed',
         order: {
           id: 'order-1',
@@ -168,8 +170,8 @@ describe('NotificationService', () => {
       expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);
     });
 
-    it('should clear notifications', async () => {
-      await eventBus.emit({
+    it('should clear notifications', () => {
+      statusChangeCallbacks.notify({
         type: 'order:status-changed',
         order: {
           id: 'order-1',
@@ -189,8 +191,8 @@ describe('NotificationService', () => {
       expect(service.getNotificationCount()).toBe(0);
     });
 
-    it('should generate sequential notification IDs', async () => {
-      await eventBus.emit({
+    it('should generate sequential notification IDs', () => {
+      statusChangeCallbacks.notify({
         type: 'order:status-changed',
         order: {
           id: 'order-1',
@@ -205,7 +207,7 @@ describe('NotificationService', () => {
         newStatus: 'confirmed',
         timestamp: new Date(),
       });
-      await eventBus.emit({
+      statusChangeCallbacks.notify({
         type: 'order:status-changed',
         order: {
           id: 'order-2',

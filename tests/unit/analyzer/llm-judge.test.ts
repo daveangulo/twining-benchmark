@@ -14,6 +14,7 @@ import {
   INTEGRATION_QUALITY_TEMPLATE,
   ARCHITECTURAL_COHERENCE_TEMPLATE,
   REDUNDANCY_DETECTION_TEMPLATE,
+  BUG_RESOLUTION_TEMPLATE,
   CODE_CORRECTNESS_TEMPLATE,
   ARCHITECTURAL_SOUNDNESS_TEMPLATE,
   MAINTAINABILITY_TEMPLATE,
@@ -387,6 +388,19 @@ describe('template constants', () => {
   it('REDUNDANCY_DETECTION_TEMPLATE has correct dimension', () => {
     expect(REDUNDANCY_DETECTION_TEMPLATE.dimension).toBe('redundancy');
     expect(REDUNDANCY_DETECTION_TEMPLATE.id).toBe('redundancy-detection-v1');
+  });
+
+  it('BUG_RESOLUTION_TEMPLATE has correct dimension and structure', () => {
+    expect(BUG_RESOLUTION_TEMPLATE.dimension).toBe('resolution');
+    expect(BUG_RESOLUTION_TEMPLATE.id).toBe('bug-resolution-v1');
+    expect(BUG_RESOLUTION_TEMPLATE.template).toContain('{{GROUND_TRUTH}}');
+    expect(BUG_RESOLUTION_TEMPLATE.template).toContain('{{CODE_DIFFS}}');
+    expect(BUG_RESOLUTION_TEMPLATE.template).toContain('root cause');
+    expect(BUG_RESOLUTION_TEMPLATE.template).toContain('regression test');
+    expect(BUG_RESOLUTION_TEMPLATE.rubric.excellent).toBeTruthy();
+    expect(BUG_RESOLUTION_TEMPLATE.rubric.good).toBeTruthy();
+    expect(BUG_RESOLUTION_TEMPLATE.rubric.acceptable).toBeTruthy();
+    expect(BUG_RESOLUTION_TEMPLATE.rubric.poor).toBeTruthy();
   });
 });
 

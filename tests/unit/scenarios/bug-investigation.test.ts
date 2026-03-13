@@ -147,6 +147,15 @@ describe('BugInvestigationScenario', () => {
       expect(tasks[1].prompt).toContain('regression test');
       expect(tasks[1].prompt).toContain('previous developer');
     });
+
+    it('Agent B prompt does not leak the bug location or fix', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+      const tasks = scenario.getAgentTasks();
+
+      expect(tasks[1].prompt).not.toContain('pagination.ts');
+      expect(tasks[1].prompt).not.toContain('off-by-one');
+      expect(tasks[1].prompt).not.toContain('offset calculation');
+    });
   });
 
   describe('score()', () => {
@@ -318,6 +327,39 @@ describe('BugInvestigationScenario', () => {
 
       // Should score well — B didn't re-read A's files
       expect(scored.scores.redundantInvestigation.value).toBe(100);
+    });
+
+    it('normalizes file paths for redundant investigation scoring across temp dirs', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            exitReason: 'timeout',
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: '/tmp/twining-bench-abc123/src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: '/tmp/twining-bench-abc123/src/utils/pagination.ts' }, timestamp: '', durationMs: 100 },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              // B reads same files but with different temp-dir prefix
+              { toolName: 'Read', parameters: { file_path: '/tmp/twining-bench-def456/src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: '/tmp/twining-bench-def456/src/utils/pagination.ts' }, timestamp: '', durationMs: 100 },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // After normalization, B re-read all A's files = 0% unique investigation
+      expect(scored.scores.redundantInvestigation.value).toBe(0);
     });
 
     it('gives zero resolution when B makes no changes', async () => {

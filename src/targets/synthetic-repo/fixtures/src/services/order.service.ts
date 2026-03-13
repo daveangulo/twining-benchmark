@@ -17,6 +17,7 @@ import { calculateOrderTotal } from '../models/order.js';
 import type { OrderRepository } from '../repositories/order.repository.js';
 import type { UserRepository } from '../repositories/user.repository.js';
 import type { EventBus } from '../events/event-bus.js';
+import { statusChangeCallbacks } from '../utils/callback-registry.js';
 import { Logger } from '../utils/logger.js';
 
 let nextId = 1;
@@ -111,7 +112,10 @@ export class OrderService {
       updatedAt: new Date(),
     });
 
-    await this.eventBus.emit({
+    // NOTE: Status changes use CallbackRegistry (direct callbacks) rather than
+    // EventBus. This is inconsistent with order creation which uses EventBus.
+    // See notification.service.ts for the mixed pattern discussion.
+    statusChangeCallbacks.notify({
       type: 'order:status-changed',
       order: updated,
       previousStatus,

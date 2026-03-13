@@ -23,15 +23,15 @@ describe('BaselineCondition', () => {
     expect(condition.description).toContain('No coordination');
   });
 
-  it('removes CLAUDE.md during setup', async () => {
-    // Plant a CLAUDE.md that should be removed
+  it('preserves CLAUDE.md during setup', async () => {
+    // Plant a CLAUDE.md that should be kept
     await writeFile(join(workDir, 'CLAUDE.md'), '# Test', 'utf-8');
 
     const ctx = await condition.setup(workDir);
 
-    // CLAUDE.md should be gone
+    // CLAUDE.md should still exist
     const files = await readdir(workDir);
-    expect(files).not.toContain('CLAUDE.md');
+    expect(files).toContain('CLAUDE.md');
     expect(ctx.setupFiles).toEqual([]);
   });
 

@@ -1,16 +1,23 @@
 /**
  * Notification service — handles sending notifications in response to events.
  *
- * Architecture decision: This service listens to events from the EventBus
- * rather than being called directly by other services. This keeps the
- * notification logic decoupled from order/user management.
+ * NOTE: This service currently uses TWO different patterns for receiving
+ * notifications, which is inconsistent and should be unified:
+ *
+ * 1. EventBus subscriptions (event-driven) — used for order:created events
+ * 2. CallbackRegistry (direct callbacks) — used for order:status-changed events
+ *
+ * Both approaches work but the mixed usage makes the codebase harder to
+ * maintain. A future refactor should pick ONE approach and use it consistently.
  *
  * Depends on:
- * - EventBus (event system) for receiving events
+ * - EventBus (event system) for receiving some events
+ * - CallbackRegistry (direct callbacks) for other events
  */
 
 import type { EventBus } from '../events/event-bus.js';
 import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
+import { statusChangeCallbacks } from '../utils/callback-registry.js';
 import { Logger } from '../utils/logger.js';
 
 export interface Notification {
@@ -41,13 +48,18 @@ export class NotificationService {
 
   /**
    * Register event handlers for notification triggers.
+   *
+   * Uses EventBus for order creation (event-driven pattern)
+   * and CallbackRegistry for status changes (direct callback pattern).
    */
   private registerHandlers(): void {
+    // Pattern 1: EventBus subscription for order creation
     this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
       this.handleOrderCreated(event);
     });
 
-    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
+    // Pattern 2: CallbackRegistry for status changes
+    statusChangeCallbacks.register((event) => {
       this.handleOrderStatusChanged(event);
     });
   }

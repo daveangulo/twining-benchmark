@@ -112,7 +112,7 @@ describe('ContextRecoveryScenario', () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
       const tasks = scenario.getAgentTasks();
 
-      expect(tasks[0].timeoutMs).toBe(8 * 60 * 1000); // 8 minutes
+      expect(tasks[0].timeoutMs).toBe(3 * 60 * 1000); // 3 minutes
       expect(tasks[1].timeoutMs).toBe(15 * 60 * 1000); // 15 minutes
       expect(tasks[0].timeoutMs).toBeLessThan(tasks[1].timeoutMs);
     });
@@ -330,6 +330,161 @@ describe('ContextRecoveryScenario', () => {
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
       expect(scored.scores.completion.value).toBe(100);
+    });
+
+    it('scores redundant-rework 100 when B makes no changes and completion is high', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface AnalyticsSummary { totalUsers: number; }',
+              },
+              {
+                path: 'src/services/analytics.service.ts',
+                changeType: 'added',
+                linesAdded: 50,
+                linesRemoved: 0,
+                diff: '+export class AnalyticsService {}',
+              },
+              {
+                path: 'tests/analytics.test.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: '+describe("analytics test", () => {})',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [],
+            toolCalls: [
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/models/analytics.ts' },
+                timestamp: '',
+                durationMs: 100,
+              },
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/services/analytics.service.ts' },
+                timestamp: '',
+                durationMs: 100,
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // Completion is 100 (all 3 components from A), so B making no changes = ideal
+      expect(scored.scores['redundant-rework'].value).toBe(100);
+      expect(scored.scores['redundant-rework'].justification).toContain('correctly identified');
+    });
+
+    it('scores redundant-rework 0 when B makes no changes and completion is low', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                diff: '+export interface UserAnalytics {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // Completion is 33 (1/3), B made no changes = failure
+      expect(scored.scores['redundant-rework'].value).toBe(0);
+    });
+
+    it('scores context-accuracy from tool calls when B has no diffs', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/models/analytics.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+export interface AnalyticsSummary {}',
+              },
+              {
+                path: 'src/services/analytics.service.ts',
+                changeType: 'added',
+                linesAdded: 50,
+                linesRemoved: 0,
+                diff: '+export class AnalyticsService {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [],
+            toolCalls: [
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/models/analytics.ts' },
+                timestamp: '',
+                durationMs: 100,
+              },
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/services/analytics.service.ts' },
+                timestamp: '',
+                durationMs: 100,
+              },
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'tests/some-test.ts' },
+                timestamp: '',
+                durationMs: 100,
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // B read A's output files — should get partial context-accuracy score
+      expect(scored.scores['context-accuracy'].value).toBeGreaterThan(0);
     });
 
     it('gives partial completion when some components are missing', async () => {
