@@ -75,6 +75,7 @@ describe('ArchitectureCascadeScenario', () => {
       expect(meta.agentSessionCount).toBe(3);
       expect(meta.scoringDimensions).toEqual([
         'decisionPropagation',
+        'decisionDiscovery',
         'patternConsistency',
         'decisionQuality',
       ]);
@@ -189,7 +190,7 @@ describe('ArchitectureCascadeScenario', () => {
   });
 
   describe('score()', () => {
-    it('scores full propagation when B and C follow A pattern', async () => {
+    it('scores full propagation when B and C follow A pattern (EventBus)', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -251,7 +252,59 @@ describe('ArchitectureCascadeScenario', () => {
       expect(scored.composite).toBeGreaterThan(0);
     });
 
-    it('scores partial propagation when only B follows', async () => {
+    it('scores full propagation when all agents use CallbackRegistry', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 10,
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+const registry = new CallbackRegistry();\n+registry.register(handleNotification);\n+registry.notify(event);',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/notifications/email.ts',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+emailRegistry.register(handleEmail);',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/notifications/webhook.ts',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+webhookRegistry.register(handleWebhook);',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      expect(scored.scores.decisionPropagation.value).toBe(100);
+    });
+
+    it('scores partial propagation when only B follows A (EventBus vs CallbackRegistry)', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -261,7 +314,7 @@ describe('ArchitectureCascadeScenario', () => {
             fileChanges: [
               {
                 path: 'src/events/event-bus.ts',
-                changeType: 'added',
+                changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 0,
                 diff: '+export class EventBus { emit(e: string) {} subscribe(e: string, h: Function) {} }',
@@ -276,7 +329,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 15,
                 linesRemoved: 0,
-                diff: '+eventBus.subscribe("order", handleEmail);',
+                diff: '+eventBus.subscribe("order", handleEmail);\n+eventBus.on("status", handleStatus);',
               },
             ],
           }),
@@ -288,7 +341,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 15,
                 linesRemoved: 0,
-                diff: '+function directCall() { orderService.notify("webhook"); }',
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+webhookRegistry.register(handleWebhook);\n+webhookRegistry.notify(event);',
               },
             ],
           }),
@@ -303,7 +356,7 @@ describe('ArchitectureCascadeScenario', () => {
       expect(scored.scores.decisionPropagation.value).toBe(50);
     });
 
-    it('scores zero propagation when neither B nor C follow', async () => {
+    it('scores zero propagation when neither B nor C follow A', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -313,7 +366,7 @@ describe('ArchitectureCascadeScenario', () => {
             fileChanges: [
               {
                 path: 'src/events/event-bus.ts',
-                changeType: 'added',
+                changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 0,
                 diff: '+export class EventBus { emit() {} subscribe() {} }',
@@ -328,7 +381,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 10,
                 linesRemoved: 0,
-                diff: '+function sendEmailDirect() { notificationService.send("email"); }',
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+emailCallbacks.register(sendEmail);\n+emailCallbacks.notify(data);',
               },
             ],
           }),
@@ -340,7 +393,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 10,
                 linesRemoved: 0,
-                diff: '+function sendWebhookDirect() { notificationService.send("webhook"); }',
+                diff: '+import { CallbackRegistry } from "../utils/callback-registry";\n+webhookCallbacks.register(fireWebhook);\n+webhookCallbacks.notify(payload);',
               },
             ],
           }),
@@ -353,6 +406,123 @@ describe('ArchitectureCascadeScenario', () => {
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
       expect(scored.scores.decisionPropagation.value).toBe(0);
+    });
+
+    it('scores decision discovery when B and C read A files and use coordination tools', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 10,
+                diff: '+export class EventBus { emit() {} subscribe() {} }',
+              },
+              {
+                path: 'DECISIONS.md',
+                changeType: 'added',
+                linesAdded: 5,
+                linesRemoved: 0,
+                diff: '+# Decision: EventBus',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              // Read A's file before writing
+              { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/src/services/notification.service.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
+              // Coordination tool
+              { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: { task: 'add email' }, timestamp: '2026-02-20T10:00:01Z', durationMs: 200 },
+              { toolName: 'mcp__plugin_twining_twining__twining_why', parameters: { scope: 'src/services/' }, timestamp: '2026-02-20T10:00:02Z', durationMs: 200 },
+              // Then write
+              { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/email.ts' }, timestamp: '2026-02-20T10:00:03Z', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/notifications/email.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0, diff: '+eventBus.subscribe("order", handleEmail);' },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            toolCalls: [
+              // Read A's file before writing
+              { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/src/services/notification.service.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/DECISIONS.md' }, timestamp: '2026-02-20T10:00:01Z', durationMs: 100 },
+              // Coordination tool
+              { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: { task: 'add webhook' }, timestamp: '2026-02-20T10:00:02Z', durationMs: 200 },
+              // Then write
+              { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/webhook.ts' }, timestamp: '2026-02-20T10:00:03Z', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/notifications/webhook.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0, diff: '+eventBus.subscribe("order", fireWebhook);' },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // B: read 1/2 files (12 pts) + 2 coord tools (25 pts) = 37
+      // C: read 2/2 files (25 pts) + 1 coord tool (15 pts) = 40
+      // Total: 77
+      expect(scored.scores.decisionDiscovery.value).toBeGreaterThanOrEqual(50);
+      expect(scored.scores.decisionDiscovery.justification).toContain('coordination tool');
+    });
+
+    it('scores zero decision discovery when B and C do not read A files or use coordination', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 10,
+                diff: '+export class EventBus { emit() {} subscribe() {} }',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              // Writes immediately, no reads
+              { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/email.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/notifications/email.ts', changeType: 'added', linesAdded: 10, linesRemoved: 0, diff: '+directCall()' },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            toolCalls: [
+              // Writes immediately, no reads
+              { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/webhook.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/notifications/webhook.ts', changeType: 'added', linesAdded: 10, linesRemoved: 0, diff: '+directCall()' },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      expect(scored.scores.decisionDiscovery.value).toBe(0);
     });
 
     it('handles missing transcripts gracefully', async () => {

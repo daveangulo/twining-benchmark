@@ -255,6 +255,45 @@ Important:
 - Respect the patterns and decisions already in the codebase.
 - Make sure the codebase compiles and tests pass when you're done.`;
 
+/**
+ * Two mutually exclusive pattern groups for detecting A's architectural choice.
+ * Used by scoreDecisionPropagation to determine WHICH pattern A chose,
+ * then verify B/C followed that specific choice (not just any pattern).
+ */
+const EVENT_BUS_PATTERNS = [
+  /EventBus/,
+  /eventBus/,
+  /EventEmitter/,
+  /\.emit\(/,
+  /\.on\(/,
+  /subscribe/,
+  /publish/,
+];
+
+const CALLBACK_REGISTRY_PATTERNS = [
+  /CallbackRegistry/,
+  /callbackRegistry/,
+  /statusChangeCallbacks/,
+  /\.register\(/,
+  /\.notify\(/,
+];
+
+/** Coordination tool names that indicate intentional decision discovery. */
+const COORDINATION_TOOLS = [
+  'twining_assemble',
+  'twining_why',
+  'twining_query',
+  'twining_search_decisions',
+  'twining_read',
+  'twining_recent',
+  'mcp__plugin_twining_twining__twining_assemble',
+  'mcp__plugin_twining_twining__twining_why',
+  'mcp__plugin_twining_twining__twining_query',
+  'mcp__plugin_twining_twining__twining_search_decisions',
+  'mcp__plugin_twining_twining__twining_read',
+  'mcp__plugin_twining_twining__twining_recent',
+];
+
 export class ArchitectureCascadeScenario extends BaseScenario {
   protected buildMetadata(): ScenarioMetadata {
     return {
@@ -264,7 +303,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       estimatedDurationMinutes: 45,
       requiredTargetType: 'service-with-dependency',
       agentSessionCount: 3,
-      scoringDimensions: ['decisionPropagation', 'patternConsistency', 'decisionQuality'],
+      scoringDimensions: ['decisionPropagation', 'decisionDiscovery', 'patternConsistency', 'decisionQuality'],
       excludeFromAll: false,
     };
   }
@@ -320,6 +359,7 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
     const decisionPropagation = this.scoreDecisionPropagation(rawResults, groundTruth);
+    const decisionDiscovery = this.scoreDecisionDiscovery(rawResults);
     const patternConsistency = this.scorePatternConsistency(rawResults);
     let decisionQuality: DimensionScore;
     if (evaluatorClient) {
@@ -337,15 +377,17 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
     const scores: Record<string, DimensionScore> = {
       decisionPropagation,
+      decisionDiscovery,
       patternConsistency,
       decisionQuality,
     };
 
     // Composite: weighted average
     const composite =
-      decisionPropagation.value * 0.4 +
-      patternConsistency.value * 0.3 +
-      decisionQuality.value * 0.3;
+      decisionPropagation.value * 0.3 +
+      decisionDiscovery.value * 0.2 +
+      patternConsistency.value * 0.25 +
+      decisionQuality.value * 0.25;
 
     return {
       runId: '',
@@ -363,15 +405,37 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   }
 
   /**
-   * Score decision propagation: Did B and C both discover and follow A's decision?
+   * Detect which architectural pattern group (EventBus vs CallbackRegistry)
+   * is dominant in a diff string.
    *
-   * 100 = both aligned with A's pattern.
+   * Returns 'eventbus' | 'callback' | 'mixed' | 'none'.
+   */
+  private detectPatternChoice(diffs: string): 'eventbus' | 'callback' | 'mixed' | 'none' {
+    const ebMatches = EVENT_BUS_PATTERNS.filter((r) => r.test(diffs)).length;
+    const cbMatches = CALLBACK_REGISTRY_PATTERNS.filter((r) => r.test(diffs)).length;
+
+    if (ebMatches === 0 && cbMatches === 0) return 'none';
+    if (ebMatches > 0 && cbMatches === 0) return 'eventbus';
+    if (cbMatches > 0 && ebMatches === 0) return 'callback';
+    // Both present — whichever has more matches wins, tie = mixed
+    if (ebMatches > cbMatches) return 'eventbus';
+    if (cbMatches > ebMatches) return 'callback';
+    return 'mixed';
+  }
+
+  /**
+   * Score decision propagation: Did B and C both follow A's SPECIFIC pattern choice?
+   *
+   * Detects whether A chose EventBus or CallbackRegistry, then checks if B and C
+   * used that same pattern group. Using the alternative pattern is NOT alignment.
+   *
+   * 100 = both aligned with A's specific choice.
    * 50 = one aligned.
-   * 0 = neither aligned.
+   * 0 = neither aligned (or used the wrong pattern).
    */
   private scoreDecisionPropagation(
     rawResults: RawResults,
-    groundTruth: ArchitecturalManifest,
+    _groundTruth: ArchitecturalManifest,
   ): DimensionScore {
     const transcriptA = rawResults.transcripts[0];
     const transcriptB = rawResults.transcripts[1];
@@ -386,20 +450,8 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    // Detect A's chosen pattern from its diffs
     const aDiffs = transcriptA.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
     const aHasMissingDiffs = transcriptA.fileChanges.some((c) => c.diff === undefined);
-    const decouplingDecision = groundTruth.decisions.find(
-      (d) => d.id === 'decouple-notifications',
-    );
-    if (!decouplingDecision) {
-      return {
-        value: 0,
-        confidence: 'low',
-        method: 'automated',
-        justification: 'Ground truth missing decouple-notifications decision.',
-      };
-    }
 
     if (aHasMissingDiffs && aDiffs.length === 0) {
       return {
@@ -411,49 +463,76 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    // Check which expected patterns A used
-    const aPatterns = decouplingDecision.expectedPatterns.filter(
-      (p) => new RegExp(p).test(aDiffs),
-    );
+    // Detect A's specific pattern choice
+    const aChoice = this.detectPatternChoice(aDiffs);
 
+    if (aChoice === 'none') {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'Could not detect Agent A\'s architectural pattern choice from diffs.',
+        dataQuality: aHasMissingDiffs ? 'partial' : 'complete',
+      };
+    }
+
+    if (aChoice === 'mixed') {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'Agent A used a mix of EventBus and CallbackRegistry — did not make a clear choice.',
+        dataQuality: aHasMissingDiffs ? 'partial' : 'complete',
+      };
+    }
+
+    const aChoiceLabel = aChoice === 'eventbus' ? 'EventBus' : 'CallbackRegistry';
     let bAligned = false;
     let cAligned = false;
     let anyMissingDiffs = aHasMissingDiffs;
-    const details: string[] = [];
+    const details: string[] = [`Agent A chose ${aChoiceLabel}.`];
 
-    // Check if B follows A's patterns
+    // Check if B follows A's specific pattern choice
     if (transcriptB) {
       const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
       const bHasMissingDiffs = transcriptB.fileChanges.some((c) => c.diff === undefined);
       if (bHasMissingDiffs) anyMissingDiffs = true;
       if (bHasMissingDiffs && bDiffs.length === 0) {
-        details.push('Agent B has no diff data — git enrichment may have failed.');
+        details.push('Agent B has no diff data.');
       } else {
-        bAligned = aPatterns.some((p) => new RegExp(p).test(bDiffs));
-        details.push(
-          bAligned
-            ? 'Agent B aligned with Agent A\'s pattern.'
-            : 'Agent B did NOT follow Agent A\'s architectural pattern.',
-        );
+        const bChoice = this.detectPatternChoice(bDiffs);
+        bAligned = bChoice === aChoice;
+        if (bAligned) {
+          details.push(`Agent B followed ${aChoiceLabel}.`);
+        } else if (bChoice === 'none') {
+          details.push('Agent B did not use a recognizable pattern.');
+        } else {
+          const bLabel = bChoice === 'eventbus' ? 'EventBus' : bChoice === 'callback' ? 'CallbackRegistry' : 'mixed patterns';
+          details.push(`Agent B used ${bLabel} instead of ${aChoiceLabel}.`);
+        }
       }
     } else {
       details.push('Agent B did not produce a transcript.');
     }
 
-    // Check if C follows A's patterns
+    // Check if C follows A's specific pattern choice
     if (transcriptC) {
       const cDiffs = transcriptC.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
       const cHasMissingDiffs = transcriptC.fileChanges.some((c) => c.diff === undefined);
       if (cHasMissingDiffs) anyMissingDiffs = true;
       if (cHasMissingDiffs && cDiffs.length === 0) {
-        details.push('Agent C has no diff data — git enrichment may have failed.');
+        details.push('Agent C has no diff data.');
       } else {
-        cAligned = aPatterns.some((p) => new RegExp(p).test(cDiffs));
-        details.push(
-          cAligned
-            ? 'Agent C aligned with Agent A\'s pattern.'
-            : 'Agent C did NOT follow Agent A\'s architectural pattern.',
-        );
+        const cChoice = this.detectPatternChoice(cDiffs);
+        cAligned = cChoice === aChoice;
+        if (cAligned) {
+          details.push(`Agent C followed ${aChoiceLabel}.`);
+        } else if (cChoice === 'none') {
+          details.push('Agent C did not use a recognizable pattern.');
+        } else {
+          const cLabel = cChoice === 'eventbus' ? 'EventBus' : cChoice === 'callback' ? 'CallbackRegistry' : 'mixed patterns';
+          details.push(`Agent C used ${cLabel} instead of ${aChoiceLabel}.`);
+        }
       }
     } else {
       details.push('Agent C did not produce a transcript.');
@@ -470,10 +549,118 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
     return {
       value,
-      confidence: aPatterns.length > 0 ? 'medium' : 'low',
+      confidence: 'medium',
       method: 'automated',
       justification: details.join(' '),
       dataQuality: anyMissingDiffs ? (aDiffs.length > 0 ? 'partial' : 'missing') : 'complete',
+    };
+  }
+
+  /**
+   * Score decision discovery: Did B and C discover A's work before building?
+   *
+   * Two sub-scores per agent (B and C), averaged:
+   * 1. File reads (25 pts): Did the agent read files A modified BEFORE its first write?
+   * 2. Coordination tools (25 pts): Did the agent use Twining tools to discover A's decisions?
+   *
+   * Total: 0-100 (sum of B's and C's sub-scores).
+   */
+  private scoreDecisionDiscovery(rawResults: RawResults): DimensionScore {
+    const transcriptA = rawResults.transcripts[0];
+    const transcriptB = rawResults.transcripts[1];
+    const transcriptC = rawResults.transcripts[2];
+
+    if (!transcriptA) {
+      return {
+        value: 0,
+        confidence: 'high',
+        method: 'automated',
+        justification: 'Agent A did not produce a transcript — nothing to discover.',
+      };
+    }
+
+    // Files A modified (normalized to relative paths)
+    const aModifiedFiles = new Set(
+      transcriptA.fileChanges.map((c) => c.path.replace(/^\/+/, '')),
+    );
+
+    if (aModifiedFiles.size === 0) {
+      return {
+        value: 0,
+        confidence: 'low',
+        method: 'automated',
+        justification: 'Agent A made no file changes — nothing to discover.',
+      };
+    }
+
+    const details: string[] = [];
+    let totalScore = 0;
+
+    for (const [label, transcript] of [['B', transcriptB], ['C', transcriptC]] as const) {
+      if (!transcript) {
+        details.push(`Agent ${label} did not produce a transcript.`);
+        continue;
+      }
+
+      // Find the index of first write/edit tool call
+      const firstWriteIdx = transcript.toolCalls.findIndex((tc) =>
+        /^(Write|Edit|write|edit|mcp.*write|mcp.*edit)$/i.test(tc.toolName) ||
+        tc.toolName === 'Bash', // Bash can also write files
+      );
+
+      // Tool calls before first write (or all calls if no writes)
+      const earlyToolCalls = firstWriteIdx >= 0
+        ? transcript.toolCalls.slice(0, firstWriteIdx)
+        : transcript.toolCalls;
+
+      // Sub-score 1: Did agent read A's modified files before writing?
+      const readFiles = new Set<string>();
+      for (const tc of earlyToolCalls) {
+        if (/^(Read|read|mcp.*read_file)$/i.test(tc.toolName)) {
+          const filePath = String(tc.parameters?.file_path ?? tc.parameters?.path ?? '');
+          // Normalize: extract relative path from absolute
+          const normalized = filePath.replace(/.*?(?:src\/|tests\/|\.\/)/i, '');
+          readFiles.add(normalized);
+        }
+      }
+
+      // Count how many of A's files this agent read before writing
+      let aFilesRead = 0;
+      for (const aFile of aModifiedFiles) {
+        const aNormalized = aFile.replace(/.*?(?:src\/|tests\/|\.\/)/i, '');
+        for (const readFile of readFiles) {
+          if (readFile.includes(aNormalized) || aNormalized.includes(readFile)) {
+            aFilesRead++;
+            break;
+          }
+        }
+      }
+
+      const fileReadScore = Math.round((aFilesRead / aModifiedFiles.size) * 25);
+
+      // Sub-score 2: Did agent use coordination tools?
+      const coordToolCalls = earlyToolCalls.filter((tc) =>
+        COORDINATION_TOOLS.some((ct) => tc.toolName.includes(ct)),
+      );
+      // 25 pts if any coordination tool used, scaled: 1 call = 15, 2+ = 25
+      const coordScore = coordToolCalls.length === 0 ? 0
+        : coordToolCalls.length === 1 ? 15
+        : 25;
+
+      const agentScore = fileReadScore + coordScore;
+      totalScore += agentScore;
+
+      details.push(
+        `Agent ${label}: read ${aFilesRead}/${aModifiedFiles.size} of A's files before writing (${fileReadScore} pts), ` +
+        `${coordToolCalls.length} coordination tool calls (${coordScore} pts).`,
+      );
+    }
+
+    return {
+      value: totalScore,
+      confidence: 'medium',
+      method: 'automated',
+      justification: details.join(' '),
     };
   }
 
