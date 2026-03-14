@@ -187,6 +187,40 @@ describe('substitutePromptTemplate', () => {
   });
 });
 
+describe('BaseScenario.computeCoordinationLift', () => {
+  it('returns undefined when no evaluator client is provided', async () => {
+    const scenario = new TestScenario();
+    await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+    const rawResults: RawResults = {
+      transcripts: [makeTranscript(0)],
+      finalWorkingDir: '/tmp/test-repo',
+      allSessionsCompleted: true,
+      errors: [],
+    };
+    const groundTruth: ArchitecturalManifest = {
+      name: 'test',
+      description: 'Test manifest',
+      components: [],
+      dependencies: [],
+      patterns: [],
+      testLocations: [],
+      decisions: [],
+    };
+
+    const result = await (scenario as any).computeCoordinationLift(
+      rawResults,
+      groundTruth,
+      75,
+      undefined,
+    );
+
+    expect(result).toBeUndefined();
+
+    await scenario.teardown();
+  });
+});
+
 describe('BaseScenario execution modes', () => {
   describe('sequential execution (default)', () => {
     let scenario: TestScenario;

@@ -23,8 +23,9 @@ import type {
 } from '../types/scenario.js';
 import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js';
 import type { ConditionContext } from '../types/condition.js';
-import type { ScoredResults, RunMetrics } from '../types/results.js';
+import type { ScoredResults, RunMetrics, StandaloneScoreResult, CoordinationLift } from '../types/results.js';
 import type { AgentTranscript } from '../types/transcript.js';
+import { buildEvaluationContextFromResults, evaluateStandaloneQuality } from '../analyzer/llm-judge.js';
 
 export type {
   Scenario,
@@ -294,6 +295,40 @@ export abstract class BaseScenario implements Scenario {
 
   /** Scenario-specific cleanup. */
   protected abstract doTeardown(): Promise<void>;
+
+  /**
+   * Compute coordination lift by comparing the coordination-aware composite
+   * score against a standalone quality score from an LLM judge that evaluates
+   * the output without any coordination context.
+   *
+   * Returns undefined if no evaluator client is provided (LLM judging is optional).
+   * Errors from the LLM judge are caught and treated as non-fatal.
+   */
+  protected async computeCoordinationLift(
+    rawResults: RawResults,
+    groundTruth: ArchitecturalManifest,
+    coordinationComposite: number,
+    evaluatorClient?: Anthropic,
+  ): Promise<{ standaloneScores: StandaloneScoreResult; coordinationLift: CoordinationLift } | undefined> {
+    if (!evaluatorClient) {
+      return undefined;
+    }
+
+    try {
+      const context = buildEvaluationContextFromResults(rawResults, groundTruth);
+      const standaloneScores = await evaluateStandaloneQuality(evaluatorClient, context);
+      const lift = coordinationComposite - standaloneScores.composite;
+      const coordinationLift: CoordinationLift = {
+        lift,
+        coordinationScore: coordinationComposite,
+        standaloneScore: standaloneScores.composite,
+      };
+      return { standaloneScores, coordinationLift };
+    } catch {
+      // LLM judge errors are non-fatal; coordination lift is optional
+      return undefined;
+    }
+  }
 
   /**
    * Extract run metrics from raw results.
