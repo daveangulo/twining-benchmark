@@ -15,7 +15,10 @@ export type ScenarioName =
   | 'scale-stress-test'
   | 'conflict-resolution'
   | 'concurrent-agents'
-  | 'context-recovery';
+  | 'context-recovery'
+  | 'iterative-feature-build'
+  | 'decision-volume-recovery'
+  | 'evolving-requirements';
 
 /**
  * Metadata describing a scenario.
