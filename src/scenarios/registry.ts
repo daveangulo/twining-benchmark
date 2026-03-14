@@ -9,6 +9,7 @@ import { createConcurrentAgentsScenario } from './concurrent-agents.js';
 import { createContextRecoveryScenario } from './context-recovery.js';
 import { createEvolvingRequirementsScenario } from './evolving-requirements.js';
 import { createIterativeFeatureBuildScenario } from './iterative-feature-build.js';
+import { createDecisionVolumeRecoveryScenario } from './decision-volume-recovery.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -133,6 +134,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createIterativeFeatureBuildScenario(),
+  },
+  'decision-volume-recovery': {
+    metadata: {
+      name: 'decision-volume-recovery',
+      description: 'Four-session needle-in-a-haystack scenario. Session 1 generates many decisions via six refactoring ops. Sessions 2 and 3 must recover the relevant ones. Measures retrieval precision, pattern compliance, and cross-session integration.',
+      estimatedDurationMinutes: 60,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 4,
+      scoringDimensions: ['decisionRecovery', 'patternCompliance', 'crossCuttingConsistency', 'retrievalPrecision'],
+      excludeFromAll: true,
+    },
+    create: () => createDecisionVolumeRecoveryScenario(),
   },
 };
 
