@@ -179,6 +179,18 @@ def _print_terminal_summary(results: dict):
         for d in disordinal[:3]:
             print(f"  {d['condition_a']} vs {d['condition_b']}: ranking reverses across scenarios")
 
+    # Statistical design context
+    design = results.get("reliability", {}).get("design_guidance", {})
+    if design:
+        n = design.get("current_n_per_condition", 0)
+        iters = design.get("iterations_per_pair", 0)
+        mdes = design.get("current_mdes", 0)
+        print(f"\n=== STATISTICAL DESIGN ===")
+        print(f"  {iters} iterations/pair, {design.get('n_scenarios', '?')} scenarios -> n={n}/condition, MDES=d≥{mdes:.2f}")
+        at5 = design.get("at_5_iterations", {})
+        if at5 and iters < 5:
+            print(f"  At 5 iterations/pair: n={at5.get('n_per_condition', '?')}/condition, MDES=d≥{at5.get('mdes', '?')}")
+
     # Key effect sizes
     effect_sizes = results.get("conditions", {}).get("effect_sizes", [])
     if effect_sizes:
@@ -187,7 +199,11 @@ def _print_terminal_summary(results: dict):
             print("\n=== KEY EFFECT SIZES (vs baseline) ===")
             for es in baseline_effects:
                 sig = "*" if es.get("significant") else ""
-                print(f"  {es['condition_b']:<30s} d={es['cohens_d']:+.2f} ({es['interpretation']}){sig}")
+                d_val = abs(es.get("cohens_d", 0))
+                marker = ""
+                if mdes and d_val > 0.1 and d_val < mdes:
+                    marker = " [below MDES]"
+                print(f"  {es['condition_b']:<30s} d={es['cohens_d']:+.2f} ({es['interpretation']}){sig}{marker}")
 
     recs = results.get("recommendations", {}).get("items", [])
     if recs:

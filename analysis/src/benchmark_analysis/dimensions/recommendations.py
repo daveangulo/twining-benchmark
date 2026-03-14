@@ -51,21 +51,36 @@ def synthesize_recommendations(all_results: dict) -> dict:
             "message": f"Scenario '{ce['scenario']}' x '{ce['condition']}' has ceiling effect (mean={ce['mean']:.1f}, std={ce['std']:.1f}) — consider redesigning for more discrimination",
         })
 
-    # Check power from reliability
+    # Check power from reliability — use MDES-based messaging
     reliability = all_results.get("reliability", {})
-    for pa in reliability.get("power_analysis", []):
-        if pa.get("observed_power", 1.0) < 0.5:
-            items.append({
-                "priority": "high",
-                "category": "reliability",
-                "message": f"Underpowered comparison: {pa['comparison']} has power={pa['observed_power']:.2f} — need {pa['recommended_n']} runs per group (currently {pa['n_per_group']})",
-            })
-        elif pa.get("underpowered", False):
-            items.append({
-                "priority": "medium",
-                "category": "reliability",
-                "message": f"Low power: {pa['comparison']} has power={pa['observed_power']:.2f} — consider {pa['recommended_n']} runs per group",
-            })
+    design = reliability.get("design_guidance", {})
+    mdes = design.get("current_mdes", 0)
+    mdes_at_5 = design.get("at_5_iterations", {}).get("mdes", 0)
+    current_iters = design.get("iterations_per_pair", 0)
+
+    # One overall design recommendation instead of per-comparison noise
+    if mdes and mdes > 1.0 and current_iters <= 3:
+        items.append({
+            "priority": "medium",
+            "category": "reliability",
+            "message": f"At {current_iters} iterations/pair (n={design.get('current_n_per_condition', '?')}/condition), "
+                       f"only large effects (d≥{mdes:.1f}) are detectable. "
+                       f"At 5 iterations/pair, MDES drops to d≥{mdes_at_5:.1f} — "
+                       f"a ~66% cost increase for medium-effect detection",
+        })
+
+    # Flag comparisons where observed effect is below MDES (inconclusive, not "no effect")
+    inconclusive = [pa for pa in reliability.get("power_analysis", [])
+                    if abs(pa.get("cohens_d", 0)) > 0.1
+                    and abs(pa.get("cohens_d", 0)) < pa.get("mdes", 999)]
+    if inconclusive:
+        names = ", ".join(pa["comparison"].split(" vs ")[1] for pa in inconclusive[:3])
+        items.append({
+            "priority": "low",
+            "category": "reliability",
+            "message": f"Inconclusive comparisons ({names}): observed effects are below detectable threshold — "
+                       f"cannot distinguish from noise at current sample size",
+        })
 
     # Check scorer diagnostics
     scorer = all_results.get("scorer_diagnostics", {})

@@ -295,21 +295,39 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
             add(f"**All {len(variance_flags)} scenario-condition cells have CV <= 30%.**")
             add()
 
+        # Design guidance
+        design = reliability.get("design_guidance", {})
+        if design:
+            add("### Statistical Design")
+            add()
+            n = design.get("current_n_per_condition", 0)
+            iters = design.get("iterations_per_pair", 0)
+            mdes_val = design.get("current_mdes", 0)
+            add(f"- **Iterations per pair:** {iters}")
+            add(f"- **Scenarios:** {design.get('n_scenarios', '?')}")
+            add(f"- **N per condition:** {n} (pooled across scenarios)")
+            add(f"- **Minimum Detectable Effect (MDES):** d ≥ {mdes_val:.2f} at 80% power")
+            at5 = design.get("at_5_iterations", {})
+            if at5 and iters < 5:
+                add(f"- **At 5 iterations:** n={at5.get('n_per_condition', '?')}, MDES = d ≥ {at5.get('mdes', '?')}")
+                add(f"  - {at5.get('note', '')}")
+            add()
+
         # Power analysis
         power_results = reliability.get("power_analysis", [])
         if power_results:
             add("### Power Analysis")
             add()
-            headers = ["Comparison", "Cohen's d", "N", "Power", "Rec. N", "Underpowered"]
+            headers = ["Comparison", "Cohen's d", "N", "MDES", "Power", "Verdict"]
             rows = []
             for pr in power_results:
                 rows.append([
                     pr.get("comparison", ""),
                     f"{pr.get('cohens_d', 0):+.3f}",
                     str(pr.get("n_per_group", 0)),
+                    f"d≥{pr.get('mdes', 0):.2f}",
                     f"{pr.get('observed_power', 0):.3f}",
-                    str(pr.get("recommended_n", "?")),
-                    "Yes" if pr.get("underpowered") else "No",
+                    pr.get("verdict", ""),
                 ])
             add_table(headers, rows)
     else:

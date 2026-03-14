@@ -46,7 +46,7 @@ export interface ScoreWeights {
  */
 export const DEFAULT_CONFIG: BenchmarkConfig = {
   targetPath: './targets/synthetic',
-  defaultRuns: 3,
+  defaultRuns: 5,
   scenarioDirectories: [],
   agentTimeoutMs: 15 * 60 * 1000,
   tokenBudgetPerRun: 500_000,

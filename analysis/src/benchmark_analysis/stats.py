@@ -209,6 +209,31 @@ def required_sample_size(
     return 500
 
 
+def minimum_detectable_effect(
+    n_per_group: int, power: float = 0.80, alpha: float = 0.05,
+) -> float:
+    """Minimum detectable effect size (MDES) at given n and power.
+
+    This answers the practical question: "with my current sample size,
+    what's the smallest effect I can reliably detect?"
+
+    For benchmark harness context:
+      - Full 'all' run at 3 iterations: ~21 per condition → MDES ≈ 0.80
+      - Full 'all' run at 5 iterations: ~35 per condition → MDES ≈ 0.62
+    """
+    if n_per_group < 3:
+        return float("inf")
+    # Binary search for smallest d where power >= target
+    lo, hi = 0.01, 5.0
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if power_analysis(mid, n_per_group, alpha) >= power:
+            hi = mid
+        else:
+            lo = mid
+    return round(hi, 2)
+
+
 def condition_summary(condition: str, values: list[float]) -> ConditionSummary:
     """Compute statistical summary for a condition."""
     if not values:
