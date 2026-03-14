@@ -8,6 +8,7 @@ import { createConflictResolutionScenario } from './conflict-resolution.js';
 import { createConcurrentAgentsScenario } from './concurrent-agents.js';
 import { createContextRecoveryScenario } from './context-recovery.js';
 import { createEvolvingRequirementsScenario } from './evolving-requirements.js';
+import { createIterativeFeatureBuildScenario } from './iterative-feature-build.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -120,6 +121,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createEvolvingRequirementsScenario(),
+  },
+  'iterative-feature-build': {
+    metadata: {
+      name: 'iterative-feature-build',
+      description: 'Five-session scenario where each agent adds a layer to an analytics feature (models → repository → service → controller → integration). Later agents must understand all prior architectural decisions to maintain consistency.',
+      estimatedDurationMinutes: 75,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 5,
+      scoringDimensions: ['architecturalDrift', 'layerIntegrity', 'decisionAccumulation', 'integrationCompleteness'],
+      excludeFromAll: true,
+    },
+    create: () => createIterativeFeatureBuildScenario(),
   },
 };
 
