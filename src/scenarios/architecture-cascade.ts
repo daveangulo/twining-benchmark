@@ -25,6 +25,7 @@ import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
+import type { AgentTranscript } from '../types/transcript.js';
 import { BaseScenario } from './scenario.interface.js';
 import {
   buildEvaluationContextFromResults,
@@ -424,6 +425,33 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   }
 
   /**
+   * Detect which architectural pattern Agent A chose by scanning transcript tool calls.
+   *
+   * Used as a fallback when diff-based detection returns 'none' (e.g., when A records
+   * the decision via Twining coordination tools rather than in code changes).
+   *
+   * Returns 'eventbus' | 'callback' | 'mixed' | 'none'.
+   */
+  private detectPatternFromTranscript(transcript: AgentTranscript): 'eventbus' | 'callback' | 'mixed' | 'none' {
+    const relevantCalls = transcript.toolCalls.filter(
+      (tc) => tc.toolName.includes('twining_decide') || tc.toolName.includes('twining_post'),
+    );
+
+    if (relevantCalls.length === 0) return 'none';
+
+    const combinedText = relevantCalls
+      .map((tc) => {
+        const { summary, rationale, detail, context } = tc.parameters as Record<string, unknown>;
+        return [summary, rationale, detail, context]
+          .filter((v): v is string => typeof v === 'string')
+          .join('\n');
+      })
+      .join('\n');
+
+    return this.detectPatternChoice(combinedText);
+  }
+
+  /**
    * Score decision propagation: Did B and C both follow A's SPECIFIC pattern choice?
    *
    * Detects whether A chose EventBus or CallbackRegistry, then checks if B and C
@@ -464,7 +492,12 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     }
 
     // Detect A's specific pattern choice
-    const aChoice = this.detectPatternChoice(aDiffs);
+    let aChoice = this.detectPatternChoice(aDiffs);
+
+    // Fallback: if diffs don't reveal a pattern, check Twining tool call parameters
+    if (aChoice === 'none') {
+      aChoice = this.detectPatternFromTranscript(transcriptA);
+    }
 
     if (aChoice === 'none') {
       return {

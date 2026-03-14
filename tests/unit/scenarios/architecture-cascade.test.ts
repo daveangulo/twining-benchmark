@@ -525,6 +525,110 @@ describe('ArchitectureCascadeScenario', () => {
       expect(scored.scores.decisionDiscovery.value).toBe(0);
     });
 
+    it('detects EventBus pattern from twining_decide tool call when diffs lack pattern', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          // Agent A: no pattern in diffs, but records decision via twining_decide
+          makeTranscript({
+            taskIndex: 0,
+            toolCalls: [
+              {
+                toolName: 'mcp__plugin_twining_twining__twining_decide',
+                parameters: {
+                  summary: 'Chose EventBus pattern for notification decoupling',
+                  rationale: 'Using EventBus with publish/subscribe to decouple notifications from order processing.',
+                },
+                timestamp: '2026-02-20T10:00:00Z',
+                durationMs: 200,
+              },
+            ],
+            fileChanges: [
+              {
+                path: 'DECISIONS.md',
+                changeType: 'added',
+                linesAdded: 5,
+                linesRemoved: 0,
+                diff: '+# Decision recorded via coordination tool',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/notifications/email.ts',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+eventBus.subscribe("order.status", handleEmail);\n+eventBus.publish("email.sent", data);',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/notifications/webhook.ts',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+eventBus.subscribe("order.status", fireWebhook);\n+eventBus.publish("webhook.sent", data);',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // A's pattern was detected from twining_decide, B and C both aligned
+      expect(scored.scores.decisionPropagation.value).toBe(100);
+    });
+
+    it('scores zero propagation when neither diffs nor transcript reveal a pattern', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          // Agent A: no pattern in diffs and no twining_decide/twining_post calls
+          makeTranscript({
+            taskIndex: 0,
+            toolCalls: [
+              {
+                toolName: 'Read',
+                parameters: { file_path: '/tmp/test-repo/src/index.ts' },
+                timestamp: '2026-02-20T10:00:00Z',
+                durationMs: 100,
+              },
+            ],
+            fileChanges: [
+              {
+                path: 'DECISIONS.md',
+                changeType: 'added',
+                linesAdded: 3,
+                linesRemoved: 0,
+                diff: '+# Some generic note without pattern keywords',
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 1, fileChanges: [] }),
+          makeTranscript({ taskIndex: 2, fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      expect(scored.scores.decisionPropagation.value).toBe(0);
+    });
+
     it('handles missing transcripts gracefully', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
