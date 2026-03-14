@@ -18,12 +18,19 @@ class _NumpyEncoder(json.JSONEncoder):
             if np.isnan(obj) or np.isinf(obj):
                 return None
             return float(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
         if isinstance(obj, (datetime,)):
             return obj.isoformat()
         if isinstance(obj, Path):
             return str(obj)
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
+        if hasattr(obj, "__dataclass_fields__"):
+            from dataclasses import asdict
+            return asdict(obj)
         return super().default(obj)
 
 
@@ -48,6 +55,13 @@ def generate_json_report(results: dict, output_path: Path) -> None:
 
 def _clean_for_json(obj):
     """Recursively clean an object for JSON serialization."""
+    # Handle Pydantic BaseModel objects
+    if hasattr(obj, "model_dump"):
+        return _clean_for_json(obj.model_dump())
+    # Handle dataclasses
+    if hasattr(obj, "__dataclass_fields__"):
+        from dataclasses import asdict
+        return _clean_for_json(asdict(obj))
     if isinstance(obj, dict):
         return {k: _clean_for_json(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -62,6 +76,8 @@ def _clean_for_json(obj):
         return float(obj)
     if isinstance(obj, (np.integer,)):
         return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
     if isinstance(obj, np.ndarray):
         return _clean_for_json(obj.tolist())
     if isinstance(obj, Path):

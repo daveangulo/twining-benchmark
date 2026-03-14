@@ -135,14 +135,18 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add("## Per-Scenario Breakdown")
     add()
     scenario_data = results.get("scenarios", {})
-    per_scenario = scenario_data.get("per_scenario", [])
+    per_scenario = scenario_data.get("per_scenario", {})
     if per_scenario:
         headers = ["Scenario", "Mean", "Std", "Best Condition", "Worst Condition"]
         rows = []
-        for s in per_scenario:
+        # per_scenario may be a dict keyed by scenario name or a list of dicts
+        items = per_scenario.items() if isinstance(per_scenario, dict) else [(s.get("scenario", ""), s) for s in per_scenario]
+        for scenario_name, s in items:
+            if isinstance(s, str):
+                continue
             rows.append([
-                s.get("scenario", ""),
-                f"{s.get('mean', 0):.1f}",
+                scenario_name,
+                f"{s.get('mean', s.get('spread', 0)):.1f}",
                 f"{s.get('std', 0):.1f}",
                 s.get("best_condition", ""),
                 s.get("worst_condition", ""),
@@ -191,16 +195,20 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add("## Coordination Behavior")
     add()
     coord = results.get("coordination", {})
-    per_condition = coord.get("per_condition", [])
+    per_condition = coord.get("per_condition", {})
     if per_condition:
-        headers = ["Condition", "Twining %", "Productive %", "Total Calls"]
+        headers = ["Condition", "Twining %", "Engagement Rate", "Sessions"]
         rows = []
-        for c in per_condition:
+        # per_condition may be a dict keyed by condition name or a list of dicts
+        items = per_condition.values() if isinstance(per_condition, dict) else per_condition
+        for c in items:
+            if not isinstance(c, dict):
+                continue
             rows.append([
                 c.get("condition", ""),
-                f"{c.get('twining_pct', 0):.1f}%",
-                f"{c.get('productive_pct', 0):.1f}%",
-                str(c.get("total_tool_calls", 0)),
+                f"{c.get('avg_twining_pct', c.get('twining_pct', 0)):.1f}%",
+                f"{c.get('engagement_rate', 0):.0%}",
+                str(c.get("session_count", c.get("total_tool_calls", 0))),
             ])
         add_table(headers, rows)
     else:

@@ -131,7 +131,17 @@ def run_compare(args):
 def _run_safe(results: dict, key: str, fn):
     """Run an analyzer function, storing errors instead of crashing."""
     try:
-        results[key] = fn()
+        result = fn()
+        # Normalize: if a Pydantic BaseModel, convert to dict
+        if hasattr(result, "model_dump"):
+            result = result.model_dump()
+        # Unwrap DimensionAnalysis-shaped dicts: extract details so downstream
+        # consumers can access keys like "condition_rankings" directly
+        if isinstance(result, dict) and "details" in result and "dimension" in result:
+            unwrapped = dict(result["details"])
+            unwrapped["_summary"] = result.get("summary", "")
+            result = unwrapped
+        results[key] = result
     except Exception as e:
         print(f"  Warning: {key} analysis failed: {e}", file=sys.stderr)
         results[key] = {"error": str(e)}

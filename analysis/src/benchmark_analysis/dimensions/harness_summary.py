@@ -31,7 +31,14 @@ def generate_harness_summary(all_results: dict) -> dict:
 
     # Coordination overhead from coordination analysis
     coord = all_results.get("coordination", {})
-    overhead_data = {e["condition"]: e for e in coord.get("per_condition", [])} if coord else {}
+    overhead_data = {}
+    if coord:
+        pc = coord.get("per_condition", {})
+        if isinstance(pc, dict):
+            # per_condition is a dict keyed by condition name
+            overhead_data = {k: v for k, v in pc.items() if isinstance(v, dict)}
+        elif isinstance(pc, list):
+            overhead_data = {e["condition"]: e for e in pc if isinstance(e, dict)}
 
     matrix = []
     for condition, ranking in sorted(rankings.items(), key=lambda x: x[1].get("rank", 99)):
@@ -51,7 +58,7 @@ def generate_harness_summary(all_results: dict) -> dict:
             "cost_per_point": cost.get("cost_per_composite_point", 0),
             "best_scenario": best_scenarios.get(condition, "\u2014"),
             "worst_scenario": worst_scenarios.get(condition, "\u2014"),
-            "coordination_overhead_pct": overhead.get("twining_pct", 0),
+            "coordination_overhead_pct": overhead.get("avg_twining_pct", overhead.get("twining_pct", 0)),
         })
 
     # Generate headline

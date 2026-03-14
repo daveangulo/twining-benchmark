@@ -12,18 +12,24 @@ def synthesize_recommendations(all_results: dict) -> dict:
 
     # Check coordination engagement
     coord = all_results.get("coordination", {})
-    for entry in coord.get("per_condition", []):
+    pc = coord.get("per_condition", {})
+    # per_condition may be a dict keyed by condition name or a list of dicts
+    coord_entries = pc.values() if isinstance(pc, dict) else (pc if isinstance(pc, list) else [])
+    for entry in coord_entries:
+        if not isinstance(entry, dict):
+            continue
         if entry.get("engagement_rate", 1.0) < 0.5:
             items.append({
                 "priority": "high",
                 "category": "coordination",
                 "message": f"Fix activation: Twining engagement rate is {entry['engagement_rate']:.0%} for {entry['condition']} — agents aren't using coordination tools",
             })
-        if entry.get("graph_overhead_pct", 0) > 20:
+        graph_pct = entry.get("avg_graph_building_pct", entry.get("graph_overhead_pct", 0))
+        if graph_pct > 20:
             items.append({
                 "priority": "medium",
                 "category": "coordination",
-                "message": f"Reduce graph ceremony: {entry['graph_overhead_pct']:.0f}% of twining calls in {entry['condition']} are graph-building (add_entity/add_relation)",
+                "message": f"Reduce graph ceremony: {graph_pct:.0f}% of twining calls in {entry.get('condition', '?')} are graph-building (add_entity/add_relation)",
             })
 
     # Check if full-twining underperforms twining-lite
