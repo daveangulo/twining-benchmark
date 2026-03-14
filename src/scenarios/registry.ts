@@ -7,6 +7,7 @@ import { createScaleStressTestScenario } from './scale-stress-test.js';
 import { createConflictResolutionScenario } from './conflict-resolution.js';
 import { createConcurrentAgentsScenario } from './concurrent-agents.js';
 import { createContextRecoveryScenario } from './context-recovery.js';
+import { createEvolvingRequirementsScenario } from './evolving-requirements.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -107,6 +108,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: false,
     },
     create: () => createContextRecoveryScenario(),
+  },
+  'evolving-requirements': {
+    metadata: {
+      name: 'evolving-requirements',
+      description: 'Four-session scenario where requirements change mid-stream. Session 3 introduces priority routing, invalidating prior decisions. Measures requirement adaptation, decision evolution, backward compatibility, and integration completeness.',
+      estimatedDurationMinutes: 60,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 4,
+      scoringDimensions: ['requirementAdaptation', 'decisionEvolution', 'backwardCompatibility', 'integrationCompleteness'],
+      excludeFromAll: true,
+    },
+    create: () => createEvolvingRequirementsScenario(),
   },
 };
 
