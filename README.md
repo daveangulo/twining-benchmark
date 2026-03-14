@@ -29,14 +29,14 @@ npm run build
 # Run a single scenario/condition pair
 npx twining-bench run --scenario refactoring-handoff --condition baseline --runs 1
 
-# Run all scenarios against all conditions (3 runs each for statistical significance)
-npx twining-bench run --scenario all --condition all --runs 3 --budget 500
+# Run all scenarios against all conditions (5 runs each, ~$470, ~37 hours)
+npx twining-bench run --scenario all --condition all --budget 500
 
 # Use a seed for reproducible execution order
-npx twining-bench run --scenario all --condition all --runs 3 --seed benchmark-v1
+npx twining-bench run --scenario all --condition all --seed benchmark-v1
 
 # Dry run — validate config and estimate cost without executing
-npx twining-bench run --scenario all --condition all --runs 3 --dry-run
+npx twining-bench run --scenario all --condition all --dry-run
 
 # Smoke test — quick end-to-end validation (2 conditions, ~10 min)
 npx twining-bench smoke-test
@@ -60,6 +60,23 @@ npx twining-bench export <run-id> --format csv
 
 The results display includes a VERDICT (whether Twining helps), CONFIDENCE level, condition ranking table with significance indicators, pairwise comparisons, and auto-generated key findings.
 
+### Analyze Results (Python)
+
+A standalone Python analysis package provides 16-dimension statistical analysis with interactive reports:
+
+```bash
+cd analysis
+uv venv && uv pip install -e .
+
+# Full analysis of a benchmark run (JSON, Markdown, HTML reports)
+python -m benchmark_analysis analyze ../benchmark-results/<run-id>
+
+# Compare two runs for regressions/improvements
+python -m benchmark_analysis compare ../benchmark-results/<run-id-1> ../benchmark-results/<run-id-2>
+```
+
+See [`analysis/README.md`](analysis/README.md) for the full list of analyses performed.
+
 ## Cloud Execution (Fly.io)
 
 The harness can run on Fly.io for long-running benchmark suites.
@@ -82,7 +99,7 @@ fly ssh console -a twining-benchmark -C "node dist/cli/index.js smoke-test --tim
 
 # Full benchmark run (detached via tmux)
 fly ssh console -a twining-benchmark -C "apt-get update -qq && apt-get install -y -qq tmux"
-fly ssh console -a twining-benchmark -C "tmux new-session -d -s bench 'node dist/cli/index.js run --scenario all --condition all --runs 3 --budget 500 --seed benchmark-v1 --output /data/benchmark-results 2>&1 | tee /data/benchmark-results/full-run.log'"
+fly ssh console -a twining-benchmark -C "tmux new-session -d -s bench 'node dist/cli/index.js run --scenario all --condition all --budget 500 --seed benchmark-v1 --output /data/benchmark-results 2>&1 | tee /data/benchmark-results/full-run.log'"
 
 # Check progress
 fly ssh console -a twining-benchmark -C "tail -20 /data/benchmark-results/full-run.log"
@@ -192,13 +209,16 @@ LLM-as-judge evaluation uses **blind mode** to prevent bias:
 
 #### Statistical Analysis
 
-- **Cohen's d** (primary): Effect size magnitude — leads all comparison tables with interpretation (negligible/small/medium/large)
-- **Holm-Bonferroni correction**: Adjusted p-values control family-wise error rate across multiple comparisons
-- **Mann-Whitney U**: Non-parametric significance test, appropriate for small samples
-- **Z-test** (secondary reference): Reported alongside, flagged as inappropriate for N < 30
-- **95% confidence intervals**: For all metrics
-- **Variance flagging**: Metrics where stddev exceeds 20% of mean
-- **Key Effect Sizes**: Top 5 largest Cohen's d values highlighted in results summary
+The harness is designed for realistic sample sizes (n=21-35 per condition at 3-5 iterations across 7 scenarios). Statistical methods are calibrated accordingly:
+
+- **Hedges' g** (primary): Bias-corrected effect size — leads all comparison tables. Small-sample correction prevents the ~19% overestimate of raw Cohen's d at n<10.
+- **Minimum Detectable Effect Size (MDES)**: Reports what effects are detectable at your actual sample size, replacing misleading "need N runs" guidance. At 5 iterations × 7 scenarios: MDES = d≥0.62.
+- **ROPE analysis** (primary decision framework): Region of Practical Equivalence testing — classifies differences as "equivalent", "different", or "undecided" based on practical significance (default ±5 composite points), better suited to small samples than p-values alone.
+- **Holm-Bonferroni correction**: Adjusted p-values control family-wise error rate across all pairwise comparisons.
+- **Mann-Whitney U**: Non-parametric significance test. Note: at n<10, exact p-value resolution is coarse.
+- **Bootstrap 95% CIs**: For condition means and mean differences (delta). Fixed seed for reproducibility.
+- **Spearman rank correlation**: Used for behavior-outcome analysis (robust to non-normality of count data).
+- **Variance flagging**: Scenario×condition cells with CV > 30% are flagged as high-variance.
 
 ### Test Targets
 
@@ -252,6 +272,7 @@ twining-benchmark-harness/
 │   ├── unit/                         # 38 test files
 │   ├── integration/                  # 2 integration test files
 │   └── e2e/                          # CI-gated smoke test
+├── analysis/                          # Python analysis package (16 dimensions, 3 report formats)
 ├── scripts/                          # Smoke test and analysis scripts
 ├── Dockerfile                        # Multi-stage build for Fly.io
 ├── fly.toml                          # Fly.io config (4 CPU, 4GB RAM)
@@ -265,7 +286,7 @@ twining-benchmark-harness/
 ```typescript
 const config: BenchmarkConfig = {
   targetPath: './targets/synthetic',
-  defaultRuns: 3,
+  defaultRuns: 5,                         // 5 iterations per pair (detects d≥0.62 at full matrix)
   agentTimeoutMs: 15 * 60 * 1000,       // 15 min per agent session
   tokenBudgetPerRun: 500_000,
   budgetDollars: 100,                    // Hard cost ceiling
