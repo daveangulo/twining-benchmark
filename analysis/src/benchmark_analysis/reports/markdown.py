@@ -96,15 +96,15 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     # --- Behavior-Outcome Correlations ---
     add("## Behavior-Outcome Correlations")
     add()
-    predictive = results.get("behavior_outcome", {}).get("predictive_behaviors", [])
-    if predictive:
+    correlated = results.get("behavior_outcome", {}).get("correlated_behaviors", [])
+    if correlated:
         headers = ["Behavior", "Outcome", "r", "Interpretation"]
         rows = []
-        for p in predictive[:10]:
+        for p in correlated[:10]:
             rows.append([
                 p.get("behavior_metric", ""),
                 p.get("outcome_metric", ""),
-                f"{p.get('pearson_r', 0):+.2f}",
+                f"{p.get('spearman_r', 0):+.2f}",
                 p.get("interpretation", ""),
             ])
         add_table(headers, rows)
@@ -116,15 +116,25 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add("## Effect Decomposition")
     add()
     decomp = results.get("effect_decomposition", {})
-    mechanisms = decomp.get("mechanisms", [])
+    mechanisms = decomp.get("mechanism_attribution", [])
     if mechanisms:
-        headers = ["Mechanism", "Contribution", "Evidence"]
+        headers = ["Mechanism", "Associated Difference", "Evidence"]
         rows = []
         for m in mechanisms:
+            lift = m.get("associated_difference", 0)
+            # Build evidence string from heavy/non-user conditions
+            heavy = m.get("heavy_user_conditions", [])
+            non = m.get("non_user_conditions", [])
+            evidence_parts = []
+            if heavy:
+                evidence_parts.append(f"heavy users: {', '.join(heavy)}")
+            if non:
+                evidence_parts.append(f"non-users: {', '.join(non)}")
+            evidence = "; ".join(evidence_parts) if evidence_parts else "N/A"
             rows.append([
                 m.get("mechanism", ""),
-                f"{m.get('contribution_pct', 0):.0f}%",
-                m.get("evidence", ""),
+                f"{lift:+.2f}",
+                evidence,
             ])
         add_table(headers, rows)
     else:
@@ -221,13 +231,12 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     cost_data = results.get("cost", {})
     cost_per_condition = cost_data.get("per_condition", [])
     if cost_per_condition:
-        headers = ["Condition", "Mean Cost", "Median Cost", "Cost/Point"]
+        headers = ["Condition", "Mean Cost", "Cost/Point"]
         rows = []
         for c in cost_per_condition:
             rows.append([
                 c.get("condition", ""),
                 f"${c.get('mean_cost_usd', 0):.2f}",
-                f"${c.get('median_cost_usd', 0):.2f}",
                 f"${c.get('cost_per_composite_point', 0):.3f}",
             ])
         add_table(headers, rows)
@@ -240,16 +249,21 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add()
     validity = results.get("construct_validity", {})
     if validity:
-        cronbach = validity.get("cronbach_alpha")
-        if cronbach is not None:
-            add(f"**Cronbach's alpha:** {cronbach:.3f}")
+        # Internal consistency summary
+        internal = validity.get("internal_consistency", [])
+        if internal:
+            reliable_count = sum(1 for ic in internal if ic.get("reliable"))
+            total_count = len(internal)
+            add(f"**Internal consistency:** {reliable_count}/{total_count} scenario-condition-dimension cells have CV < 20%")
             add()
-        convergent = validity.get("convergent_pairs", [])
-        if convergent:
-            add("### Convergent Validity")
+
+        # Dimension correlations
+        dim_corrs = validity.get("dimension_correlations", [])
+        if dim_corrs:
+            add("### Dimension Correlations")
             add()
-            headers = ["Dimension A", "Dimension B", "Correlation"]
-            rows = [[p.get("dim_a", ""), p.get("dim_b", ""), f"{p.get('correlation', 0):.2f}"] for p in convergent[:10]]
+            headers = ["Dimension A", "Dimension B", "Pearson r", "Interpretation"]
+            rows = [[p.get("dim_a", ""), p.get("dim_b", ""), f"{p.get('pearson_r', 0):.2f}", p.get("interpretation", "")] for p in dim_corrs[:10]]
             add_table(headers, rows)
     else:
         add("_No construct validity data available._")
@@ -260,19 +274,42 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add()
     reliability = results.get("reliability", {})
     if reliability:
-        icc = reliability.get("icc")
-        if icc is not None:
-            add(f"**ICC (intra-class correlation):** {icc:.3f}")
+        # Variance flags
+        variance_flags = reliability.get("variance_flags", [])
+        high_var = [v for v in variance_flags if v.get("high_variance")]
+        if high_var:
+            add(f"**High-variance cells (CV > 30%):** {len(high_var)} of {len(variance_flags)}")
             add()
-        per_condition_rel = reliability.get("per_condition", [])
-        if per_condition_rel:
-            headers = ["Condition", "CV", "Spread"]
+            headers = ["Scenario", "Condition", "N", "Mean", "CV%"]
             rows = []
-            for c in per_condition_rel:
+            for v in high_var:
                 rows.append([
-                    c.get("condition", ""),
-                    f"{c.get('cv', 0):.2f}",
-                    f"{c.get('spread', 0):.1f}",
+                    v.get("scenario", ""),
+                    v.get("condition", ""),
+                    str(v.get("n", 0)),
+                    f"{v.get('mean', 0):.2f}",
+                    f"{v.get('cv_pct', 0):.1f}",
+                ])
+            add_table(headers, rows)
+        elif variance_flags:
+            add(f"**All {len(variance_flags)} scenario-condition cells have CV <= 30%.**")
+            add()
+
+        # Power analysis
+        power_results = reliability.get("power_analysis", [])
+        if power_results:
+            add("### Power Analysis")
+            add()
+            headers = ["Comparison", "Cohen's d", "N", "Power", "Rec. N", "Underpowered"]
+            rows = []
+            for pr in power_results:
+                rows.append([
+                    pr.get("comparison", ""),
+                    f"{pr.get('cohens_d', 0):+.3f}",
+                    str(pr.get("n_per_group", 0)),
+                    f"{pr.get('observed_power', 0):.3f}",
+                    str(pr.get("recommended_n", "?")),
+                    "Yes" if pr.get("underpowered") else "No",
                 ])
             add_table(headers, rows)
     else:

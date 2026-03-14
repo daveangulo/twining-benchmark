@@ -4,6 +4,12 @@ from tests.conftest import make_scored_result
 from benchmark_analysis.dimensions.coordination_lift import analyze_coordination_lift
 
 
+def test_empty_scores():
+    result = analyze_coordination_lift([])
+    assert result["pairwise_lift"] == []
+    assert result["summary"] == {} or result["summary"].get("overall_lift_significant") is None
+
+
 def test_lift_computed(sample_scores):
     result = analyze_coordination_lift(sample_scores)
     assert "pairwise_lift" in result
@@ -18,6 +24,8 @@ def test_lift_direction(sample_scores):
     for entry in result["pairwise_lift"]:
         if entry["condition"] == "full-twining" and entry["baseline"] == "baseline":
             assert entry["lift_points"] > 0
+            # full-twining base 90 - baseline base 75 = 15 points
+            assert entry["lift_points"] == pytest.approx(15.0, abs=0.1)
 
 
 def test_lift_per_scenario(sample_scores):

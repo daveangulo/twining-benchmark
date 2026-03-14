@@ -1,5 +1,9 @@
 """Cost and token efficiency analysis."""
 from __future__ import annotations
+from collections import defaultdict
+
+import numpy as np
+
 from ..models import ScoredResult
 
 
@@ -12,8 +16,6 @@ def analyze_cost(scores: list[ScoredResult], baseline: str = "baseline") -> dict
       - token_efficiency: tokens per composite point, cache hit ratios
       - per_scenario: cost breakdown by scenario x condition
     """
-    from collections import defaultdict
-    import numpy as np
 
     by_condition = defaultdict(list)
     by_scenario_condition = defaultdict(list)
@@ -48,11 +50,15 @@ def analyze_cost(scores: list[ScoredResult], baseline: str = "baseline") -> dict
             continue
         delta_points = entry["mean_composite"] - baseline_mean_composite
         delta_cost = entry["mean_cost_usd"] - baseline_mean_cost
+        if abs(delta_points) < 1.0:
+            marginal_cost = None
+        else:
+            marginal_cost = round(delta_cost / abs(delta_points), 4)
         vs_baseline.append({
             "condition": entry["condition"],
             "delta_composite": round(delta_points, 2),
             "delta_cost_usd": round(delta_cost, 4),
-            "marginal_cost_per_point_gained": round(delta_cost / max(abs(delta_points), 0.01), 4),
+            "marginal_cost_per_point_gained": marginal_cost,
         })
 
     # Token efficiency

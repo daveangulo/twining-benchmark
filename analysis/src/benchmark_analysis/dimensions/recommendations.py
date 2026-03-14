@@ -93,12 +93,12 @@ def synthesize_recommendations(all_results: dict) -> dict:
 
     # Check behavior-outcome correlations — flag overhead candidates
     behavior = all_results.get("behavior_outcome", {})
-    for np_entry in behavior.get("non_predictive_behaviors", []):
+    for np_entry in behavior.get("uncorrelated_behaviors", []):
         if np_entry.get("behavior_metric") in ("graph_calls", "verification_calls") and np_entry.get("outcome_metric") == "composite":
             items.append({
                 "priority": "medium",
                 "category": "behavior-outcome",
-                "message": f"Overhead candidate: {np_entry['behavior_metric']} has negligible correlation with composite (r={np_entry['pearson_r']:.2f})",
+                "message": f"Overhead candidate: {np_entry['behavior_metric']} has negligible correlation with composite (r={np_entry['spearman_r']:.2f})",
             })
 
     # Check effect decomposition — lite vs full

@@ -9,6 +9,7 @@ from itertools import combinations
 import numpy as np
 from scipy import stats as sp_stats
 from ..models import ScoredResult
+from ..stats import holm_bonferroni
 
 
 def analyze_construct_validity(scores: list[ScoredResult]) -> dict:
@@ -50,12 +51,20 @@ def analyze_construct_validity(scores: list[ScoredResult]) -> dict:
                 "dim_a": d1, "dim_b": d2,
                 "pearson_r": round(float(r), 3),
                 "p_value": round(float(p), 4),
+                "p_value_corrected": None,  # will be set after Holm-Bonferroni
                 "n": len(paired_v1),
                 "interpretation": "redundant" if abs(r) > 0.9 else
                                   "strongly related" if abs(r) > 0.7 else
                                   "moderately related" if abs(r) > 0.4 else
                                   "weakly related" if abs(r) > 0.2 else "independent",
             })
+
+    # Apply Holm-Bonferroni correction to dimension correlations
+    if dimension_correlations:
+        raw_ps = [dc["p_value"] for dc in dimension_correlations]
+        corrected_ps = holm_bonferroni(raw_ps)
+        for dc, cp in zip(dimension_correlations, corrected_ps):
+            dc["p_value_corrected"] = round(cp, 4)
 
     # Internal consistency (test-retest across iterations)
     internal_consistency = []
@@ -81,24 +90,31 @@ def analyze_construct_validity(scores: list[ScoredResult]) -> dict:
         for level, count in sorted(confidence_counts.items())
     }
 
-    # Method agreement: where automated and llm-judge scores exist for same dimension
-    method_comparison = defaultdict(lambda: {"automated": [], "llm-judge": []})
+    # Method agreement: collect PAIRED values where the SAME ScoredResult has
+    # both automated and llm-judge scores for the same dimension.
+    method_paired = defaultdict(lambda: {"automated": [], "llm-judge": []})
     for s in scores:
         for dim_name, dim_score in s.scores.items():
             if dim_score.method in ("automated", "llm-judge"):
-                method_comparison[dim_name][dim_score.method].append(dim_score.value)
+                method_paired[dim_name][dim_score.method].append((id(s), dim_score.value))
 
     method_agreement = []
-    for dim_name, methods in sorted(method_comparison.items()):
-        if methods["automated"] and methods["llm-judge"]:
-            min_n = min(len(methods["automated"]), len(methods["llm-judge"]))
-            if min_n >= 3:
-                r, p = sp_stats.pearsonr(methods["automated"][:min_n], methods["llm-judge"][:min_n])
+    for dim_name in sorted(method_paired.keys()):
+        auto_map = {sid: val for sid, val in method_paired[dim_name]["automated"]}
+        llm_map = {sid: val for sid, val in method_paired[dim_name]["llm-judge"]}
+        # Only keep values where the same ScoredResult has both methods
+        common_ids = set(auto_map.keys()) & set(llm_map.keys())
+        if len(common_ids) >= 3:
+            paired_auto = [auto_map[sid] for sid in sorted(common_ids)]
+            paired_llm = [llm_map[sid] for sid in sorted(common_ids)]
+            if len(set(paired_auto)) > 1 and len(set(paired_llm)) > 1:
+                r, p = sp_stats.pearsonr(paired_auto, paired_llm)
                 method_agreement.append({
                     "dimension": dim_name,
                     "pearson_r": round(float(r), 3),
-                    "automated_mean": round(float(np.mean(methods["automated"])), 1),
-                    "llm_judge_mean": round(float(np.mean(methods["llm-judge"])), 1),
+                    "n_paired": len(common_ids),
+                    "automated_mean": round(float(np.mean(paired_auto)), 1),
+                    "llm_judge_mean": round(float(np.mean(paired_llm)), 1),
                     "agreement": "good" if abs(r) > 0.7 else "moderate" if abs(r) > 0.4 else "poor",
                 })
 

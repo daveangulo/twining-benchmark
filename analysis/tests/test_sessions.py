@@ -3,6 +3,11 @@ from tests.conftest import make_transcript, make_tool_call
 from benchmark_analysis.dimensions.sessions import analyze_sessions
 
 
+def test_empty_transcripts():
+    result = analyze_sessions([])
+    assert result["per_session"] == []
+
+
 def test_per_session_breakdown():
     transcripts = [
         make_transcript(scenario="s1", condition="baseline", task_index=0),

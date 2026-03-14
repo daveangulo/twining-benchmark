@@ -63,31 +63,36 @@ def sample_results():
         },
         "cost": {
             "per_condition": [
-                {"condition": "full-twining", "mean_cost_usd": 2.50, "median_cost_usd": 2.40, "cost_per_composite_point": 0.028},
-                {"condition": "baseline", "mean_cost_usd": 1.50, "median_cost_usd": 1.40, "cost_per_composite_point": 0.020},
+                {"condition": "full-twining", "mean_cost_usd": 2.50, "cost_per_composite_point": 0.028},
+                {"condition": "baseline", "mean_cost_usd": 1.50, "cost_per_composite_point": 0.020},
             ],
         },
         "reliability": {
-            "icc": 0.85,
-            "per_condition": [
-                {"condition": "full-twining", "cv": 0.05, "spread": 4.0},
-                {"condition": "baseline", "cv": 0.08, "spread": 6.0},
+            "variance_flags": [
+                {"scenario": "refactoring-handoff", "condition": "full-twining", "n": 3, "mean": 90.0, "std": 2.0, "cv_pct": 2.2, "high_variance": False},
+                {"scenario": "refactoring-handoff", "condition": "baseline", "n": 3, "mean": 75.0, "std": 5.0, "cv_pct": 6.7, "high_variance": False},
             ],
+            "power_analysis": [
+                {"comparison": "baseline vs full-twining", "cohens_d": 1.5, "n_per_group": 3, "observed_power": 0.65, "recommended_n": 5, "underpowered": True},
+            ],
+            "sample_size_recommendations": [],
         },
         "construct_validity": {
-            "cronbach_alpha": 0.82,
-            "convergent_pairs": [
-                {"dim_a": "completion", "dim_b": "consistency", "correlation": 0.65},
+            "dimension_correlations": [
+                {"dim_a": "completion", "dim_b": "consistency", "pearson_r": 0.65, "p_value": 0.01, "n": 10, "interpretation": "moderately related"},
+            ],
+            "internal_consistency": [
+                {"scenario": "refactoring-handoff", "condition": "full-twining", "dimension": "completion", "n": 3, "mean": 90.0, "std": 2.0, "cv_pct": 2.2, "reliable": True},
             ],
         },
         "behavior_outcome": {
-            "predictive_behaviors": [
-                {"behavior_metric": "twining_pct", "outcome_metric": "composite", "pearson_r": 0.72, "interpretation": "strong"},
+            "correlated_behaviors": [
+                {"behavior_metric": "twining_pct", "outcome_metric": "composite", "spearman_r": 0.72, "interpretation": "strong"},
             ],
         },
         "effect_decomposition": {
-            "mechanisms": [
-                {"mechanism": "context_preservation", "contribution_pct": 45, "evidence": "strong correlation"},
+            "mechanism_attribution": [
+                {"mechanism": "orientation", "associated_difference": 5.2, "caveat": "Descriptive only -- differences are confounded across mechanisms", "heavy_user_conditions": ["full-twining"], "non_user_conditions": ["baseline"], "heavy_user_mean_composite": 90.0, "non_user_mean_composite": 84.8, "avg_calls_per_session": 3.5},
             ],
         },
         "interactions": {

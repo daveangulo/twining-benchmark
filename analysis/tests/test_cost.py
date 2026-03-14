@@ -11,6 +11,10 @@ def test_cost_per_point(sample_scores):
         assert "condition" in entry
         assert "mean_cost_usd" in entry
         assert "cost_per_composite_point" in entry
+    # full-twining and baseline have different composites (and now different costs),
+    # so cost_per_composite_point must differ
+    by_cond = {e["condition"]: e for e in result["per_condition"]}
+    assert by_cond["full-twining"]["cost_per_composite_point"] != by_cond["baseline"]["cost_per_composite_point"]
 
 
 def test_cost_vs_baseline(sample_scores):

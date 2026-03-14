@@ -4,6 +4,11 @@ from tests.conftest import make_transcript, make_tool_call
 from benchmark_analysis.dimensions.learning_curve import analyze_learning_curve
 
 
+def test_empty_transcripts():
+    result = analyze_learning_curve([])
+    assert result["per_scenario"] == []
+
+
 def test_session_order_metrics():
     """Sessions later in sequence should show measurable trend data."""
     transcripts = [
@@ -17,6 +22,9 @@ def test_session_order_metrics():
     msb = [s for s in result["per_scenario"] if s["scenario"] == "multi-session-build"]
     assert len(msb) > 0
     assert "session_trend" in msb[0]
+    # Input has monotonically increasing turns and cost, so trends should be increasing
+    assert msb[0]["trends"]["cost_trend"] == "increasing"
+    assert msb[0]["trends"]["turns_trend"] == "increasing"
 
 
 def test_coordination_value_over_sessions():

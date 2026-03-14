@@ -9,45 +9,44 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any
 
-from benchmark_analysis.models import SessionTranscript, CoordinationArtifacts
+from ..models import SessionTranscript, CoordinationArtifacts
+from ._constants import (
+    PRODUCTIVE_TOOLS,
+    ORIENTATION_OPS,
+    RECORDING_OPS,
+    GRAPH_OPS,
+    normalize_tool_name,
+    is_twining_tool,
+    classify_twining_op,
+    ENGAGEMENT_THRESHOLD,
+    HIGH_OVERHEAD_RATIO,
+)
 
 
 # ---------------------------------------------------------------------------
 # Tool-call classification
 # ---------------------------------------------------------------------------
 
-PRODUCTIVE_TOOLS = frozenset({
-    "Read", "Edit", "Write", "Bash", "Glob", "Grep",
-    # Also include common variants / aliases
-    "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
-    "LS",
-})
-
-# Twining sub-categories (matched against toolName after stripping twining_ prefix)
-GRAPH_BUILDING_OPS = frozenset({"add_entity", "add_relation"})
-ORIENTATION_OPS = frozenset({"assemble", "recent", "query", "status", "search_decisions", "read", "neighbors", "graph_query"})
-RECORDING_OPS = frozenset({"decide", "post", "handoff", "register", "promote", "acknowledge", "verify"})
+# Keep legacy names as module-level aliases so existing tests still import them.
+GRAPH_BUILDING_OPS = GRAPH_OPS
 
 
 def _twining_subcategory(tool_name: str) -> str:
     """Return 'graph_building', 'orientation', 'recording', or 'other'."""
-    # Strip prefixes: twining_ or twining__twining_
-    name = tool_name
-    for prefix in ("mcp__plugin_twining_twining__twining_", "twining__twining_", "twining_"):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-            break
-    if name in GRAPH_BUILDING_OPS:
+    cat = classify_twining_op(tool_name)
+    if cat == "graph_building":
         return "graph_building"
-    if name in ORIENTATION_OPS:
+    if cat == "orientation":
         return "orientation"
-    if name in RECORDING_OPS:
+    if cat in ("recording", "verification"):
         return "recording"
+    if cat is not None:
+        return cat
     return "other"
 
 
 def _is_twining(tool_name: str) -> bool:
-    return "twining" in tool_name.lower()
+    return is_twining_tool(tool_name)
 
 
 def _is_productive(tool_name: str) -> bool:

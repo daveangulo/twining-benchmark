@@ -17,7 +17,7 @@ def test_mechanism_attribution(sample_scores):
     assert "mechanism_attribution" in result
     for entry in result["mechanism_attribution"]:
         assert "mechanism" in entry
-        assert "lift_contribution" in entry
+        assert "associated_difference" in entry
 
 
 def test_tool_utilization(sample_scores):

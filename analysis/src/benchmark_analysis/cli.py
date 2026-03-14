@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 
@@ -166,12 +165,12 @@ def _print_terminal_summary(results: dict):
             print(f"  {row['condition']:<28s} {row['rank']:>4} {row['composite_mean']:>6.1f} "
                   f"{row['lift_vs_baseline']:>+6.1f}{sig} {d_str} ${row['cost_usd']:>6.2f}")
 
-    # Predictive behaviors
-    predictive = results.get("behavior_outcome", {}).get("predictive_behaviors", [])
-    if predictive:
-        print("\n=== PREDICTIVE BEHAVIORS ===")
-        for p in predictive[:5]:
-            print(f"  {p['behavior_metric']:<25s} -> {p['outcome_metric']:<12s} r={p['pearson_r']:+.2f} ({p['interpretation']})")
+    # Correlated behaviors
+    correlated = results.get("behavior_outcome", {}).get("correlated_behaviors", [])
+    if correlated:
+        print("\n=== CORRELATED BEHAVIORS ===")
+        for p in correlated[:5]:
+            print(f"  {p['behavior_metric']:<25s} -> {p['outcome_metric']:<12s} r={p['spearman_r']:+.2f} ({p['interpretation']})")
 
     # Interaction warnings
     disordinal = results.get("interactions", {}).get("disordinal_interactions", [])

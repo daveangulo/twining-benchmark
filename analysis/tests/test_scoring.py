@@ -214,6 +214,14 @@ class TestHighVariance:
             assert info["high_variance"] is False
 
 
+class TestEmptyInput:
+    """Empty input should not crash."""
+
+    def test_empty_scores(self):
+        result = analyze_scoring([])
+        assert result is not None  # should not crash
+
+
 class TestEdgeCases:
     """Edge cases: single score, single condition, single scenario."""
 

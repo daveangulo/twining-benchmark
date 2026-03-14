@@ -5,8 +5,8 @@ from collections import defaultdict
 
 import numpy as np
 
-from benchmark_analysis.models import DimensionAnalysis, ScoredResult
-from benchmark_analysis.stats import bootstrap_ci, condition_summary
+from ..models import DimensionAnalysis, ScoredResult
+from ..stats import bootstrap_ci, condition_summary
 
 
 def analyze_scoring(scores: list[ScoredResult]) -> dict:

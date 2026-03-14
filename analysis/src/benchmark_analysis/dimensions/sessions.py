@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections import defaultdict
 from ..models import SessionTranscript
+from ._constants import PRODUCTIVE_TOOLS, is_twining_tool
 
 
 def analyze_sessions(transcripts: list[SessionTranscript]) -> dict:
@@ -17,8 +18,8 @@ def analyze_sessions(transcripts: list[SessionTranscript]) -> dict:
     by_scenario_condition = defaultdict(list)
 
     for t in transcripts:
-        twining_calls = [tc for tc in t.toolCalls if "twining" in tc.toolName]
-        productive_calls = [tc for tc in t.toolCalls if tc.toolName in {"Read", "Edit", "Write", "Bash", "Glob", "Grep"}]
+        twining_calls = [tc for tc in t.toolCalls if is_twining_tool(tc.toolName)]
+        productive_calls = [tc for tc in t.toolCalls if tc.toolName in PRODUCTIVE_TOOLS]
         entry = {
             "session_id": t.sessionId,
             "scenario": t.scenario,

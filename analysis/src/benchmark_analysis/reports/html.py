@@ -89,39 +89,26 @@ def _build_charts(results: dict) -> str:
 
     # 2. Per-scenario heatmap
     scenario_data = results.get("scenarios", {}).get("per_scenario", {})
-    if scenario_data:
-        # per_scenario may be a dict keyed by scenario name or a list
-        if isinstance(scenario_data, dict):
-            scenario_names = sorted(scenario_data.keys())
-            # Collect all condition names across scenarios
-            condition_set = set()
-            for s_name, s_val in scenario_data.items():
-                if isinstance(s_val, dict):
-                    cond_summaries = s_val.get("condition_summaries", {})
-                    if isinstance(cond_summaries, dict):
-                        condition_set.update(cond_summaries.keys())
-            condition_set = sorted(condition_set)
+    if scenario_data and isinstance(scenario_data, dict):
+        scenario_names = sorted(scenario_data.keys())
+        # Collect all condition names across scenarios
+        condition_set = set()
+        for s_name, s_val in scenario_data.items():
+            if isinstance(s_val, dict):
+                cond_summaries = s_val.get("condition_summaries", {})
+                if isinstance(cond_summaries, dict):
+                    condition_set.update(cond_summaries.keys())
+        condition_set = sorted(condition_set)
 
-            # Build lookup from condition_summaries
-            lookup = {}
-            for s_name, s_val in scenario_data.items():
-                if isinstance(s_val, dict):
-                    cond_summaries = s_val.get("condition_summaries", {})
-                    if isinstance(cond_summaries, dict):
-                        for cond_name, cond_stats in cond_summaries.items():
-                            if isinstance(cond_stats, dict):
-                                lookup[(s_name, cond_name)] = _safe_float(cond_stats.get("mean"))
-        else:
-            scenario_names = sorted(set(s.get("scenario", "") for s in scenario_data if isinstance(s, dict)))
-            condition_set = sorted(set(s.get("condition", "") for s in scenario_data if isinstance(s, dict) and s.get("condition")))
-            if not condition_set:
-                condition_set = [r["condition"] for r in matrix] if matrix else []
-            lookup = {}
-            for s in scenario_data:
-                if isinstance(s, dict):
-                    for cond_entry in s.get("condition_means", []):
-                        key = (s.get("scenario", ""), cond_entry.get("condition", ""))
-                        lookup[key] = _safe_float(cond_entry.get("mean"))
+        # Build lookup from condition_summaries
+        lookup = {}
+        for s_name, s_val in scenario_data.items():
+            if isinstance(s_val, dict):
+                cond_summaries = s_val.get("condition_summaries", {})
+                if isinstance(cond_summaries, dict):
+                    for cond_name, cond_stats in cond_summaries.items():
+                        if isinstance(cond_stats, dict):
+                            lookup[(s_name, cond_name)] = _safe_float(cond_stats.get("mean"))
 
         if scenario_names and condition_set:
             z = []

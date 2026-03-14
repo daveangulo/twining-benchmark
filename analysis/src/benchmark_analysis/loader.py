@@ -77,12 +77,20 @@ def load_sessions(sessions_dir: str | Path) -> list[SessionData]:
 
 
 def load_transcripts(sessions_dir: str | Path) -> list[SessionTranscript]:
-    """Load all transcript.json files from a sessions directory (without artifacts)."""
+    """Load all transcript.json files from a sessions directory (without artifacts).
+
+    Convenience wrapper around :func:`load_sessions` -- prefer ``load_sessions``
+    when you also need coordination artifacts.
+    """
     return [sd.transcript for sd in load_sessions(sessions_dir)]
 
 
 def load_coordination_artifacts(sessions_dir: str | Path) -> list[CoordinationArtifacts]:
-    """Load all coordination-artifacts.json files from a sessions directory."""
+    """Load all coordination-artifacts.json files from a sessions directory.
+
+    Convenience wrapper around :func:`load_sessions` -- prefer ``load_sessions``
+    when you also need transcripts paired with their artifacts.
+    """
     return [sd.artifacts for sd in load_sessions(sessions_dir) if sd.artifacts is not None]
 
 

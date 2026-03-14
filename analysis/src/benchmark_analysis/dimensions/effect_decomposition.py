@@ -7,26 +7,12 @@ from __future__ import annotations
 from collections import defaultdict
 import numpy as np
 from ..models import ScoredResult, SessionTranscript
-
-# Tool categories (same as behavior_outcome, shared constants)
-MECHANISM_CATEGORIES = {
-    "orientation": {"twining_assemble", "twining_recent", "twining_query", "twining_why", "twining_read",
-                    "twining_status", "twining_what_changed"},
-    "recording": {"twining_decide", "twining_post", "twining_link_commit"},
-    "graph_building": {"twining_add_entity", "twining_add_relation", "twining_neighbors", "twining_graph_query",
-                       "twining_prune_graph"},
-    "verification": {"twining_verify"},
-    "coordination_mgmt": {"twining_register", "twining_agents", "twining_discover", "twining_delegate",
-                          "twining_handoff", "twining_acknowledge"},
-    "search_retrieval": {"twining_search_decisions", "twining_trace", "twining_commits"},
-    "lifecycle": {"twining_archive", "twining_export", "twining_summarize"},
-    "decision_mgmt": {"twining_reconsider", "twining_override", "twining_promote", "twining_dismiss"},
-}
-
-# All known twining tools (union of above)
-ALL_TWINING_TOOLS = set()
-for tools in MECHANISM_CATEGORIES.values():
-    ALL_TWINING_TOOLS |= tools
+from ._constants import (
+    MECHANISM_CATEGORIES,
+    ALL_TWINING_OPS,
+    normalize_tool_name,
+    is_twining_tool,
+)
 
 
 def analyze_effect_decomposition(
@@ -49,13 +35,14 @@ def analyze_effect_decomposition(
 
     for t in transcripts:
         tool_names = [tc.toolName for tc in t.toolCalls]
+        short_names = [normalize_tool_name(tn) for tn in tool_names]
         for mechanism, tool_set in MECHANISM_CATEGORIES.items():
-            count = sum(1 for tn in tool_names if tn in tool_set)
+            count = sum(1 for sn in short_names if sn in tool_set)
             mechanism_usage[t.condition][mechanism].append(count)
-        for tn in tool_names:
-            if tn in ALL_TWINING_TOOLS:
-                tool_counts[t.condition][tn] += 1
-                tools_ever_called.add(tn)
+        for sn in short_names:
+            if sn in ALL_TWINING_OPS:
+                tool_counts[t.condition][sn] += 1
+                tools_ever_called.add(sn)
 
     # Compute mean composite per condition
     condition_composites = defaultdict(list)
@@ -88,14 +75,15 @@ def analyze_effect_decomposition(
             "non_user_conditions": non_users,
             "heavy_user_mean_composite": round(heavy_mean, 2),
             "non_user_mean_composite": round(non_mean, 2),
-            "lift_contribution": round(heavy_mean - non_mean, 2),
+            "associated_difference": round(heavy_mean - non_mean, 2),
+            "caveat": "Descriptive only -- differences are confounded across mechanisms",
             "avg_calls_per_session": round(
                 float(np.mean([u for u in usage_by_condition.values() if u > 0])) if any(
                     u > 0 for u in usage_by_condition.values()) else 0, 1),
         })
 
     # Tool utilization
-    never_called = sorted(ALL_TWINING_TOOLS - tools_ever_called)
+    never_called = sorted(ALL_TWINING_OPS - tools_ever_called)
     per_tool = []
     for condition, counts in sorted(tool_counts.items()):
         for tool, count in sorted(counts.items(), key=lambda x: -x[1]):
@@ -114,13 +102,13 @@ def analyze_effect_decomposition(
             "delta": round(condition_means["full-twining"] - condition_means["twining-lite"], 2),
             "full_only_tools": sorted(full_only_tools),
             "shared_tools": sorted(full_tools_used & lite_tools_used),
-            "conclusion": "full adds value" if condition_means["full-twining"] > condition_means["twining-lite"] + 2
-                          else "lite sufficient" if condition_means["twining-lite"] >= condition_means["full-twining"] - 2
-                          else "marginal difference",
+            "conclusion": "full-twining scored higher" if condition_means["full-twining"] > condition_means["twining-lite"] + 2
+                          else "twining-lite scored comparably" if condition_means["twining-lite"] >= condition_means["full-twining"] - 2
+                          else "marginal difference observed",
         }
 
     return {
-        "mechanism_attribution": sorted(mechanism_attribution, key=lambda x: -abs(x["lift_contribution"])),
+        "mechanism_attribution": sorted(mechanism_attribution, key=lambda x: -abs(x["associated_difference"])),
         "tool_utilization": {
             "tools_ever_called": sorted(tools_ever_called),
             "never_called": never_called,

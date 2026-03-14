@@ -1,4 +1,5 @@
 """Shared test fixtures for benchmark analysis tests."""
+import itertools
 import pytest
 from benchmark_analysis.models import (
     ScoredResult, DimensionScore, RunMetrics, GitChurn,
@@ -6,6 +7,8 @@ from benchmark_analysis.models import (
     TurnUsage, CoordinationArtifacts,
     RunMetadata, EnvironmentInfo, RunConfig,
 )
+
+_session_counter = itertools.count(1)
 
 
 def make_score(value: float = 75.0, confidence: str = "medium") -> DimensionScore:
@@ -17,7 +20,7 @@ def make_score(value: float = 75.0, confidence: str = "medium") -> DimensionScor
 
 def make_metrics(**overrides) -> RunMetrics:
     defaults = dict(
-        agentSessions=2, totalTokens=1000000, inputTokens=50,
+        agentSessions=2, inputTokens=50,
         outputTokens=20000, cacheReadTokens=900000, cacheCreationTokens=50000,
         costUsd=1.50, wallTimeMs=300000, numTurns=40,
         compactionCount=0, contextUtilization=0.0,
@@ -25,6 +28,12 @@ def make_metrics(**overrides) -> RunMetrics:
         testsPass=95, testsFail=0, compiles=True,
     )
     defaults.update(overrides)
+    # Compute totalTokens from components if not explicitly overridden
+    if "totalTokens" not in overrides:
+        defaults["totalTokens"] = (
+            defaults["inputTokens"] + defaults["outputTokens"]
+            + defaults["cacheReadTokens"] + defaults["cacheCreationTokens"]
+        )
     return RunMetrics(**defaults)
 
 
@@ -66,7 +75,7 @@ def make_transcript(
     duration_ms: int = 300000,
 ) -> SessionTranscript:
     return SessionTranscript(
-        sessionId="test-session", runId="test-run",
+        sessionId=f"test-session-{next(_session_counter)}", runId="test-run",
         scenario=scenario, condition=condition,
         taskIndex=task_index, toolCalls=tool_calls or [],
         fileChanges=[], numTurns=num_turns,
@@ -88,22 +97,23 @@ def sample_scores() -> list[ScoredResult]:
     """A minimal dataset: 2 scenarios x 8 conditions x 3 iterations = 48 results."""
     results = []
     condition_bases = {
-        "baseline": 75,
-        "claude-md-only": 78,
-        "shared-markdown": 80,
-        "file-reload-generic": 82,
-        "file-reload-structured": 85,
-        "persistent-history": 83,
-        "twining-lite": 88,
-        "full-twining": 90,
+        "baseline": (75, 1.00),
+        "claude-md-only": (78, 1.10),
+        "shared-markdown": (80, 1.30),
+        "file-reload-generic": (82, 1.50),
+        "file-reload-structured": (85, 1.70),
+        "persistent-history": (83, 1.60),
+        "twining-lite": (88, 2.00),
+        "full-twining": (90, 2.50),
     }
     for scenario in ["refactoring-handoff", "architecture-cascade"]:
-        for condition, base in condition_bases.items():
+        for condition, (base, cost) in condition_bases.items():
             for i in range(3):
                 noise = (i - 1) * 3  # -3, 0, +3
                 results.append(make_scored_result(
                     scenario=scenario, condition=condition,
                     iteration=i, composite=base + noise,
+                    costUsd=cost,
                 ))
     return results
 

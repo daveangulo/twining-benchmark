@@ -2,8 +2,10 @@
 from __future__ import annotations
 from itertools import combinations
 
-from benchmark_analysis.models import ScoredResult, EffectSize, ConditionSummary, DimensionAnalysis
-from benchmark_analysis.stats import (
+import numpy as np
+
+from ..models import ScoredResult, EffectSize, ConditionSummary, DimensionAnalysis
+from ..stats import (
     cohens_d,
     interpret_cohens_d,
     bootstrap_ci,
@@ -88,14 +90,20 @@ def analyze_conditions(
         raw_p = raw_p_values[i]
         corr_p = corrected_p_values[i]
 
-        # Bootstrap CI for the mean difference (delta)
-        import numpy as np
         mean_a = float(np.mean(vals_a))
         mean_b = float(np.mean(vals_b))
         delta = mean_b - mean_a
 
-        # Bootstrap CI of means for condition A (stored on the effect object for convenience)
-        ci_a = bootstrap_ci(vals_a)
+        # Bootstrap CI of the mean DIFFERENCE (delta = mean_b - mean_a)
+        n_boot = 10000
+        rng = np.random.default_rng(42)
+        arr_a = np.array(vals_a, dtype=float)
+        arr_b = np.array(vals_b, dtype=float)
+        idx_a = rng.integers(0, len(arr_a), size=(n_boot, len(arr_a)))
+        idx_b = rng.integers(0, len(arr_b), size=(n_boot, len(arr_b)))
+        boot_deltas = arr_b[idx_b].mean(axis=1) - arr_a[idx_a].mean(axis=1)
+        ci_delta = (float(np.percentile(boot_deltas, 2.5)),
+                    float(np.percentile(boot_deltas, 97.5)))
 
         effect_sizes.append(EffectSize(
             condition_a=a,
@@ -109,8 +117,8 @@ def analyze_conditions(
             mean_a=mean_a,
             mean_b=mean_b,
             delta=delta,
-            ci_lower=ci_a[0],
-            ci_upper=ci_a[1],
+            ci_lower=ci_delta[0],
+            ci_upper=ci_delta[1],
         ))
 
     # ── 5. ROPE tests + power for each pair ──────────────────────────────────

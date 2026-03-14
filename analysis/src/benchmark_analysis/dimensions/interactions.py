@@ -77,10 +77,10 @@ def analyze_interactions(
         baseline_mean = pair_means.get((scenario, baseline))
         if baseline_mean is None:
             continue
-        best_lift = 0.0
-        best_condition = baseline
-        worst_lift = 0.0
-        worst_condition = baseline
+        best_lift = -float('inf')
+        best_condition = None
+        worst_lift = float('inf')
+        worst_condition = None
         for condition in conditions:
             if condition == baseline:
                 continue

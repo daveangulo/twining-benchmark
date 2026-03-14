@@ -118,8 +118,11 @@ def analyze_learning_curve(transcripts: list[SessionTranscript]) -> dict:
 
 def _compute_trend(x: list, y: list) -> dict:
     """Compute linear trend (slope + direction)."""
-    if len(x) < 2 or len(set(y)) < 2:
-        return {"slope": 0.0, "direction": "flat", "r_squared": 0.0}
+    _flat = {"slope": 0.0, "direction": "flat", "r_squared": 0.0}
+    if len(x) < 4:
+        return _flat
+    if len(set(x)) < 2 or len(set(y)) < 2:
+        return _flat
     slope, intercept, r, p, se = sp_stats.linregress(x, y)
     direction = "increasing" if slope > 0 and p < 0.1 else "decreasing" if slope < 0 and p < 0.1 else "flat"
     return {"slope": float(slope), "direction": direction, "r_squared": round(float(r ** 2), 3)}

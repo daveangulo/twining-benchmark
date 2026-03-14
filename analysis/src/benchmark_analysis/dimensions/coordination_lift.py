@@ -9,15 +9,7 @@ import numpy as np
 from ..models import ScoredResult
 from ..stats import cohens_d, interpret_cohens_d, bootstrap_ci, welch_t_test, holm_bonferroni
 
-# Conditions that use explicit inter-agent coordination mechanisms.
-# claude-md-only provides project conventions but no inter-agent state sharing.
-# persistent-history shares conversation context implicitly (no coordination tools/files).
-COORDINATED_CONDITIONS = {
-    "full-twining", "twining-lite",
-    "file-reload-structured", "file-reload-generic",
-    "shared-markdown", "persistent-history",
-}
-UNCOORDINATED_CONDITIONS = {"baseline", "claude-md-only"}
+from ._constants import COORDINATED_CONDITIONS, UNCOORDINATED_CONDITIONS
 
 
 def analyze_coordination_lift(
@@ -64,6 +56,7 @@ def analyze_coordination_lift(
             "cohens_d": round(d, 3) if not np.isnan(d) else None,
             "interpretation": interpret_cohens_d(d) if not np.isnan(d) else "insufficient data",
             "p_value": round(p, 4),
+            "n": len(values),
             "condition_ci": [round(cond_ci[0], 2), round(cond_ci[1], 2)],
         })
 
@@ -81,8 +74,8 @@ def analyze_coordination_lift(
         baseline_scenario = [s.composite for s in by_scenario_condition.get((scenario, baseline), [])]
         if not baseline_scenario:
             continue
-        best_condition = baseline
-        best_lift = 0.0
+        best_condition = None
+        best_lift = -float('inf')
         for condition in by_condition:
             if condition == baseline:
                 continue
@@ -112,8 +105,8 @@ def analyze_coordination_lift(
         bl_vals = by_cond.get(baseline, [])
         if not bl_vals:
             continue
-        best_lift = 0.0
-        best_cond = baseline
+        best_lift = -float('inf')
+        best_cond = None
         for cond, vals in by_cond.items():
             if cond == baseline:
                 continue

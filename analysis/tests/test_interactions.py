@@ -4,6 +4,11 @@ from tests.conftest import make_scored_result
 from benchmark_analysis.dimensions.interactions import analyze_interactions
 
 
+def test_empty_scores():
+    result = analyze_interactions([])
+    assert result["matrix"] == []
+
+
 def test_interaction_matrix(sample_scores):
     result = analyze_interactions(sample_scores)
     assert "matrix" in result

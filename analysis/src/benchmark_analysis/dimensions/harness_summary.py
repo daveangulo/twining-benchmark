@@ -65,7 +65,10 @@ def generate_harness_summary(all_results: dict) -> dict:
     headline = ""
     if matrix:
         top = matrix[0]
-        if top["lift_significant"]:
+        if top["condition"] == "baseline":
+            headline = (f"Baseline ranks #1 with {top['composite_mean']:.1f} composite "
+                       f"— no coordination condition outperforms it")
+        elif top["lift_significant"]:
             headline = (f"{top['condition']} ranks #1 with {top['composite_mean']:.1f} composite "
                        f"(+{top['lift_vs_baseline']:.1f} vs baseline, {top['effect_size']} effect, p<0.05)")
         else:
