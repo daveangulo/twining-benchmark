@@ -464,10 +464,13 @@ export class BugInvestigationScenario extends BaseScenario {
   /**
    * Score resolution: Did Agent B fix the bug and add a regression test?
    *
-   * Checks:
-   * - Bug file was modified
-   * - Fix matches expected patterns
-   * - Test file was added/modified
+   * Partial-credit gradient:
+   * -  0: No investigation of bug file, no changes
+   * - 15: Investigated the correct file (Read/Grep in toolCalls) but didn't modify it
+   * - 30: Modified the correct file but fix doesn't match expected pattern
+   * - 50: Fixed the bug (pattern match) but no regression test
+   * - 70: Fixed + regression test but anti-pattern remains
+   * - 85: Fixed + regression test + no anti-patterns
    */
   private scoreResolution(
     rawResults: RawResults,
@@ -484,7 +487,6 @@ export class BugInvestigationScenario extends BaseScenario {
       };
     }
 
-    let score = 0;
     const details: string[] = [];
 
     const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
@@ -501,50 +503,74 @@ export class BugInvestigationScenario extends BaseScenario {
       };
     }
 
-    // Check: Was the bug file modified?
     const bugFix = groundTruth.decisions.find((d) => d.id === 'pagination-bug-fix');
-    if (bugFix) {
-      const fixedBugFile = bugFix.affectedFiles.some((f) =>
-        bFiles.some((bf) => bf.includes(f) || f.includes(bf)),
-      );
-      if (fixedBugFile) {
-        score += 30;
-        details.push('Agent B modified the bug file.');
-      } else {
-        details.push('Agent B did NOT modify the expected bug file.');
-      }
-
-      // Check: Does the fix match expected patterns?
-      const hasFixPattern = bugFix.expectedPatterns.some((p) => new RegExp(p).test(bDiffs));
-      if (hasFixPattern) {
-        score += 30;
-        details.push('Fix matches expected pattern.');
-      }
-
-      // Check: No anti-patterns in fix
-      const hasAntiPattern = bugFix.antiPatterns.some((p) => new RegExp(p).test(bDiffs));
-      if (hasAntiPattern) {
-        score -= 20;
-        details.push('Fix still contains the anti-pattern (likely incomplete fix).');
-      }
-    }
-
-    // Check: Was a regression test added?
     const regressionDecision = groundTruth.decisions.find((d) => d.id === 'regression-test');
-    if (regressionDecision) {
-      const hasTestFile = bFiles.some(
-        (f) => /test|spec/i.test(f),
+
+    // --- Step 1: Did B investigate the bug file (Read/Grep tool calls)? ---
+    const bugAffectedFiles = bugFix?.affectedFiles ?? [];
+    const bInvestigatedBugFile = transcriptB.toolCalls.some((tc) => {
+      if (tc.toolName !== 'Read' && tc.toolName !== 'Grep') return false;
+      const fp = (tc.parameters['file_path'] ?? tc.parameters['path'] ?? '') as string;
+      const pattern = (tc.parameters['pattern'] ?? '') as string;
+      // Match against affected file paths
+      return bugAffectedFiles.some(
+        (af) => fp.includes(af) || af.includes(fp) || pattern.includes(af),
       );
-      if (hasTestFile) {
-        score += 40;
-        details.push('Regression test file added/modified.');
-      } else {
-        details.push('No regression test file detected.');
-      }
+    });
+
+    // --- Step 2: Did B modify the bug file? ---
+    const bModifiedBugFile = bugFix
+      ? bugFix.affectedFiles.some((f) =>
+          bFiles.some((bf) => bf.includes(f) || f.includes(bf)),
+        )
+      : false;
+
+    // --- Step 3: Does the fix match the expected patterns? ---
+    const hasFixPattern = bugFix
+      ? bugFix.expectedPatterns.some((p) => new RegExp(p).test(bDiffs))
+      : false;
+
+    // --- Step 4: Does the fix contain anti-patterns? ---
+    const hasAntiPattern = bugFix
+      ? bugFix.antiPatterns.some((p) => new RegExp(p).test(bDiffs))
+      : false;
+
+    // --- Step 5: Was a regression test added? ---
+    const hasTestFile = regressionDecision
+      ? bFiles.some((f) => /test|spec/i.test(f))
+      : false;
+
+    // --- Apply gradient scoring ---
+    let score: number;
+
+    if (!bInvestigatedBugFile && !bModifiedBugFile) {
+      // 0: No investigation, no changes
+      score = 0;
+      details.push('Agent B did not investigate or modify the bug file.');
+    } else if (!bModifiedBugFile) {
+      // 15: Investigated but did not modify
+      score = 15;
+      details.push('Agent B investigated the bug file but did not modify it.');
+    } else if (!hasFixPattern) {
+      // 30: Modified bug file but fix pattern not matched
+      score = 30;
+      details.push('Agent B modified the bug file but the fix does not match the expected pattern.');
+    } else if (!hasTestFile) {
+      // 50: Fixed the bug but no regression test
+      score = 50;
+      details.push('Agent B fixed the bug but no regression test was added.');
+    } else if (hasAntiPattern) {
+      // 70: Fixed + test but anti-pattern remains
+      score = 70;
+      details.push('Agent B fixed the bug and added a regression test, but anti-pattern remains.');
+    } else {
+      // 85: Fixed + test + no anti-patterns
+      score = 85;
+      details.push('Agent B fixed the bug, added a regression test, and has no anti-patterns.');
     }
 
     return {
-      value: Math.max(0, Math.min(100, score)),
+      value: score,
       confidence: bDiffs.length > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),

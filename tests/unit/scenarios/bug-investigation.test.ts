@@ -380,6 +380,72 @@ describe('BugInvestigationScenario', () => {
       expect(scored.scores.resolution.value).toBe(0);
     });
 
+    it('scores 15 when B investigates the bug file but does not modify it', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0, exitReason: 'timeout' }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/services/search.service.ts' },
+                timestamp: '2026-02-20T10:05:00Z',
+                durationMs: 100,
+              },
+            ],
+            fileChanges: [],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      expect(scored.scores.resolution.value).toBe(15);
+    });
+
+    it('scores 50 when B fixes the bug but adds no regression test', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0, exitReason: 'timeout' }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'src/services/search.service.ts' },
+                timestamp: '2026-02-20T10:05:00Z',
+                durationMs: 100,
+              },
+            ],
+            fileChanges: [
+              {
+                path: 'src/services/search.service.ts',
+                changeType: 'modified',
+                linesAdded: 2,
+                linesRemoved: 2,
+                diff: '-const offset = (page - 1) * pageSize - 1;\n+const offset = (page - 1) * pageSize;',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      expect(scored.scores.resolution.value).toBe(50);
+    });
+
     it('scores time-to-resolution based on B duration', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
