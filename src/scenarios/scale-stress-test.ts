@@ -432,13 +432,22 @@ export class ScaleStressTestScenario extends BaseScenario {
   }
 
   /**
-   * Score orientation overhead: What fraction of tokens is spent on
+   * Score orientation overhead: What fraction of tool calls is spent on
    * reading/orientation vs. productive work?
    *
-   * Orientation = tool calls to Read, Grep, Glob, search tools.
+   * Orientation = tool calls to Read, Grep, Glob, search tools, twining reads.
    * Production = tool calls to Edit, Write, Bash (build/test).
    *
-   * 100 = low overhead (< 10%), 0 = high overhead (> 40%).
+   * Some orientation is expected and healthy (the "sweet spot" is 20-40%).
+   * Too little means the agent is editing blind; too much means excessive overhead.
+   *
+   * Scoring curve (bell-shaped around the sweet spot):
+   *   20-40% overhead  = 100 (sweet spot)
+   *   10-20% overhead  = 50-100 (too little orientation)
+   *   40-60% overhead  = 60-100 (slightly high but acceptable)
+   *   60-80% overhead  = 20-60 (too much reading)
+   *   < 10% overhead   = 30 (editing blind)
+   *   > 80% overhead   = 0 (almost no productive work)
    */
   private scoreOrientationOverhead(rawResults: RawResults): DimensionScore {
     let orientationCalls = 0;
@@ -489,97 +498,213 @@ export class ScaleStressTestScenario extends BaseScenario {
 
     const overheadRatio = orientationCalls / totalCalls;
 
-    // Score mapping: <10% overhead = 100, 10-20% = 80-60, 20-40% = 60-20, >40% = 0
+    // Bell-curve scoring around the sweet spot of 20-40% orientation overhead.
+    // Real agents typically spend 40-70% of calls on orientation, so the old
+    // curve (which scored 0 at >40%) was degenerate.
     let score: number;
-    if (overheadRatio <= 0.10) {
-      score = 100;
-    } else if (overheadRatio <= 0.20) {
-      score = Math.round(100 - ((overheadRatio - 0.10) / 0.10) * 40);
+    if (overheadRatio < 0.10) {
+      // Too little orientation — editing blind
+      score = 30;
+    } else if (overheadRatio < 0.20) {
+      // Ramping up toward sweet spot
+      score = Math.round(30 + ((overheadRatio - 0.10) / 0.10) * 70);
     } else if (overheadRatio <= 0.40) {
-      score = Math.round(60 - ((overheadRatio - 0.20) / 0.20) * 60);
+      // Sweet spot: good balance of reading and writing
+      score = 100;
+    } else if (overheadRatio <= 0.60) {
+      // Slightly high but acceptable
+      score = Math.round(100 - ((overheadRatio - 0.40) / 0.20) * 40);
+    } else if (overheadRatio <= 0.80) {
+      // Too much reading, not enough productive work
+      score = Math.round(60 - ((overheadRatio - 0.60) / 0.20) * 40);
     } else {
-      score = 0;
+      // Almost no productive work
+      score = Math.round(20 - ((overheadRatio - 0.80) / 0.20) * 20);
     }
+
+    score = Math.max(0, Math.min(100, score));
 
     return {
       value: score,
       confidence: totalCalls >= 10 ? 'medium' : 'low',
       method: 'automated',
       justification:
-        `Orientation: ${orientationCalls}/${totalCalls} tool calls (${(overheadRatio * 100).toFixed(1)}%). Production: ${productionCalls} calls. Scale factor: ${this.scaleConfig.scaleFactor}.`,
+        `Orientation: ${orientationCalls}/${totalCalls} tool calls (${(overheadRatio * 100).toFixed(1)}%). Production: ${productionCalls} calls. Sweet spot: 20-40%. Scale factor: ${this.scaleConfig.scaleFactor}.`,
     };
   }
 
   /**
-   * Score integration success: Did the final session's integration tests pass?
+   * Score integration success: Did agents successfully integrate their work at scale?
    *
-   * Since we can't run tests directly, we proxy by checking:
-   * - Final session completed
-   * - Final session added test files
-   * - No errors reported
+   * Measures integration quality through multiple gradient signals:
+   * - Cross-component file references (do later sessions reference earlier files?)
+   * - Integration test coverage depth (not just existence, but breadth)
+   * - Test execution and pass signals from Bash output
+   * - Session completion rate (graduated, not binary threshold)
+   * - Component connectivity (do components import/reference each other?)
    */
   private scoreIntegrationSuccess(rawResults: RawResults): DimensionScore {
-    const lastTranscript = rawResults.transcripts[rawResults.transcripts.length - 1];
+    const transcripts = rawResults.transcripts;
 
-    if (!lastTranscript) {
+    if (transcripts.length === 0) {
       return {
         value: 0,
         confidence: 'high',
         method: 'automated',
-        justification: 'Final session did not produce a transcript.',
+        justification: 'No transcripts available.',
       };
     }
 
-    let score = 0;
+    const lastTranscript = transcripts[transcripts.length - 1];
     const details: string[] = [];
+    let score = 0;
 
-    // Check: Did the final session complete?
+    // --- Dimension 1: Session completion rate (0-15 points, graduated) ---
+    const completedSessions = transcripts.filter(
+      (t) => t.exitReason === 'completed',
+    ).length;
+    const completionRate = completedSessions / transcripts.length;
+    const completionPoints = Math.round(completionRate * 15);
+    score += completionPoints;
+    details.push(`Completion: ${completedSessions}/${transcripts.length} sessions (${completionPoints}/15 pts).`);
+
+    // --- Dimension 2: Final session quality (0-20 points) ---
+    let finalSessionPoints = 0;
     if (lastTranscript.exitReason === 'completed') {
-      score += 30;
-      details.push('Final session completed.');
-    } else {
-      details.push(`Final session ended with: ${lastTranscript.exitReason}.`);
+      finalSessionPoints += 5;
     }
-
-    // Check: Did the final session produce test files?
     const testFiles = lastTranscript.fileChanges.filter(
       (fc) => /test|spec|integration/i.test(fc.path),
     );
-    if (testFiles.length > 0) {
-      score += 30;
-      details.push(`${testFiles.length} test file(s) produced by final session.`);
-    } else {
-      details.push('No test files from final session.');
+    // Graduated: 1 test file = 3pts, 2 = 5pts, 3+ = 8pts
+    if (testFiles.length >= 3) {
+      finalSessionPoints += 8;
+    } else if (testFiles.length === 2) {
+      finalSessionPoints += 5;
+    } else if (testFiles.length === 1) {
+      finalSessionPoints += 3;
     }
-
-    // Check: Was there a Bash call to run tests?
-    const ranTests = lastTranscript.toolCalls.some(
+    // Test execution with pass/fail signal
+    const testBashCalls = lastTranscript.toolCalls.filter(
       (tc) =>
         tc.toolName === 'Bash' &&
         /(?:test|jest|vitest|mocha|npm\s+test|npx\s+.*test)/i.test(
           JSON.stringify(tc.parameters),
         ),
     );
-    if (ranTests) {
-      score += 20;
-      details.push('Tests were executed in the final session.');
+    if (testBashCalls.length > 0) {
+      finalSessionPoints += 4;
+      // Bonus: multiple test runs suggest iteration on failures
+      if (testBashCalls.length >= 3) {
+        finalSessionPoints += 3;
+      }
     }
+    score += finalSessionPoints;
+    details.push(`Final session: ${testFiles.length} test file(s), ${testBashCalls.length} test run(s) (${finalSessionPoints}/20 pts).`);
 
-    // Check: Overall completion rate
-    const completedSessions = rawResults.transcripts.filter(
-      (t) => t.exitReason === 'completed',
-    ).length;
-    const completionRate = completedSessions / rawResults.transcripts.length;
-    if (completionRate >= 0.8) {
-      score += 20;
-      details.push(`${completedSessions}/${rawResults.transcripts.length} sessions completed (${(completionRate * 100).toFixed(0)}%).`);
-    } else {
-      details.push(`Only ${completedSessions}/${rawResults.transcripts.length} sessions completed.`);
+    // --- Dimension 3: Cross-session file integration (0-30 points) ---
+    // Do later sessions touch files created by earlier sessions?
+    const filesBySession: Map<number, Set<string>> = new Map();
+    for (let i = 0; i < transcripts.length; i++) {
+      filesBySession.set(i, new Set(transcripts[i].fileChanges.map((fc) => fc.path)));
     }
+    let crossSessionTouches = 0;
+    let totalLateFiles = 0;
+    const midpoint = Math.floor(transcripts.length / 2);
+    const earlyFiles = new Set<string>();
+    for (let i = 0; i < midpoint; i++) {
+      for (const fc of transcripts[i].fileChanges) {
+        earlyFiles.add(fc.path);
+      }
+    }
+    for (let i = midpoint; i < transcripts.length; i++) {
+      for (const fc of transcripts[i].fileChanges) {
+        totalLateFiles++;
+        if (earlyFiles.has(fc.path)) {
+          crossSessionTouches++;
+        }
+      }
+    }
+    // Also check: do late sessions read early files? (via Read tool calls)
+    let crossSessionReads = 0;
+    for (let i = midpoint; i < transcripts.length; i++) {
+      for (const tc of transcripts[i].toolCalls) {
+        if (tc.toolName === 'Read' && tc.parameters) {
+          const filePath = String(tc.parameters.file_path || tc.parameters.path || '');
+          if (earlyFiles.has(filePath)) {
+            crossSessionReads++;
+          }
+        }
+      }
+    }
+    const crossSessionRatio = totalLateFiles > 0
+      ? Math.min(1, (crossSessionTouches + crossSessionReads * 0.5) / Math.max(totalLateFiles, 1))
+      : 0;
+    const crossSessionPoints = Math.round(crossSessionRatio * 30);
+    score += crossSessionPoints;
+    details.push(`Cross-session integration: ${crossSessionTouches} file overlaps, ${crossSessionReads} cross-reads (${crossSessionPoints}/30 pts).`);
+
+    // --- Dimension 4: Component connectivity via imports (0-20 points) ---
+    // Check diffs for import statements referencing other components
+    const allDiffs = transcripts
+      .flatMap((t) => t.fileChanges.map((fc) => fc.diff))
+      .filter((d): d is string => d !== undefined)
+      .join('\n');
+    const importMatches = allDiffs.match(/import\s+.*from\s+['"]\..*['"]/g) || [];
+    const crossComponentImports = importMatches.filter(
+      (imp) => /component|service|shared|common|registry/i.test(imp),
+    );
+    // Graduated: 0 cross-imports = 0, 1-2 = 8, 3-5 = 14, 6+ = 20
+    let connectivityPoints: number;
+    if (crossComponentImports.length >= 6) {
+      connectivityPoints = 20;
+    } else if (crossComponentImports.length >= 3) {
+      connectivityPoints = 14;
+    } else if (crossComponentImports.length >= 1) {
+      connectivityPoints = 8;
+    } else if (importMatches.length >= 3) {
+      // Some imports exist but not cross-component
+      connectivityPoints = 4;
+    } else {
+      connectivityPoints = 0;
+    }
+    score += connectivityPoints;
+    details.push(`Component connectivity: ${crossComponentImports.length} cross-component imports, ${importMatches.length} total (${connectivityPoints}/20 pts).`);
+
+    // --- Dimension 5: Integration test depth (0-15 points) ---
+    // Check if integration tests reference multiple components
+    const integrationTestDiffs = transcripts
+      .flatMap((t) => t.fileChanges
+        .filter((fc) => /integration|e2e/i.test(fc.path))
+        .map((fc) => fc.diff),
+      )
+      .filter((d): d is string => d !== undefined)
+      .join('\n');
+    const componentRefs = new Set<string>();
+    const componentRefMatches = integrationTestDiffs.match(/[Cc]omponent[-_]?\d+|[Ss]ervice[-_]?\d+/g) || [];
+    for (const ref of componentRefMatches) {
+      componentRefs.add(ref.toLowerCase().replace(/[-_]/g, ''));
+    }
+    // Also count describe/it/test blocks as a depth signal
+    const testBlockCount = (integrationTestDiffs.match(/(?:describe|it|test)\s*\(/g) || []).length;
+    let depthPoints: number;
+    if (componentRefs.size >= 3 && testBlockCount >= 5) {
+      depthPoints = 15;
+    } else if (componentRefs.size >= 2 && testBlockCount >= 3) {
+      depthPoints = 10;
+    } else if (componentRefs.size >= 1 || testBlockCount >= 2) {
+      depthPoints = 5;
+    } else if (testBlockCount >= 1) {
+      depthPoints = 2;
+    } else {
+      depthPoints = 0;
+    }
+    score += depthPoints;
+    details.push(`Integration depth: ${componentRefs.size} component refs, ${testBlockCount} test blocks (${depthPoints}/15 pts).`);
 
     return {
       value: Math.min(100, score),
-      confidence: 'medium',
+      confidence: transcripts.length >= 4 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
     };

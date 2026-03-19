@@ -216,17 +216,17 @@ describe('ScaleStressTestScenario', () => {
       expect(scored.scores.coherenceDegradation.value).toBeGreaterThanOrEqual(50);
     });
 
-    it('measures orientation overhead from tool calls', async () => {
+    it('scores sweet-spot overhead when orientation ratio is 20-40%', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const transcripts = Array.from({ length: 4 }, (_, i) =>
         makeTranscript({
           taskIndex: i,
           toolCalls: [
-            // Orientation calls
+            // 2 orientation calls out of 5 total = 40% (sweet spot)
             { toolName: 'Read', parameters: { file_path: 'README.md' }, timestamp: '', durationMs: 100 },
             { toolName: 'Grep', parameters: { pattern: 'component' }, timestamp: '', durationMs: 100 },
-            // Production calls
+            // 3 production calls
             { toolName: 'Write', parameters: { file_path: `src/component-${i}.ts` }, timestamp: '', durationMs: 100 },
             { toolName: 'Edit', parameters: { file_path: `src/component-${i}.ts` }, timestamp: '', durationMs: 100 },
             { toolName: 'Bash', parameters: { command: 'npm test' }, timestamp: '', durationMs: 100 },
@@ -243,12 +243,42 @@ describe('ScaleStressTestScenario', () => {
 
       const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
 
-      // 8 orientation calls out of 20 total = 40% overhead
-      // Score should be 0 at 40%
-      expect(scored.scores.orientationOverhead.value).toBeLessThanOrEqual(20);
+      // 8 orientation calls out of 20 total = 40% overhead = sweet spot = 100
+      expect(scored.scores.orientationOverhead.value).toBe(100);
     });
 
-    it('scores high overhead when mostly reading', async () => {
+    it('scores moderate when overhead ratio is 50-60%', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const transcripts = Array.from({ length: 4 }, (_, i) =>
+        makeTranscript({
+          taskIndex: i,
+          toolCalls: [
+            // 3 orientation calls out of 5 total = 60% (slightly high)
+            { toolName: 'Read', parameters: { file_path: 'a.ts' }, timestamp: '', durationMs: 100 },
+            { toolName: 'Read', parameters: { file_path: 'b.ts' }, timestamp: '', durationMs: 100 },
+            { toolName: 'Grep', parameters: { pattern: 'x' }, timestamp: '', durationMs: 100 },
+            // 2 production calls
+            { toolName: 'Write', parameters: { file_path: `src/c-${i}.ts` }, timestamp: '', durationMs: 100 },
+            { toolName: 'Edit', parameters: { file_path: `src/c-${i}.ts` }, timestamp: '', durationMs: 100 },
+          ],
+        }),
+      );
+
+      const rawResults: RawResults = {
+        transcripts,
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
+
+      // 12/20 = 60% overhead -> score = 60
+      expect(scored.scores.orientationOverhead.value).toBe(60);
+    });
+
+    it('scores low when almost all orientation (>80%)', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const transcripts = Array.from({ length: 4 }, (_, i) =>
@@ -273,27 +303,24 @@ describe('ScaleStressTestScenario', () => {
 
       const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
 
-      // 100% orientation overhead = score 0
+      // 100% orientation overhead -> score 0
       expect(scored.scores.orientationOverhead.value).toBe(0);
     });
 
-    it('scores integration success based on final session', async () => {
+    it('scores low when almost no orientation (<10%)', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
-      const transcripts = [
-        ...Array.from({ length: 3 }, (_, i) =>
-          makeTranscript({ taskIndex: i }),
-        ),
+      const transcripts = Array.from({ length: 4 }, (_, i) =>
         makeTranscript({
-          taskIndex: 3,
-          fileChanges: [
-            { path: 'tests/integration/all.test.ts', changeType: 'added', linesAdded: 30, linesRemoved: 0 },
-          ],
+          taskIndex: i,
           toolCalls: [
-            { toolName: 'Bash', parameters: { command: 'npx vitest' }, timestamp: '', durationMs: 5000 },
+            // 10 production calls, 0 orientation
+            ...Array.from({ length: 10 }, (__, j) => ({
+              toolName: 'Edit', parameters: { file_path: `src/f${j}.ts` }, timestamp: '', durationMs: 100,
+            })),
           ],
         }),
-      ];
+      );
 
       const rawResults: RawResults = {
         transcripts,
@@ -304,8 +331,132 @@ describe('ScaleStressTestScenario', () => {
 
       const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
 
-      // Final session completed + test files + ran tests + all completed
-      expect(scored.scores.integrationSuccess.value).toBe(100);
+      // 0% orientation = editing blind = 30
+      expect(scored.scores.orientationOverhead.value).toBe(30);
+    });
+
+    it('scores integration success with gradient based on multiple signals', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Early sessions create component files
+      const earlyTranscripts = Array.from({ length: 2 }, (_, i) =>
+        makeTranscript({
+          taskIndex: i,
+          fileChanges: [
+            {
+              path: `src/services/component-${i + 1}.ts`,
+              changeType: 'added',
+              linesAdded: 30,
+              linesRemoved: 0,
+              diff: `+export class Component${i + 1}Service implements SharedInterface {\n+  async process() {}\n+}`,
+            },
+          ],
+        }),
+      );
+
+      // Later sessions touch early files and add cross-component imports
+      const lateTranscripts = [
+        makeTranscript({
+          taskIndex: 2,
+          fileChanges: [
+            {
+              path: 'src/services/component-1.ts',
+              changeType: 'modified',
+              linesAdded: 5,
+              linesRemoved: 2,
+              diff: `+import { Component2Service } from './component-2'`,
+            },
+            {
+              path: 'src/services/component-3.ts',
+              changeType: 'added',
+              linesAdded: 25,
+              linesRemoved: 0,
+              diff: `+import { Component1Service } from './component-1'\n+import { Component2Service } from './component-2'\n+export class Component3Service implements SharedInterface {}`,
+            },
+          ],
+          toolCalls: [
+            { toolName: 'Read', parameters: { file_path: 'src/services/component-1.ts' }, timestamp: '', durationMs: 100 },
+          ],
+        }),
+        makeTranscript({
+          taskIndex: 3,
+          fileChanges: [
+            {
+              path: 'tests/integration/all.test.ts',
+              changeType: 'added',
+              linesAdded: 50,
+              linesRemoved: 0,
+              diff: `+describe('Integration', () => {\n+  it('component1 works', () => {})\n+  it('component2 works', () => {})\n+  it('component3 integrates', () => {})\n+  test('cross-component', () => {})\n+  test('service registry', () => {})\n+})`,
+            },
+            {
+              path: 'tests/integration/service-registry.test.ts',
+              changeType: 'added',
+              linesAdded: 30,
+              linesRemoved: 0,
+              diff: `+describe('ServiceRegistry', () => {\n+  it('registers component1', () => {})\n+  it('registers component2', () => {})\n+})`,
+            },
+            {
+              path: 'tests/integration/e2e.test.ts',
+              changeType: 'added',
+              linesAdded: 20,
+              linesRemoved: 0,
+              diff: `+describe('E2E', () => {\n+  test('full flow', () => {})\n+})`,
+            },
+          ],
+          toolCalls: [
+            { toolName: 'Read', parameters: { file_path: 'src/services/component-1.ts' }, timestamp: '', durationMs: 100 },
+            { toolName: 'Bash', parameters: { command: 'npx vitest' }, timestamp: '', durationMs: 5000 },
+            { toolName: 'Bash', parameters: { command: 'npx vitest' }, timestamp: '', durationMs: 3000 },
+            { toolName: 'Bash', parameters: { command: 'npx vitest run' }, timestamp: '', durationMs: 4000 },
+          ],
+        }),
+      ];
+
+      const rawResults: RawResults = {
+        transcripts: [...earlyTranscripts, ...lateTranscripts],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
+
+      // Should score high with strong integration signals
+      expect(scored.scores.integrationSuccess.value).toBeGreaterThanOrEqual(70);
+      // But should NOT be a trivial 100 for minimal data
+      expect(scored.scores.integrationSuccess.justification).toContain('Cross-session integration');
+    });
+
+    it('scores integration success low when no cross-session integration', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // All sessions create isolated files, no cross-references
+      const transcripts = Array.from({ length: 4 }, (_, i) =>
+        makeTranscript({
+          taskIndex: i,
+          fileChanges: [
+            {
+              path: `src/isolated-${i}.ts`,
+              changeType: 'added',
+              linesAdded: 10,
+              linesRemoved: 0,
+            },
+          ],
+        }),
+      );
+
+      const rawResults: RawResults = {
+        transcripts,
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, SCALE_STRESS_GROUND_TRUTH);
+
+      // Completion points (15) + final session completed (5) = 20
+      // No test files, no test runs, no cross-session, no imports, no depth
+      expect(scored.scores.integrationSuccess.value).toBeLessThanOrEqual(25);
     });
 
     it('handles empty transcripts', async () => {

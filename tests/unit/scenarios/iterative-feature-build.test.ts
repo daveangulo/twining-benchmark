@@ -568,7 +568,7 @@ describe('IterativeFeatureBuildScenario', () => {
   // ── integrationCompleteness ───────────────────────────────────────────────
 
   describe('score() — integrationCompleteness', () => {
-    it('scores 100 when session 5 has integration tests, audit, and rate limiting', async () => {
+    it('scores high when session 5 has substantive integration tests, audit, and rate limiting', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults = makeFullResults([
@@ -582,7 +582,10 @@ describe('IterativeFeatureBuildScenario', () => {
               linesRemoved: 0,
               diff: `+import { AnalyticsService } from '../../src/services/analytics.service';
 +describe('analytics integration', () => {
-+  it('audits requests', () => { auditLog.record(query); });
++  it('computes summary', async () => {
++    const result = await service.computeSummary(range);
++    expect(result.totalEvents).toBeGreaterThan(0);
++  });
 +  it('applies rate limiting', () => { expect(rateLimit.check(userId)).toBe(true); });
 +});`,
             },
@@ -591,14 +594,25 @@ describe('IterativeFeatureBuildScenario', () => {
               changeType: 'added',
               linesAdded: 30,
               linesRemoved: 0,
-              diff: '+export function auditLog(query: string) { console.log("audit", query); }',
+              diff: `+export class AuditLogger {
++  log(request: { userId: string, query: string, timestamp: number }) {
++    this.entries.push(request);
++  }
++}`,
             },
             {
               path: 'src/middleware/rate-limit.ts',
               changeType: 'added',
               linesAdded: 25,
               linesRemoved: 0,
-              diff: '+export function rateLimit(userId: string) { /* throttle */ }',
+              diff: `+export class RateLimiter {
++  check(userId: string): boolean {
++    const count = this.windowCounts.get(userId) ?? 0;
++    if (count > this.limit) return false;
++    this.windowCounts.set(userId, count + 1);
++    return true;
++  }
++}`,
             },
           ],
         },
@@ -606,6 +620,9 @@ describe('IterativeFeatureBuildScenario', () => {
 
       const scored = await scenario.score(rawResults, ITERATIVE_FEATURE_BUILD_GROUND_TRUTH);
 
+      // Tests: imports (25) + assertions (15) = 40
+      // Audit: file (10) + logging logic (20) = 30
+      // Rate limit: file (10) + throttle logic (20) = 30
       expect(scored.scores.integrationCompleteness.value).toBe(100);
     });
 
@@ -629,7 +646,7 @@ describe('IterativeFeatureBuildScenario', () => {
       expect(scored.scores.integrationCompleteness.value).toBe(0);
     });
 
-    it('scores partially when only audit logging is present', async () => {
+    it('scores low when audit file exists but lacks substantive logic', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults = makeFullResults([
@@ -639,9 +656,9 @@ describe('IterativeFeatureBuildScenario', () => {
             {
               path: 'src/middleware/audit-log.ts',
               changeType: 'added',
-              linesAdded: 20,
+              linesAdded: 5,
               linesRemoved: 0,
-              diff: '+export function auditLog(query: string) { console.log(query); }',
+              diff: '+export class AuditLog { /* placeholder */ }',
             },
             // Missing integration tests and rate limiting
           ],
@@ -650,8 +667,31 @@ describe('IterativeFeatureBuildScenario', () => {
 
       const scored = await scenario.score(rawResults, ITERATIVE_FEATURE_BUILD_GROUND_TRUTH);
 
-      // 1/3 = 33
-      expect(scored.scores.integrationCompleteness.value).toBe(33);
+      // Audit file only (10), no tests, no rate limiting
+      expect(scored.scores.integrationCompleteness.value).toBe(10);
+    });
+
+    it('scores 0 when session 5 has unrelated file changes', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults = makeFullResults([
+        {}, {}, {}, {},
+        {
+          fileChanges: [
+            {
+              path: 'src/utils/helpers.ts',
+              changeType: 'modified',
+              linesAdded: 3,
+              linesRemoved: 1,
+              diff: '+// refactored helper function',
+            },
+          ],
+        },
+      ]);
+
+      const scored = await scenario.score(rawResults, ITERATIVE_FEATURE_BUILD_GROUND_TRUTH);
+
+      expect(scored.scores.integrationCompleteness.value).toBe(0);
     });
   });
 
@@ -714,7 +754,14 @@ describe('IterativeFeatureBuildScenario', () => {
               changeType: 'added',
               linesAdded: 60,
               linesRemoved: 0,
-              diff: "+import { AnalyticsService } from '../../services/analytics.service';\n+import type { AnalyticsSummary, UserAnalytics, TrendPoint } from '../../models/analytics';\n+describe('analytics integration', () => { it('works', () => {}); });\n+// auditLog(query); rateLimit(userId);",
+              diff: `+import { AnalyticsService } from '../../services/analytics.service';
++import type { AnalyticsSummary, UserAnalytics, TrendPoint } from '../../models/analytics';
++describe('analytics integration', () => {
++  it('computes summary', async () => {
++    const result = await service.computeSummary(range);
++    expect(result.totalEvents).toBeGreaterThan(0);
++  });
++});`,
             },
           ],
         },

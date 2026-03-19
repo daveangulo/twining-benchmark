@@ -403,64 +403,76 @@ export class DecisionVolumeRecoveryScenario extends BaseScenario {
   /**
    * Score pattern compliance (weight 0.30).
    *
-   * Check B's diffs for IUserRepository and error handling patterns.
-   * Check C's diffs for IOrderRepository and error handling patterns.
-   * Each agent: 50 pts for interface usage, 50 pts for error handling patterns.
+   * For each of agents B and C, check diffs for four compliance signals:
+   *   1. Interface usage (25 pts): exact interface name (IUserRepository / IOrderRepository)
+   *   2. Structured error handling (25 pts): try/catch blocks (requires BOTH try AND catch)
+   *   3. Typed errors (25 pts): typed catch clause or custom error class (e.g., `catch (err: unknown)` or `new ...Error`)
+   *   4. Logger pattern (25 pts): standardized Logger usage (`logger\.|Logger`)
+   *
+   * The dimension score is the average of B and C.
    */
   private scorePatternCompliance(rawResults: RawResults): DimensionScore {
     const details: string[] = [];
     const agentScores: number[] = [];
 
-    // Agent B (cache-builder): must use IUserRepository and error handling
-    const transcriptB = rawResults.transcripts[1];
-    if (!transcriptB) {
-      details.push('Agent B transcript missing — cannot score pattern compliance.');
-      agentScores.push(0);
-    } else {
-      const contentB = transcriptB.fileChanges
-        .map((c) => (c.diff ?? '') + '\n' + c.path)
+    const configs: Array<{ idx: number; label: string; interfacePattern: RegExp }> = [
+      { idx: 1, label: 'B (cache-builder)', interfacePattern: /IUserRepository/ },
+      { idx: 2, label: 'C (order-feature-builder)', interfacePattern: /IOrderRepository/ },
+    ];
+
+    for (const { idx, label, interfacePattern } of configs) {
+      const transcript = rawResults.transcripts[idx];
+      if (!transcript) {
+        details.push(`Agent ${label} transcript missing — cannot score pattern compliance.`);
+        agentScores.push(0);
+        continue;
+      }
+
+      // Only consider added lines in diffs (lines starting with +) to avoid
+      // matching removed code or context lines
+      const addedLines = transcript.fileChanges
+        .map((c) => (c.diff ?? '').split('\n').filter((line) => line.startsWith('+')).join('\n'))
         .join('\n');
 
-      let scoreB = 0;
-      if (/IUserRepository/i.test(contentB)) {
-        scoreB += 50;
-        details.push('Agent B uses IUserRepository interface.');
-      } else {
-        details.push('Agent B missing IUserRepository usage.');
-      }
-      if (/try|catch|Error|throw/i.test(contentB)) {
-        scoreB += 50;
-        details.push('Agent B follows error handling pattern.');
-      } else {
-        details.push('Agent B missing error handling pattern.');
-      }
-      agentScores.push(scoreB);
-    }
+      let agentScore = 0;
 
-    // Agent C (order-feature-builder): must use IOrderRepository and error handling
-    const transcriptC = rawResults.transcripts[2];
-    if (!transcriptC) {
-      details.push('Agent C transcript missing — cannot score pattern compliance.');
-      agentScores.push(0);
-    } else {
-      const contentC = transcriptC.fileChanges
-        .map((c) => (c.diff ?? '') + '\n' + c.path)
-        .join('\n');
+      // 1. Interface usage (25 pts) — exact interface name, case-sensitive
+      if (interfacePattern.test(addedLines)) {
+        agentScore += 25;
+        details.push(`Agent ${label} uses ${interfacePattern.source} interface.`);
+      } else {
+        details.push(`Agent ${label} missing ${interfacePattern.source} usage.`);
+      }
 
-      let scoreC = 0;
-      if (/IOrderRepository/i.test(contentC)) {
-        scoreC += 50;
-        details.push('Agent C uses IOrderRepository interface.');
+      // 2. Structured error handling (25 pts) — must have BOTH try AND catch
+      const hasTry = /\btry\s*\{/.test(addedLines);
+      const hasCatch = /\bcatch\s*\(/.test(addedLines);
+      if (hasTry && hasCatch) {
+        agentScore += 25;
+        details.push(`Agent ${label} has structured try/catch blocks.`);
       } else {
-        details.push('Agent C missing IOrderRepository usage.');
+        details.push(`Agent ${label} missing structured try/catch error handling.`);
       }
-      if (/try|catch|Error|throw/i.test(contentC)) {
-        scoreC += 50;
-        details.push('Agent C follows error handling pattern.');
+
+      // 3. Typed errors (25 pts) — typed catch clause OR custom error class
+      const hasTypedCatch = /catch\s*\(\s*\w+\s*:\s*\w+\s*\)/.test(addedLines);
+      const hasCustomError = /new\s+\w*Error\s*\(/.test(addedLines);
+      if (hasTypedCatch || hasCustomError) {
+        agentScore += 25;
+        details.push(`Agent ${label} uses typed errors.`);
       } else {
-        details.push('Agent C missing error handling pattern.');
+        details.push(`Agent ${label} missing typed error patterns.`);
       }
-      agentScores.push(scoreC);
+
+      // 4. Logger pattern (25 pts) — standardized Logger usage
+      if (/\blogger\.\w+|Logger\b/.test(addedLines)) {
+        agentScore += 25;
+        details.push(`Agent ${label} uses standardized Logger pattern.`);
+      } else {
+        details.push(`Agent ${label} missing standardized Logger pattern.`);
+      }
+
+      agentScores.push(agentScore);
     }
 
     const avgScore = agentScores.length > 0
@@ -478,10 +490,12 @@ export class DecisionVolumeRecoveryScenario extends BaseScenario {
   /**
    * Score cross-cutting consistency (weight 0.25).
    *
-   * Check Agent D's test files for:
-   * - Imports from B's caching code (cache|Cache in test imports/content)
-   * - Imports from C's order history code (history|History|transition|Transition in test imports/content)
-   * - Presence of test files in tests/integration/ directory
+   * Checks Agent D's work across five signals (20 pts each):
+   *   1. Integration test location (20 pts): files in tests/integration/ directory specifically
+   *   2. Cache test assertions (20 pts): test code with cache-specific assertions (hit/miss/invalidate)
+   *   3. Order history test assertions (20 pts): test code with history-specific assertions (transition/timestamp)
+   *   4. Interface verification (20 pts): tests verify interface usage (IUserRepository or IOrderRepository)
+   *   5. Cross-feature interaction (20 pts): a single test exercises both caching AND order history
    */
   private scoreCrossCuttingConsistency(rawResults: RawResults): DimensionScore {
     const transcriptD = rawResults.transcripts[3];
@@ -497,40 +511,85 @@ export class DecisionVolumeRecoveryScenario extends BaseScenario {
     const details: string[] = [];
     let score = 0;
 
-    // Check for integration test files
-    const testFiles = transcriptD.fileChanges.filter(
-      (c) => /tests?\/integration|\.test\.|\.spec\./i.test(c.path),
-    );
-    if (testFiles.length > 0) {
-      score += 34;
-      details.push(`Agent D created ${testFiles.length} test file(s).`);
-    } else {
-      details.push('Agent D did not create integration test files.');
-    }
-
-    const contentD = transcriptD.fileChanges
-      .map((c) => (c.diff ?? '') + '\n' + c.path)
+    // Only look at added lines in diffs
+    const addedLines = transcriptD.fileChanges
+      .map((c) => (c.diff ?? '').split('\n').filter((line) => line.startsWith('+')).join('\n'))
       .join('\n');
 
-    // Check for caching coverage (Agent B's work)
-    if (/cache|Cache/i.test(contentD)) {
-      score += 33;
-      details.push('Agent D tests cover caching (Agent B).');
+    // 1. Integration test location (20 pts) — files specifically in tests/integration/
+    const integrationFiles = transcriptD.fileChanges.filter(
+      (c) => /tests?\/integration\//.test(c.path),
+    );
+    if (integrationFiles.length > 0) {
+      score += 20;
+      details.push(`Agent D created ${integrationFiles.length} integration test file(s).`);
     } else {
-      details.push('Agent D tests do not appear to cover caching.');
+      // Partial credit (10 pts) for test files outside integration directory
+      const anyTestFiles = transcriptD.fileChanges.filter(
+        (c) => /\.test\.|\.spec\./i.test(c.path),
+      );
+      if (anyTestFiles.length > 0) {
+        score += 10;
+        details.push(`Agent D created test file(s) but not in tests/integration/ directory.`);
+      } else {
+        details.push('Agent D did not create any test files.');
+      }
     }
 
-    // Check for order history coverage (Agent C's work)
-    if (/history|History|transition|Transition|orderHistory|order.history/i.test(contentD)) {
-      score += 33;
-      details.push('Agent D tests cover order history (Agent C).');
+    // 2. Cache test assertions (20 pts) — must have cache-specific test behavior
+    //    Look for cache hit/miss semantics, not just the word "cache"
+    const hasCacheHitMiss = /cache\s*hit|cache\s*miss|cached|invalidat|cache\.get|cache\.set|cache\.has|cache\.delete|cache\.clear|fromCache|isCached/i.test(addedLines);
+    const hasCacheTestBlock = /\b(it|test|describe)\s*\(\s*['"`].*cache/i.test(addedLines);
+    if (hasCacheHitMiss) {
+      score += 20;
+      details.push('Agent D tests exercise cache hit/miss behavior.');
+    } else if (hasCacheTestBlock) {
+      score += 10;
+      details.push('Agent D has cache test blocks but no specific hit/miss assertions.');
     } else {
-      details.push('Agent D tests do not appear to cover order history.');
+      details.push('Agent D tests do not cover caching behavior.');
+    }
+
+    // 3. Order history test assertions (20 pts) — must have history-specific behavior
+    //    Look for transition recording, timestamp assertions, not just the word "history"
+    const hasHistoryBehavior = /status\s*transition|record.*history|transition.*timestamp|history.*entry|orderHistory|statusHistory|trackTransition|recordTransition/i.test(addedLines);
+    const hasHistoryTestBlock = /\b(it|test|describe)\s*\(\s*['"`].*(history|transition)/i.test(addedLines);
+    if (hasHistoryBehavior) {
+      score += 20;
+      details.push('Agent D tests exercise order history tracking behavior.');
+    } else if (hasHistoryTestBlock) {
+      score += 10;
+      details.push('Agent D has history test blocks but no specific transition assertions.');
+    } else {
+      details.push('Agent D tests do not cover order history behavior.');
+    }
+
+    // 4. Interface verification (20 pts) — tests reference the interfaces
+    const hasInterfaceRef = /IUserRepository|IOrderRepository/.test(addedLines);
+    if (hasInterfaceRef) {
+      score += 20;
+      details.push('Agent D tests verify interface usage.');
+    } else {
+      details.push('Agent D tests do not reference IUserRepository or IOrderRepository.');
+    }
+
+    // 5. Cross-feature interaction (20 pts) — a single test file exercises both features
+    const hasBothInOneFile = transcriptD.fileChanges.some((c) => {
+      const added = (c.diff ?? '').split('\n').filter((line) => line.startsWith('+')).join('\n');
+      const mentionsCache = /cache|Cache/.test(added);
+      const mentionsHistory = /history|History|transition|Transition/.test(added);
+      return mentionsCache && mentionsHistory;
+    });
+    if (hasBothInOneFile) {
+      score += 20;
+      details.push('Agent D has cross-feature test covering both caching and order history.');
+    } else {
+      details.push('Agent D does not test cross-feature interaction in a single file.');
     }
 
     return {
       value: Math.min(100, score),
-      confidence: contentD.length > 0 ? 'high' : 'medium',
+      confidence: addedLines.length > 0 ? 'high' : 'medium',
       method: 'automated',
       justification: details.join(' '),
     };

@@ -607,10 +607,10 @@ export class IterativeFeatureBuildScenario extends BaseScenario {
   /**
    * Score integration completeness (weight 0.20).
    *
-   * Checks session 5's output for:
-   * - Test files importing from analytics controller or service
-   * - Audit logging patterns
-   * - Rate limiting patterns
+   * Checks session 5's diffs (not file paths) for substantive implementations:
+   * - Integration test files with actual test cases importing from analytics layers
+   * - Audit logging with recording/logging logic
+   * - Rate limiting with throttle/quota logic
    */
   private scoreIntegrationCompleteness(rawResults: RawResults): DimensionScore {
     const transcript5 = rawResults.transcripts[4];
@@ -623,55 +623,119 @@ export class IterativeFeatureBuildScenario extends BaseScenario {
       };
     }
 
-    const content5 = transcript5.fileChanges
-      .map((c) => (c.diff ?? '') + c.path)
+    const diffs5 = transcript5.fileChanges
+      .map((c) => c.diff)
+      .filter((d): d is string => d !== undefined)
       .join('\n');
 
     const details: string[] = [];
-    let found = 0;
-    const total = 3;
+    let score = 0;
 
-    // Check: integration test files importing from analytics controller/service
-    const hasIntegrationTests =
-      /integration.?test|describe.*analytics|it\(.*analytics/i.test(content5) &&
-      /from.*analytics\.controller|from.*analytics\.service|AnalyticsService|analytics\.controller/i.test(
-        content5,
-      );
+    // Check 1: Integration tests (up to 40 points)
+    // Must have test files with import statements referencing analytics layers in the diff
+    const testFiles = transcript5.fileChanges.filter(
+      (c) => /test|spec/i.test(c.path),
+    );
+    const testDiffs = testFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
 
-    if (hasIntegrationTests) {
-      found++;
-      details.push('Integration tests importing from analytics controller/service found.');
+    const hasTestImports =
+      /from\s+['"].*analytics\.controller|from\s+['"].*analytics\.service|import.*AnalyticsService|import.*AnalyticsController/i.test(testDiffs);
+    const hasTestCases =
+      /describe\s*\(|it\s*\(|test\s*\(/i.test(testDiffs);
+    const hasAssertions =
+      /expect\s*\(|assert\s*\(|should\.|toBe|toEqual|toHave|toContain|toThrow/i.test(testDiffs);
+
+    if (hasTestImports && hasTestCases) {
+      score += 25;
+      details.push('Integration tests import from analytics layers and contain test cases.');
+      if (hasAssertions) {
+        score += 15;
+        details.push('Integration tests contain assertions.');
+      } else {
+        details.push('Integration tests lack assertions.');
+      }
+    } else if (hasTestCases) {
+      score += 10;
+      details.push('Test files found but do not import from analytics controller/service.');
     } else {
       details.push('Integration tests referencing analytics controller/service missing.');
     }
 
-    // Check: audit logging patterns
-    const hasAudit =
-      /audit|AuditLog|auditLog|audit_log|logRequest|logQuery/i.test(content5);
-    if (hasAudit) {
-      found++;
-      details.push('Audit logging patterns found.');
+    // Check 2: Audit logging (up to 30 points)
+    // Must have audit-related code with actual logging/recording logic in diffs
+    const auditFiles = transcript5.fileChanges.filter(
+      (c) => /audit/i.test(c.path),
+    );
+    const auditDiffs = auditFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
+
+    if (auditFiles.length > 0) {
+      score += 10;
+      details.push('Audit file(s) created.');
+
+      const hasLoggingLogic =
+        /log\s*\(|record\s*\(|save\s*\(|push\s*\(|write\s*\(|emit\s*\(/i.test(auditDiffs) &&
+        /request|query|analytics|userId|user_id|timestamp/i.test(auditDiffs);
+      if (hasLoggingLogic) {
+        score += 20;
+        details.push('Audit logging contains substantive recording logic.');
+      } else {
+        details.push('Audit file exists but lacks substantive logging logic.');
+      }
     } else {
-      details.push('Audit logging patterns missing from session 5.');
+      // Check for inline audit logic in other diffs
+      const hasInlineAudit =
+        /class\s+.*Audit|audit.*log\s*\(|AuditLog|logRequest|logQuery/i.test(diffs5);
+      if (hasInlineAudit) {
+        score += 10;
+        details.push('Audit logging logic found inline (no dedicated file).');
+      } else {
+        details.push('Audit logging patterns missing from session 5.');
+      }
     }
 
-    // Check: rate limiting patterns
-    const hasRateLimit =
-      /rate.?limit|rateLimit|RateLimit|throttle|Throttle/i.test(content5);
-    if (hasRateLimit) {
-      found++;
-      details.push('Rate limiting patterns found.');
-    } else {
-      details.push('Rate limiting patterns missing from session 5.');
-    }
+    // Check 3: Rate limiting (up to 30 points)
+    // Must have rate-limiting code with actual throttle/quota logic in diffs
+    const rateLimitFiles = transcript5.fileChanges.filter(
+      (c) => /rate.?limit|throttle/i.test(c.path),
+    );
+    const rateLimitDiffs = rateLimitFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
 
-    const score = Math.round((found / total) * 100);
+    if (rateLimitFiles.length > 0) {
+      score += 10;
+      details.push('Rate limiting file(s) created.');
+
+      const hasThrottleLogic =
+        /token|bucket|window|count|limit|max|exceed|reject|deny|retry|throttle/i.test(rateLimitDiffs) &&
+        /user|userId|user_id|key|client|ip/i.test(rateLimitDiffs);
+      if (hasThrottleLogic) {
+        score += 20;
+        details.push('Rate limiting contains per-user throttle logic.');
+      } else {
+        details.push('Rate limiting file exists but lacks substantive throttle logic.');
+      }
+    } else {
+      // Check for inline rate limiting in other diffs
+      const hasInlineRateLimit =
+        /class\s+.*RateLimit|rateLimit\s*\(|new\s+.*RateLimit|throttle\s*\(/i.test(diffs5);
+      if (hasInlineRateLimit) {
+        score += 10;
+        details.push('Rate limiting logic found inline (no dedicated file).');
+      } else {
+        details.push('Rate limiting patterns missing from session 5.');
+      }
+    }
 
     return {
-      value: score,
-      confidence: content5.length > 0 ? 'high' : 'medium',
+      value: Math.min(100, score),
+      confidence: diffs5.length > 0 ? 'high' : 'medium',
       method: 'automated',
-      justification: `${found}/${total} integration completeness checks passed. ${details.join(' ')}`,
+      justification: `Score ${score}/100. ${details.join(' ')}`,
     };
   }
 }

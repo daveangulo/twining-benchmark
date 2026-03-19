@@ -285,10 +285,240 @@ describe('RefactoringHandoffScenario', () => {
 
       const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
 
-      expect(scored.scores.consistency.value).toBeGreaterThanOrEqual(70);
+      // Perfect: imports from A's module (25) + references interface (25) + implements (25) + no anti-patterns (25) = 100
+      expect(scored.scores.consistency.value).toBe(100);
       expect(scored.scores.rework.value).toBe(100); // B didn't touch A's files
       expect(scored.scores.completion.value).toBe(100);
       expect(scored.composite).toBeGreaterThan(0);
+    });
+
+    it('consistency: scores 0 when B ignores A entirely', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+export interface IUserRepository {\n+  findById(id: string): User | undefined;\n+}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/utils/logger.ts',
+                changeType: 'modified',
+                linesAdded: 10,
+                linesRemoved: 2,
+                diff: '+const logger = new Logger();\n+logger.info("hello");',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // B doesn't import from A, doesn't reference interface, no structural conformance
+      // Only gets anti-pattern absence points (25)
+      expect(scored.scores.consistency.value).toBe(25);
+    });
+
+    it('consistency: partial score when B references interface but does not implement it', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+export interface IUserRepository {\n+  findById(id: string): User | undefined;\n+}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/services/helper.service.ts',
+                changeType: 'added',
+                linesAdded: 30,
+                linesRemoved: 0,
+                diff: '+import { IUserRepository } from "./user.repository";\n+// TODO: implement IUserRepository\n+export class HelperService {\n+  doSomething() {}\n+}',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // imports from A's module (25) + references interface (25) + no structural conformance (0) + no anti-patterns (25) = 75
+      expect(scored.scores.consistency.value).toBe(75);
+    });
+
+    it('consistency: deducts for anti-patterns', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/repositories/user.repository.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+export interface IUserRepository {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/services/user.service.ts',
+                changeType: 'modified',
+                linesAdded: 15,
+                linesRemoved: 3,
+                diff: '+import { IUserRepository } from "../repositories/user.repository";\n+const repo = new UserRepository();\n+export class CachedRepo implements IUserRepository {\n+  private cache = new Map();',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // imports (25) + references (25) + implements (25) + anti-patterns: "new UserRepository" hits (-8) = 17
+      // Total: 92
+      expect(scored.scores.consistency.value).toBe(92);
+      expect(scored.scores.consistency.justification).toContain('anti-pattern');
+    });
+
+    it('consistency: gradient distinguishes different levels of alignment', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Level 1: B fully conforms (imports, references, implements, no anti-patterns)
+      const fullConformance: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [{
+              path: 'src/repositories/user.repository.ts',
+              changeType: 'modified',
+              linesAdded: 20,
+              linesRemoved: 5,
+              diff: '+export interface IUserRepository { findById(id: string): User; }',
+            }],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [{
+              path: 'src/repositories/cached-user.repository.ts',
+              changeType: 'added',
+              linesAdded: 40,
+              linesRemoved: 0,
+              diff: '+import { IUserRepository } from "./user.repository";\n+export class CachedUserRepository implements IUserRepository {\n+  private cache = new Map();\n+}',
+            }],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      // Level 2: B references interface but doesn't implement it
+      const partialConformance: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [{
+              path: 'src/repositories/user.repository.ts',
+              changeType: 'modified',
+              linesAdded: 20,
+              linesRemoved: 5,
+              diff: '+export interface IUserRepository { findById(id: string): User; }',
+            }],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [{
+              path: 'src/services/cache.ts',
+              changeType: 'added',
+              linesAdded: 20,
+              linesRemoved: 0,
+              diff: '+import { IUserRepository } from "../repositories/user.repository";\n+// Uses IUserRepository type for reference\n+export function addCache() {}',
+            }],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      // Level 3: B ignores A entirely
+      const noConformance: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [{
+              path: 'src/repositories/user.repository.ts',
+              changeType: 'modified',
+              linesAdded: 20,
+              linesRemoved: 5,
+              diff: '+export interface IUserRepository { findById(id: string): User; }',
+            }],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [{
+              path: 'src/utils/helpers.ts',
+              changeType: 'added',
+              linesAdded: 10,
+              linesRemoved: 0,
+              diff: '+export function formatDate(d: Date) { return d.toISOString(); }',
+            }],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scoreFull = await scenario.score(fullConformance, REFACTORING_HANDOFF_GROUND_TRUTH);
+      const scorePartial = await scenario.score(partialConformance, REFACTORING_HANDOFF_GROUND_TRUTH);
+      const scoreNone = await scenario.score(noConformance, REFACTORING_HANDOFF_GROUND_TRUTH);
+
+      // Verify gradient: full > partial > none
+      expect(scoreFull.scores.consistency.value).toBeGreaterThan(scorePartial.scores.consistency.value);
+      expect(scorePartial.scores.consistency.value).toBeGreaterThan(scoreNone.scores.consistency.value);
+
+      // Verify spread: there should be meaningful separation
+      const spread = scoreFull.scores.consistency.value - scoreNone.scores.consistency.value;
+      expect(spread).toBeGreaterThanOrEqual(50);
     });
 
     it('penalizes when Agent B rewrites Agent A code', async () => {

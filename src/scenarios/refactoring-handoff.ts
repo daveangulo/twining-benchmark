@@ -290,15 +290,20 @@ export class RefactoringHandoffScenario extends BaseScenario {
   /**
    * Score consistency: Does Agent B's code align with Agent A's architectural choices?
    *
-   * Checks:
-   * - Agent B uses the IUserRepository interface (if A created it)
-   * - Agent B doesn't introduce contradictory patterns
-   * - Agent B's caching layer conforms to the interface
+   * Uses additive scoring across independent signals to produce a gradient:
+   *
+   * Signal 1 (25 pts): Agent B imports from A's new/modified modules
+   * Signal 2 (25 pts): Agent B references the IUserRepository interface
+   * Signal 3 (25 pts): Agent B implements or wraps IUserRepository (structural conformance)
+   * Signal 4 (25 pts): Agent B avoids anti-patterns from ground truth
+   *
+   * This replaces the old subtract-from-100 approach which always yielded ~80.
    */
   private scoreConsistency(
     rawResults: RawResults,
     groundTruth: ArchitecturalManifest,
   ): DimensionScore {
+    const transcriptA = rawResults.transcripts[0];
     const transcriptB = rawResults.transcripts[1];
     if (!transcriptB) {
       return {
@@ -309,10 +314,7 @@ export class RefactoringHandoffScenario extends BaseScenario {
       };
     }
 
-    let score = 100;
-    const issues: string[] = [];
-
-    // Check if Agent B's file changes reference the expected patterns
+    // Collect Agent B's diffs
     const bChanges = transcriptB.fileChanges;
     const bDiffs = bChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
     const hasMissingDiffs = bChanges.some((c) => c.diff === undefined);
@@ -327,40 +329,118 @@ export class RefactoringHandoffScenario extends BaseScenario {
       };
     }
 
+    // Collect Agent A's diffs for cross-referencing
+    const aDiffs = transcriptA
+      ? transcriptA.fileChanges
+          .map((c) => c.diff)
+          .filter((d): d is string => d !== undefined)
+          .join('\n')
+      : '';
+    const aFiles = new Set(
+      transcriptA ? transcriptA.fileChanges.map((c) => c.path) : [],
+    );
+    const bFiles = new Set(bChanges.map((c) => c.path));
+
+    let score = 0;
+    const signals: string[] = [];
+
+    // --- Signal 1 (25 pts): Agent B imports from or touches A's modules ---
+    // Check if B's diffs import from files that A modified, or if B modifies
+    // files that A also touched (showing awareness of A's work).
+    const bImportsFromAModules = aFiles.size > 0 && Array.from(aFiles).some((aFile) => {
+      // Extract module name from file path (e.g., "src/repositories/user.repository.ts" -> "user.repository")
+      const moduleName = aFile.replace(/^src\//, '').replace(/\.ts$/, '');
+      const baseName = moduleName.split('/').pop() ?? '';
+      // Check if B's diffs contain an import referencing this module
+      return (
+        new RegExp(`from\\s+['"]\\..*${baseName.replace('.', '\\.')}`, 'i').test(bDiffs) ||
+        new RegExp(`require\\(.*${baseName.replace('.', '\\.')}`, 'i').test(bDiffs)
+      );
+    });
+    const bTouchesAFiles = aFiles.size > 0 && Array.from(aFiles).some((f) => bFiles.has(f));
+
+    if (bImportsFromAModules) {
+      score += 25;
+      signals.push('B imports from A\'s modified modules (+25)');
+    } else if (bTouchesAFiles) {
+      score += 15;
+      signals.push('B modifies files A touched but does not import from A\'s modules (+15)');
+    } else {
+      signals.push('B does not reference A\'s modules (+0)');
+    }
+
+    // --- Signal 2 (25 pts): Agent B references IUserRepository interface ---
+    // This checks whether B is aware of the interface A created.
+    const interfaceRefPattern = /IUserRepository/;
+    const bReferencesInterface = interfaceRefPattern.test(bDiffs);
+    // Also check if A actually created the interface
+    const aCreatedInterface = interfaceRefPattern.test(aDiffs);
+
+    if (bReferencesInterface) {
+      score += 25;
+      signals.push('B references IUserRepository interface (+25)');
+    } else if (!aCreatedInterface) {
+      // A didn't create the interface, so B can't be faulted for not using it
+      score += 15;
+      signals.push('A did not create IUserRepository; B not penalized (+15)');
+    } else {
+      signals.push('B does not reference IUserRepository despite A creating it (+0)');
+    }
+
+    // --- Signal 3 (25 pts): Agent B structurally conforms to the interface ---
+    // Checks for implements/extends IUserRepository, or wraps it (decorator/proxy pattern).
+    const implementsInterface = /implements\s+IUserRepository/.test(bDiffs);
+    const extendsInterface = /extends\s+\S*UserRepository/.test(bDiffs);
+    const wrapsRepository =
+      /(?:private|readonly|protected)\s+\w*(?:repository|repo|delegate|inner)\w*\s*[;:]/i.test(bDiffs) &&
+      bReferencesInterface;
+    const usesCachePattern =
+      /[Cc]ache/.test(bDiffs) && bReferencesInterface;
+
+    if (implementsInterface) {
+      score += 25;
+      signals.push('B implements IUserRepository (+25)');
+    } else if (wrapsRepository || extendsInterface) {
+      score += 20;
+      signals.push('B wraps or extends the repository pattern (+20)');
+    } else if (usesCachePattern) {
+      score += 10;
+      signals.push('B uses cache with interface reference but no structural conformance (+10)');
+    } else {
+      signals.push('B does not structurally conform to A\'s interface (+0)');
+    }
+
+    // --- Signal 4 (25 pts): Absence of anti-patterns ---
+    // Start with full points and deduct for each anti-pattern violation.
+    let antiPatternScore = 25;
+    const antiPatternIssues: string[] = [];
+
     for (const decision of groundTruth.decisions) {
-      // Check expected patterns in Agent B's changes
-      const hasExpected = decision.expectedPatterns.some(
-        (pattern) => new RegExp(pattern).test(bDiffs),
-      );
-
-      // Check for anti-patterns
-      const hasAntiPattern = decision.antiPatterns.some(
-        (pattern) => new RegExp(pattern).test(bDiffs),
-      );
-
-      if (!hasExpected && decision.id === 'caching-via-interface') {
-        score -= 30;
-        issues.push(
-          `Agent B did not use the expected interface pattern for ${decision.id}`,
-        );
+      for (const pattern of decision.antiPatterns) {
+        if (new RegExp(pattern).test(bDiffs)) {
+          antiPatternScore -= 8;
+          antiPatternIssues.push(
+            `anti-pattern '${pattern}' found for ${decision.id}`,
+          );
+        }
       }
+    }
+    antiPatternScore = Math.max(0, antiPatternScore);
+    score += antiPatternScore;
 
-      if (hasAntiPattern) {
-        score -= 20;
-        issues.push(
-          `Agent B introduced anti-pattern for ${decision.id}`,
-        );
-      }
+    if (antiPatternIssues.length === 0) {
+      signals.push('No anti-patterns detected (+25)');
+    } else {
+      signals.push(
+        `Anti-pattern deductions: ${antiPatternIssues.join('; ')} (+${antiPatternScore})`,
+      );
     }
 
     return {
-      value: Math.max(0, score),
+      value: Math.max(0, Math.min(100, score)),
       confidence: bDiffs.length > 0 ? 'medium' : 'low',
       method: 'automated',
-      justification:
-        issues.length > 0
-          ? `Consistency issues found: ${issues.join('; ')}`
-          : 'Agent B aligned with Agent A\'s architectural choices.',
+      justification: `Consistency signals: ${signals.join('. ')}.`,
       dataQuality: hasMissingDiffs ? 'partial' : 'complete',
     };
   }

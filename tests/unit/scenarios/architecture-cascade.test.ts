@@ -190,7 +190,7 @@ describe('ArchitectureCascadeScenario', () => {
   });
 
   describe('score()', () => {
-    it('scores full propagation when B and C follow A pattern (EventBus)', async () => {
+    it('scores full propagation when B and C follow A pattern (EventBus) with strong signals', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -210,7 +210,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 10,
                 linesRemoved: 0,
-                diff: '+# Decision: Event-driven decoupling\n+## Rationale: Chose event-driven approach because...',
+                diff: '+# Decision: Event-driven decoupling\n+## Rationale: Chose event-driven approach because of loose coupling trade-off',
               },
             ],
           }),
@@ -246,13 +246,14 @@ describe('ArchitectureCascadeScenario', () => {
 
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
+      // Both B and C import EventBus (strong signal = 50 each) => 100
       expect(scored.scores.decisionPropagation.value).toBe(100);
       expect(scored.scores.patternConsistency.value).toBeGreaterThanOrEqual(50);
-      expect(scored.scores.decisionQuality.value).toBeGreaterThanOrEqual(60);
+      expect(scored.scores.decisionQuality.value).toBeGreaterThanOrEqual(50);
       expect(scored.composite).toBeGreaterThan(0);
     });
 
-    it('scores full propagation when all agents use CallbackRegistry', async () => {
+    it('scores full propagation when all agents use CallbackRegistry with strong signals', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -301,6 +302,7 @@ describe('ArchitectureCascadeScenario', () => {
 
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
+      // Both B and C import CallbackRegistry (strong signal = 50 each) => 100
       expect(scored.scores.decisionPropagation.value).toBe(100);
     });
 
@@ -329,7 +331,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'added',
                 linesAdded: 15,
                 linesRemoved: 0,
-                diff: '+eventBus.subscribe("order", handleEmail);\n+eventBus.on("status", handleStatus);',
+                diff: '+import { EventBus } from "../events/event-bus";\n+eventBus.subscribe("order", handleEmail);\n+eventBus.on("status", handleStatus);',
               },
             ],
           }),
@@ -353,6 +355,7 @@ describe('ArchitectureCascadeScenario', () => {
 
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
+      // B follows EventBus strongly (import => 50), C uses wrong pattern (0)
       expect(scored.scores.decisionPropagation.value).toBe(50);
     });
 
@@ -369,7 +372,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 0,
-                diff: '+export class EventBus { emit() {} subscribe() {} }',
+                diff: '+import { EventEmitter } from "events";\n+export class EventBus extends EventEmitter { emit() {} subscribe() {} }',
               },
             ],
           }),
@@ -586,8 +589,8 @@ describe('ArchitectureCascadeScenario', () => {
 
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
-      // A's pattern was detected from twining_decide, B and C both aligned
-      expect(scored.scores.decisionPropagation.value).toBe(100);
+      // A's pattern was detected from twining_decide, B and C both used eventBus (moderate strength = 35 each)
+      expect(scored.scores.decisionPropagation.value).toBe(70);
     });
 
     it('scores zero propagation when neither diffs nor transcript reveal a pattern', async () => {
@@ -627,6 +630,252 @@ describe('ArchitectureCascadeScenario', () => {
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
       expect(scored.scores.decisionPropagation.value).toBe(0);
+    });
+
+    it('scores moderate propagation when B and C use only generic pattern terms (weak signals)', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/events/event-bus.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 0,
+                diff: '+import { EventEmitter } from "events";\n+export class EventBus extends EventEmitter {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/notifications/email.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                // Only generic terms, no EventBus/eventBus class reference
+                diff: '+function handleEmail() { subscribe("order.status", cb); }',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/notifications/webhook.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                // Only generic terms
+                diff: '+function handleWebhook() { subscribe("order.status", cb); }',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // B and C only have weak signals (subscribe) = 15 each => 30
+      expect(scored.scores.decisionPropagation.value).toBe(30);
+    });
+
+    it('scores reduced propagation when B/C mix both patterns', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/events/event-bus.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 0,
+                diff: '+import { EventEmitter } from "events";\n+export class EventBus extends EventEmitter {}',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/notifications/email.ts',
+                changeType: 'added',
+                linesAdded: 20,
+                linesRemoved: 0,
+                // Uses EventBus (strong) but also references CallbackRegistry (strong) -- mixed
+                diff: '+import { EventBus } from "../events/event-bus";\n+import { CallbackRegistry } from "../utils/callback-registry";\n+const registry = new CallbackRegistry();',
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/notifications/webhook.ts',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+import { EventBus } from "../events/event-bus";\n+eventBus.subscribe("order", fireWebhook);',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // B: mixed (correct strong 3, wrong strong 3) => 25. C: pure strong => 50. Total = 75
+      expect(scored.scores.decisionPropagation.value).toBe(75);
+    });
+
+    it('decisionQuality: scores gradient based on documentation and refactor scope', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Scenario: Agent A makes a clear choice with good code but no documentation
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 5,
+                diff: '+import { EventBus } from "../events/event-bus";\n+const bus = new EventBus();\n+bus.subscribe("order", handleNotification);\n-import { CallbackRegistry } from "../utils/callback-registry";\n-const registry = new CallbackRegistry();',
+              },
+              {
+                path: 'src/services/order.service.ts',
+                changeType: 'modified',
+                linesAdded: 10,
+                linesRemoved: 3,
+                diff: '+import { EventBus } from "../events/event-bus";\n+bus.emit("order.created", order);\n-callbackRegistry.notify("order.created", order);',
+              },
+              {
+                path: 'src/events/event-bus.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 0,
+                diff: '+export class EventBus { emit() {} subscribe() {} }',
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 1, fileChanges: [] }),
+          makeTranscript({ taskIndex: 2, fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // Clear choice (25) + no anti-patterns (15) + no doc (0) + 3 relevant files (20) + removed old (20) = 80
+      expect(scored.scores.decisionQuality.value).toBe(80);
+      expect(scored.scores.decisionQuality.justification).toContain('No decision documentation found');
+      expect(scored.scores.decisionQuality.justification).toContain('broad refactor');
+    });
+
+    it('decisionQuality: scores low when A only touches one file with no cleanup', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 0,
+                // Only adds subscribe call, no import, no cleanup
+                diff: '+// use event approach\n+subscribe("order", handleNotification);',
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 1, fileChanges: [] }),
+          makeTranscript({ taskIndex: 2, fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // Weak eventbus signal only (subscribe): ebStrength=1, cbStrength=0 => clear choice 25
+      // No anti-patterns: 15
+      // No doc file, no rationale, but has "approach" in code: 5
+      // 1 relevant file (notification.service.ts): 5
+      // No removed lines: addedChosenStrength=1 > 0, removedRejectedStrength=0 => 10
+      // Total: 25 + 15 + 5 + 5 + 10 = 60
+      expect(scored.scores.decisionQuality.value).toBe(60);
+    });
+
+    it('decisionQuality: perfect score with doc, rationale, broad refactor, and cleanup', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 20,
+                linesRemoved: 10,
+                diff: '+import { EventBus } from "../events/event-bus";\n+const bus = new EventBus();\n-import { CallbackRegistry } from "../utils/callback-registry";\n-const registry = new CallbackRegistry();',
+              },
+              {
+                path: 'src/services/order.service.ts',
+                changeType: 'modified',
+                linesAdded: 10,
+                linesRemoved: 5,
+                diff: '+import { EventBus } from "../events/event-bus";\n+bus.emit("order.created", order);\n-callbackRegistry.notify("order.created");',
+              },
+              {
+                path: 'src/events/event-bus.ts',
+                changeType: 'modified',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+export class EventBus extends EventEmitter {}',
+              },
+              {
+                path: 'ARCHITECTURE.md',
+                changeType: 'added',
+                linesAdded: 20,
+                linesRemoved: 0,
+                diff: '+# Architecture Decision\n+Chose EventBus because it provides better decoupling.\n+Trade-off: slightly more complex but more extensible.',
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 1, fileChanges: [] }),
+          makeTranscript({ taskIndex: 2, fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
+
+      // Clear choice (25) + no anti-patterns (15) + doc with rationale (20) + 3 relevant files (20) + removed old (20) = 100
+      expect(scored.scores.decisionQuality.value).toBe(100);
     });
 
     it('handles missing transcripts gracefully', async () => {

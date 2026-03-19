@@ -452,14 +452,70 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   }
 
   /**
+   * Score how strongly a diff aligns with a specific pattern choice.
+   *
+   * Returns a strength score 0-3:
+   * - 0: no signals for this pattern
+   * - 1: weak signal (only generic terms like subscribe/register that appear in many contexts)
+   * - 2: moderate signal (pattern-specific class names like EventBus/CallbackRegistry)
+   * - 3: strong signal (imports or instantiation of the pattern-specific class)
+   */
+  private measurePatternStrength(diffs: string, pattern: 'eventbus' | 'callback'): number {
+    if (pattern === 'eventbus') {
+      // Strong: import/instantiation of EventBus/EventEmitter class
+      const strong = /(?:import\s+.*EventBus|new\s+EventBus|new\s+EventEmitter|extends\s+EventEmitter)/.test(diffs);
+      // Moderate: class/instance name reference (EventBus, eventBus, EventEmitter)
+      const moderate = /(?:EventBus|eventBus|EventEmitter)/.test(diffs);
+      // Weak: generic terms that could appear in any event-related code
+      const weak = /(?:\.emit\(|\.on\(|subscribe|publish)/.test(diffs);
+
+      if (strong) return 3;
+      if (moderate) return 2;
+      if (weak) return 1;
+      return 0;
+    } else {
+      // Strong: import/instantiation of CallbackRegistry class
+      const strong = /(?:import\s+.*CallbackRegistry|new\s+CallbackRegistry)/.test(diffs);
+      // Moderate: class/instance name reference
+      const moderate = /(?:CallbackRegistry|callbackRegistry|statusChangeCallbacks)/.test(diffs);
+      // Weak: generic terms
+      const weak = /(?:\.register\(|\.notify\()/.test(diffs);
+
+      if (strong) return 3;
+      if (moderate) return 2;
+      if (weak) return 1;
+      return 0;
+    }
+  }
+
+  /**
+   * Check whether an agent's diff ONLY uses the added lines (new code) for pattern
+   * detection, filtering out context/removed lines to avoid false positives from
+   * pre-existing code.
+   */
+  private extractAddedLines(diff: string): string {
+    return diff
+      .split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .join('\n');
+  }
+
+  /**
    * Score decision propagation: Did B and C both follow A's SPECIFIC pattern choice?
    *
    * Detects whether A chose EventBus or CallbackRegistry, then checks if B and C
-   * used that same pattern group. Using the alternative pattern is NOT alignment.
+   * used that same pattern group. Uses strength-based matching to avoid false positives
+   * from generic terms like "subscribe" or "register" appearing in unrelated code.
    *
-   * 100 = both aligned with A's specific choice.
-   * 50 = one aligned.
-   * 0 = neither aligned (or used the wrong pattern).
+   * Scoring (per agent B/C, 50 pts each):
+   * - 50: strong alignment (imports/instantiates A's chosen pattern class)
+   * - 35: moderate alignment (references pattern class name)
+   * - 15: weak alignment (only generic terms that match the pattern)
+   * - 0: no alignment or used the wrong pattern
+   *
+   * Penalties:
+   * - Using the WRONG pattern (the one A rejected) subtracts points
+   * - Mixed usage (both patterns) gets reduced credit
    */
   private scoreDecisionPropagation(
     rawResults: RawResults,
@@ -520,68 +576,60 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     }
 
     const aChoiceLabel = aChoice === 'eventbus' ? 'EventBus' : 'CallbackRegistry';
-    let bAligned = false;
-    let cAligned = false;
+    const alternatePattern = aChoice === 'eventbus' ? 'callback' : 'eventbus';
     let anyMissingDiffs = aHasMissingDiffs;
     const details: string[] = [`Agent A chose ${aChoiceLabel}.`];
+    let totalScore = 0;
 
-    // Check if B follows A's specific pattern choice
-    if (transcriptB) {
-      const bDiffs = transcriptB.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-      const bHasMissingDiffs = transcriptB.fileChanges.some((c) => c.diff === undefined);
-      if (bHasMissingDiffs) anyMissingDiffs = true;
-      if (bHasMissingDiffs && bDiffs.length === 0) {
-        details.push('Agent B has no diff data.');
-      } else {
-        const bChoice = this.detectPatternChoice(bDiffs);
-        bAligned = bChoice === aChoice;
-        if (bAligned) {
-          details.push(`Agent B followed ${aChoiceLabel}.`);
-        } else if (bChoice === 'none') {
-          details.push('Agent B did not use a recognizable pattern.');
-        } else {
-          const bLabel = bChoice === 'eventbus' ? 'EventBus' : bChoice === 'callback' ? 'CallbackRegistry' : 'mixed patterns';
-          details.push(`Agent B used ${bLabel} instead of ${aChoiceLabel}.`);
-        }
+    // Score each follower agent (B and C), 50 points max each
+    for (const [label, transcript] of [['B', transcriptB], ['C', transcriptC]] as const) {
+      if (!transcript) {
+        details.push(`Agent ${label} did not produce a transcript.`);
+        continue;
       }
-    } else {
-      details.push('Agent B did not produce a transcript.');
-    }
 
-    // Check if C follows A's specific pattern choice
-    if (transcriptC) {
-      const cDiffs = transcriptC.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-      const cHasMissingDiffs = transcriptC.fileChanges.some((c) => c.diff === undefined);
-      if (cHasMissingDiffs) anyMissingDiffs = true;
-      if (cHasMissingDiffs && cDiffs.length === 0) {
-        details.push('Agent C has no diff data.');
-      } else {
-        const cChoice = this.detectPatternChoice(cDiffs);
-        cAligned = cChoice === aChoice;
-        if (cAligned) {
-          details.push(`Agent C followed ${aChoiceLabel}.`);
-        } else if (cChoice === 'none') {
-          details.push('Agent C did not use a recognizable pattern.');
-        } else {
-          const cLabel = cChoice === 'eventbus' ? 'EventBus' : cChoice === 'callback' ? 'CallbackRegistry' : 'mixed patterns';
-          details.push(`Agent C used ${cLabel} instead of ${aChoiceLabel}.`);
-        }
+      const agentDiffs = transcript.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+      const agentHasMissingDiffs = transcript.fileChanges.some((c) => c.diff === undefined);
+      if (agentHasMissingDiffs) anyMissingDiffs = true;
+
+      if (agentHasMissingDiffs && agentDiffs.length === 0) {
+        details.push(`Agent ${label} has no diff data.`);
+        continue;
       }
-    } else {
-      details.push('Agent C did not produce a transcript.');
-    }
 
-    let value: number;
-    if (bAligned && cAligned) {
-      value = 100;
-    } else if (bAligned || cAligned) {
-      value = 50;
-    } else {
-      value = 0;
+      // Use only added lines to avoid matching pre-existing code in diff context
+      const addedLines = this.extractAddedLines(agentDiffs);
+
+      const correctStrength = this.measurePatternStrength(addedLines, aChoice);
+      const wrongStrength = this.measurePatternStrength(addedLines, alternatePattern);
+
+      let agentScore: number;
+      if (correctStrength === 0 && wrongStrength === 0) {
+        agentScore = 0;
+        details.push(`Agent ${label} did not use a recognizable pattern.`);
+      } else if (wrongStrength > correctStrength) {
+        // Used the WRONG pattern more strongly than the correct one
+        agentScore = 0;
+        const wrongLabel = alternatePattern === 'eventbus' ? 'EventBus' : 'CallbackRegistry';
+        details.push(`Agent ${label} used ${wrongLabel} instead of ${aChoiceLabel}.`);
+      } else if (correctStrength > 0 && wrongStrength > 0) {
+        // Mixed: used both, but correct pattern is dominant
+        // Give partial credit scaled down
+        const strengthScores: Record<number, number> = { 3: 25, 2: 15, 1: 5 };
+        agentScore = strengthScores[correctStrength] ?? 0;
+        details.push(`Agent ${label} used ${aChoiceLabel} but also mixed in the alternative pattern (${agentScore}/50).`);
+      } else {
+        // Pure correct pattern usage, score by strength
+        const strengthScores: Record<number, number> = { 3: 50, 2: 35, 1: 15 };
+        agentScore = strengthScores[correctStrength] ?? 0;
+        details.push(`Agent ${label} followed ${aChoiceLabel} (strength ${correctStrength}/3, ${agentScore}/50).`);
+      }
+
+      totalScore += agentScore;
     }
 
     return {
-      value,
+      value: totalScore,
       confidence: 'medium',
       method: 'automated',
       justification: details.join(' '),
@@ -778,12 +826,33 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   }
 
   /**
-   * Score decision quality: Was A's decision well-reasoned?
+   * Score decision quality: Was A's decision well-reasoned and well-implemented?
    *
-   * Rubric-scored against ground truth:
-   * - Did A choose an appropriate pattern (event-driven/observer)?
-   * - Did A document the decision?
-   * - Did A implement it correctly?
+   * Five rubric dimensions with graduated scoring:
+   *
+   * 1. Clear pattern choice (0/10/25): Did A commit to ONE pattern exclusively?
+   *    - 25: Only one pattern group found in added lines (clear choice)
+   *    - 10: One dominant but some traces of the other (mostly unified)
+   *    - 0: Mixed equally or no recognizable pattern
+   *
+   * 2. Anti-pattern avoidance (0/15): Did A avoid tight coupling?
+   *
+   * 3. Decision documentation (0/5/10/20): How thoroughly did A document?
+   *    - 20: Dedicated doc file (.md) with rationale keywords (why/because/trade-off)
+   *    - 10: Dedicated doc file without rationale, or rationale in code comments only
+   *    - 5: Only generic comments mentioning the decision
+   *    - 0: No documentation found
+   *
+   * 4. Implementation scope (0/5/10/20): Did A actually refactor the codebase?
+   *    - 20: Modified 3+ relevant files (broad refactor)
+   *    - 10: Modified 2 relevant files
+   *    - 5: Modified 1 relevant file
+   *    - 0: No relevant files modified
+   *
+   * 5. Removal of old pattern (0/10/20): Did A clean up the rejected pattern?
+   *    - 20: Added lines of chosen pattern AND removed lines of rejected pattern
+   *    - 10: Only added chosen pattern (may have left old code in place)
+   *    - 0: No evidence of cleanup
    */
   private scoreDecisionQuality(
     rawResults: RawResults,
@@ -828,46 +897,96 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    // Check: Did A use an expected pattern?
-    const usedExpectedPattern = decouplingDecision.expectedPatterns.some(
-      (p) => new RegExp(p).test(aDiffs),
-    );
-    if (usedExpectedPattern) {
-      score += 40;
-      details.push('Agent A chose an appropriate decoupling pattern.');
+    // Extract added and removed lines separately for more precise analysis
+    const addedLines = this.extractAddedLines(aDiffs);
+    const removedLines = aDiffs
+      .split('\n')
+      .filter((line) => line.startsWith('-') && !line.startsWith('---'))
+      .join('\n');
+
+    // Dimension 1: Clear pattern choice (0/10/25)
+    const ebStrength = this.measurePatternStrength(addedLines, 'eventbus');
+    const cbStrength = this.measurePatternStrength(addedLines, 'callback');
+
+    if ((ebStrength > 0 && cbStrength === 0) || (cbStrength > 0 && ebStrength === 0)) {
+      score += 25;
+      const chosenLabel = ebStrength > 0 ? 'EventBus' : 'CallbackRegistry';
+      details.push(`Clear pattern choice: ${chosenLabel} only (25/25).`);
+    } else if (ebStrength > 0 && cbStrength > 0 && Math.abs(ebStrength - cbStrength) >= 2) {
+      score += 10;
+      details.push(`Mostly unified pattern but traces of both (10/25).`);
+    } else if (ebStrength > 0 && cbStrength > 0) {
+      details.push(`Mixed patterns without clear dominance (0/25).`);
     } else {
-      details.push('Agent A did not use a recognized decoupling pattern.');
+      details.push(`No recognizable decoupling pattern in added code (0/25).`);
     }
 
-    // Check: Did A avoid anti-patterns?
+    // Dimension 2: Anti-pattern avoidance (0/15)
     const usedAntiPattern = decouplingDecision.antiPatterns.some(
-      (p) => new RegExp(p).test(aDiffs),
+      (p) => new RegExp(p).test(addedLines),
     );
     if (!usedAntiPattern) {
-      score += 20;
-      details.push('No anti-patterns detected.');
+      score += 15;
+      details.push('No anti-patterns detected (15/15).');
     } else {
-      details.push('Agent A introduced anti-patterns in the decoupling.');
+      details.push('Anti-patterns found in added code (0/15).');
     }
 
-    // Check: Did A document the decision? Look for markdown/doc/comment changes
-    const docPatterns = /(?:\.md|decision|rationale|chose|because|approach|architecture)/i;
-    const hasDocumentation = transcriptA.fileChanges.some(
-      (c) => docPatterns.test(c.path) || docPatterns.test(c.diff ?? ''),
+    // Dimension 3: Decision documentation (0/5/10/20)
+    const docFiles = transcriptA.fileChanges.filter((c) => /\.md$/i.test(c.path));
+    const hasDocFile = docFiles.length > 0;
+    const docDiffs = docFiles.map((c) => c.diff ?? '').join('\n');
+    const hasRationale = /(?:because|trade-?off|advantage|disadvantage|chose.*over|prefer.*over|reason|rationale)/i.test(docDiffs);
+    const hasRationaleInCode = /(?:because|trade-?off|chose.*over|prefer.*over|rationale)/i.test(addedLines);
+
+    if (hasDocFile && hasRationale) {
+      score += 20;
+      details.push('Documented decision with rationale in dedicated file (20/20).');
+    } else if (hasDocFile || hasRationaleInCode) {
+      score += 10;
+      details.push(`${hasDocFile ? 'Doc file without rationale' : 'Rationale in code comments only'} (10/20).`);
+    } else if (/(?:decision|architecture|approach)/i.test(addedLines)) {
+      score += 5;
+      details.push('Generic decision mention without rationale (5/20).');
+    } else {
+      details.push('No decision documentation found (0/20).');
+    }
+
+    // Dimension 4: Implementation scope (0/5/10/20)
+    const relevantFilePaths = decouplingDecision.affectedFiles;
+    const modifiedRelevantFiles = transcriptA.fileChanges.filter((c) =>
+      relevantFilePaths.some((rf) => c.path.includes(rf.replace(/^src\//, ''))),
     );
-    if (hasDocumentation) {
+    const relevantCount = modifiedRelevantFiles.length;
+
+    if (relevantCount >= 3) {
       score += 20;
-      details.push('Agent A documented the decision.');
+      details.push(`Modified ${relevantCount} relevant files — broad refactor (20/20).`);
+    } else if (relevantCount === 2) {
+      score += 10;
+      details.push(`Modified ${relevantCount} relevant files — partial refactor (10/20).`);
+    } else if (relevantCount === 1) {
+      score += 5;
+      details.push(`Modified ${relevantCount} relevant file — minimal refactor (5/20).`);
     } else {
-      details.push('Agent A did not clearly document the decision.');
+      details.push('No relevant architectural files modified (0/20).');
     }
 
-    // Check: Did A actually make code changes?
-    if (transcriptA.fileChanges.length > 0 && transcriptA.exitReason === 'completed') {
+    // Dimension 5: Removal of old pattern (0/10/20)
+    // Did A remove lines containing the rejected pattern?
+    const chosenPattern = ebStrength >= cbStrength ? 'eventbus' : 'callback';
+    const rejectedPattern = chosenPattern === 'eventbus' ? 'callback' : 'eventbus';
+    const removedRejectedStrength = this.measurePatternStrength(removedLines, rejectedPattern);
+    const addedChosenStrength = this.measurePatternStrength(addedLines, chosenPattern);
+
+    if (addedChosenStrength > 0 && removedRejectedStrength > 0) {
       score += 20;
-      details.push('Agent A completed implementation.');
+      details.push('Removed old pattern code and added new — full cleanup (20/20).');
+    } else if (addedChosenStrength > 0) {
+      score += 10;
+      details.push('Added chosen pattern but did not remove old pattern code (10/20).');
     } else {
-      details.push('Agent A did not complete implementation.');
+      details.push('No evidence of pattern cleanup (0/20).');
     }
 
     return {

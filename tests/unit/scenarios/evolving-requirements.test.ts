@@ -167,7 +167,7 @@ describe('EvolvingRequirementsScenario', () => {
   });
 
   describe('score() — requirementAdaptation', () => {
-    it('scores high when session 3 creates a priority router with priority patterns', async () => {
+    it('scores high when session 3 creates a priority router with routing logic, channel mappings, and updates notification service', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -192,6 +192,14 @@ describe('EvolvingRequirementsScenario', () => {
 +  }
 +}`,
               },
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 10,
+                linesRemoved: 5,
+                diff: `+import { PriorityRouter } from './priority-router';
++this.priorityRouter.route(notification);`,
+              },
             ],
           }),
           makeTranscript({ taskIndex: 3 }),
@@ -203,11 +211,11 @@ describe('EvolvingRequirementsScenario', () => {
 
       const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
 
-      // Priority router present + all 3 priority patterns = 50 + 50 = 100
+      // Router file (15) + routing logic (15) + 3 channel mappings (50) + notification service updated (20) = 100
       expect(scored.scores.requirementAdaptation.value).toBe(100);
     });
 
-    it('scores partially when priority router exists but some patterns are missing', async () => {
+    it('scores partially when priority router file exists but has no routing logic or channel mappings', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -222,7 +230,7 @@ describe('EvolvingRequirementsScenario', () => {
                 changeType: 'added',
                 linesAdded: 30,
                 linesRemoved: 0,
-                diff: '+export class PriorityRouter { route() { /* urgent only */ } }',
+                diff: '+export class PriorityRouter { /* placeholder */ }',
               },
             ],
           }),
@@ -235,9 +243,8 @@ describe('EvolvingRequirementsScenario', () => {
 
       const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
 
-      // Has priority router (50) + urgent (1/3 * 50 ≈ 17) = ~67
-      expect(scored.scores.requirementAdaptation.value).toBeGreaterThan(50);
-      expect(scored.scores.requirementAdaptation.value).toBeLessThan(100);
+      // Router file only (15), no routing logic, no channel mappings, no notification update
+      expect(scored.scores.requirementAdaptation.value).toBe(15);
     });
 
     it('scores 0 when session 3 is missing', async () => {
@@ -269,7 +276,7 @@ describe('EvolvingRequirementsScenario', () => {
             taskIndex: 2,
             fileChanges: [
               {
-                path: 'src/services/notification.service.ts',
+                path: 'src/utils/helpers.ts',
                 changeType: 'modified',
                 linesAdded: 5,
                 linesRemoved: 2,
@@ -287,6 +294,43 @@ describe('EvolvingRequirementsScenario', () => {
       const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
 
       expect(scored.scores.requirementAdaptation.value).toBe(0);
+    });
+
+    it('gives partial credit when router has some but not all channel mappings', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/services/priority-router.ts',
+                changeType: 'added',
+                linesAdded: 40,
+                linesRemoved: 0,
+                diff: `+export class PriorityRouter {
++  route(notification: Notification) {
++    if (notification.priority === 'urgent') return this.smsService.send(notification);
++  }
++}`,
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 3 }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
+
+      // Router file (15) + routing logic (15) + 1/3 channel mapping (17) = 47
+      expect(scored.scores.requirementAdaptation.value).toBeGreaterThan(30);
+      expect(scored.scores.requirementAdaptation.value).toBeLessThan(60);
     });
   });
 
@@ -433,7 +477,7 @@ describe('EvolvingRequirementsScenario', () => {
   });
 
   describe('score() — integrationCompleteness', () => {
-    it('scores 100 when session 4 adds audit, preferences, and integration tests', async () => {
+    it('scores high when session 4 has substantive audit, preferences, and integration tests', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -449,21 +493,38 @@ describe('EvolvingRequirementsScenario', () => {
                 changeType: 'added',
                 linesAdded: 40,
                 linesRemoved: 0,
-                diff: '+export class AuditService { log(notification) {} }',
+                diff: `+export class AuditService {
++  private logs: AuditEntry[] = [];
++  log(notification: Notification) {
++    this.logs.push({ event: notification.type, timestamp: Date.now() });
++  }
++}`,
               },
               {
                 path: 'src/services/notification-preferences.service.ts',
                 changeType: 'added',
                 linesAdded: 30,
                 linesRemoved: 0,
-                diff: '+export class NotificationPreferencesService { getPreferences(userId) {} }',
+                diff: `+export class NotificationPreferencesService {
++  getPreferences(userId: string) {
++    return this.store.get(userId) ?? { channel: 'email' };
++  }
++  setPreference(userId: string, channel: string) {
++    this.store.set(userId, { channel, override: true });
++  }
++}`,
               },
               {
                 path: 'tests/integration/notification-flow.test.ts',
                 changeType: 'added',
                 linesAdded: 60,
                 linesRemoved: 0,
-                diff: '+describe("integration test: notification flow", () => { it("routes urgent to SMS", () => {}) })',
+                diff: `+describe("integration test: notification flow", () => {
++  it("routes urgent to SMS", () => {
++    const result = router.route({ priority: 'urgent', message: 'test' });
++    expect(result.channel).toBe('sms');
++  });
++});`,
               },
             ],
           }),
@@ -475,10 +536,13 @@ describe('EvolvingRequirementsScenario', () => {
 
       const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
 
+      // Audit: file (15) + logging logic (20) = 35
+      // Preferences: file (15) + per-user logic (20) = 35
+      // Tests: file (10) + assertions (10) + flow refs (10) = 30
       expect(scored.scores.integrationCompleteness.value).toBe(100);
     });
 
-    it('scores partially when only some integration elements are present', async () => {
+    it('scores low when files exist but lack substantive logic', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -492,11 +556,17 @@ describe('EvolvingRequirementsScenario', () => {
               {
                 path: 'src/services/audit.service.ts',
                 changeType: 'added',
-                linesAdded: 40,
+                linesAdded: 10,
                 linesRemoved: 0,
-                diff: '+export class AuditService { log(n) {} }',
+                diff: '+export class AuditService { /* TODO */ }',
               },
-              // Missing preferences and integration tests
+              {
+                path: 'src/services/notification-preferences.service.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                diff: '+export class NotificationPreferencesService { /* TODO */ }',
+              },
             ],
           }),
         ],
@@ -507,8 +577,8 @@ describe('EvolvingRequirementsScenario', () => {
 
       const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
 
-      // 1/3 = 33
-      expect(scored.scores.integrationCompleteness.value).toBe(33);
+      // Audit file only (15) + Preferences file only (15) + no tests = 30
+      expect(scored.scores.integrationCompleteness.value).toBe(30);
     });
 
     it('scores 0 when session 4 is missing', async () => {
@@ -522,6 +592,37 @@ describe('EvolvingRequirementsScenario', () => {
         ],
         finalWorkingDir: '/tmp/test',
         allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, EVOLVING_REQUIREMENTS_GROUND_TRUTH);
+
+      expect(scored.scores.integrationCompleteness.value).toBe(0);
+    });
+
+    it('scores 0 when session 4 has no audit, preferences, or test files', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({ taskIndex: 2 }),
+          makeTranscript({
+            taskIndex: 3,
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 3,
+                linesRemoved: 1,
+                diff: '+// minor cleanup',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
         errors: [],
       };
 
@@ -547,7 +648,15 @@ describe('EvolvingRequirementsScenario', () => {
                 changeType: 'added',
                 linesAdded: 60,
                 linesRemoved: 0,
-                diff: '+export class PriorityRouter { route(n) { if (n.priority==="urgent") {} if (n.priority==="normal") {} if (n.priority==="low") {} } }',
+                diff: `+export class PriorityRouter {
++  route(notification: Notification) {
++    switch (notification.priority) {
++      case 'urgent': return this.smsService.send(notification);
++      case 'normal': return this.emailService.send(notification);
++      case 'low': return this.webhookService.send(notification);
++    }
++  }
++}`,
               },
             ],
           }),
@@ -559,21 +668,32 @@ describe('EvolvingRequirementsScenario', () => {
                 changeType: 'added',
                 linesAdded: 30,
                 linesRemoved: 0,
-                diff: '+export class AuditService {}',
+                diff: `+export class AuditService {
++  log(notification: Notification) {
++    this.entries.push({ event: notification.type, timestamp: Date.now() });
++  }
++}`,
               },
               {
                 path: 'src/services/notification-preferences.service.ts',
                 changeType: 'added',
                 linesAdded: 20,
                 linesRemoved: 0,
-                diff: '+export class NotificationPreferencesService {}',
+                diff: `+export class NotificationPreferencesService {
++  getPreferences(userId: string) { return this.store.get(userId); }
++  setPreference(userId: string, channel: string) { this.store.set(userId, { channel, override: true }); }
++}`,
               },
               {
                 path: 'tests/integration/flow.test.ts',
                 changeType: 'added',
                 linesAdded: 40,
                 linesRemoved: 0,
-                diff: '+describe("integration test: full flow", () => {})',
+                diff: `+describe("integration test: full notification flow", () => {
++  it("routes priority correctly", () => {
++    expect(router.route({ priority: 'urgent' }).channel).toBe('sms');
++  });
++});`,
               },
             ],
           }),

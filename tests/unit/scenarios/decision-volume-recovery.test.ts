@@ -300,7 +300,62 @@ describe('DecisionVolumeRecoveryScenario', () => {
   });
 
   describe('score() — patternCompliance', () => {
-    it('scores 100 when both B and C use interfaces and error handling', async () => {
+    it('scores 100 when both B and C use interfaces, try/catch, typed errors, and Logger', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              {
+                path: 'src/services/user.service.ts',
+                changeType: 'modified',
+                linesAdded: 40,
+                linesRemoved: 5,
+                diff: `+import { IUserRepository } from '../repositories/user.repository.ts';
++import { Logger } from '../utils/logger';
++try {
++  const user = await this.userRepo.findById(id);
++  logger.info('found user');
++} catch (err: unknown) {
++  throw new Error('not found');
++}`,
+              },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'src/services/order.service.ts',
+                changeType: 'modified',
+                linesAdded: 30,
+                linesRemoved: 5,
+                diff: `+import { IOrderRepository } from '../repositories/order.repository.ts';
++import { Logger } from '../utils/logger';
++try {
++  await this.orderRepo.recordHistory(transition);
++  logger.info('recorded');
++} catch (err: unknown) {
++  throw new Error('history failed');
++}`,
+              },
+            ],
+          }),
+          makeTranscript({ taskIndex: 3 }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, DECISION_VOLUME_RECOVERY_GROUND_TRUTH);
+      expect(scored.scores.patternCompliance.value).toBe(100);
+    });
+
+    it('scores 75 when agents use interface, try/catch, typed errors but no Logger', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -348,10 +403,10 @@ describe('DecisionVolumeRecoveryScenario', () => {
       };
 
       const scored = await scenario.score(rawResults, DECISION_VOLUME_RECOVERY_GROUND_TRUTH);
-      expect(scored.scores.patternCompliance.value).toBe(100);
+      expect(scored.scores.patternCompliance.value).toBe(75);
     });
 
-    it('scores 50 when only B complies', async () => {
+    it('scores partial when only B complies with some patterns', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -365,7 +420,7 @@ describe('DecisionVolumeRecoveryScenario', () => {
                 changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 2,
-                diff: '+const repo: IUserRepository = this.userRepo;\n+try {} catch (e) { throw e; }',
+                diff: '+const repo: IUserRepository = this.userRepo;',
               },
             ],
           }),
@@ -389,11 +444,11 @@ describe('DecisionVolumeRecoveryScenario', () => {
       };
 
       const scored = await scenario.score(rawResults, DECISION_VOLUME_RECOVERY_GROUND_TRUTH);
-      // B = 100, C = 0 → avg 50
-      expect(scored.scores.patternCompliance.value).toBe(50);
+      // B = 25 (interface only), C = 0 → avg 13
+      expect(scored.scores.patternCompliance.value).toBe(13);
     });
 
-    it('scores 0 when neither B nor C use interface or error handling', async () => {
+    it('scores 0 when neither B nor C use any required patterns', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -436,7 +491,7 @@ describe('DecisionVolumeRecoveryScenario', () => {
   });
 
   describe('score() — crossCuttingConsistency', () => {
-    it('scores 100 when D creates integration tests covering both caching and order history', async () => {
+    it('scores 100 when D creates integration tests with all five signals', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
       const rawResults: RawResults = {
@@ -452,9 +507,16 @@ describe('DecisionVolumeRecoveryScenario', () => {
                 changeType: 'added',
                 linesAdded: 80,
                 linesRemoved: 0,
-                diff: `+describe('integration', () => {
-+  it('cache hit for findById', async () => { /* tests cache */ });
-+  it('records order history transition', async () => { /* tests orderHistory */ });
+                diff: `+import { IUserRepository } from '../../src/repositories/user.repository';
++describe('integration', () => {
++  it('cache hit for findById', async () => {
++    const cached = await service.findById(1);
++    expect(cached).toBe(fromCache);
++  });
++  it('records order history transition', async () => {
++    const entry = await service.recordTransition(order, 'shipped');
++    expect(entry.timestamp).toBeDefined();
++  });
 +})`,
               },
             ],
@@ -485,7 +547,12 @@ describe('DecisionVolumeRecoveryScenario', () => {
                 changeType: 'added',
                 linesAdded: 40,
                 linesRemoved: 0,
-                diff: '+describe("cache", () => { it("hits cache", () => {}); });',
+                diff: `+describe("cache", () => {
++  it("hits cache on second call", () => {
++    const cached = service.findById(1);
++    expect(isCached(cached)).toBe(true);
++  });
++});`,
               },
             ],
           }),
@@ -496,8 +563,39 @@ describe('DecisionVolumeRecoveryScenario', () => {
       };
 
       const scored = await scenario.score(rawResults, DECISION_VOLUME_RECOVERY_GROUND_TRUTH);
-      expect(scored.scores.crossCuttingConsistency.value).toBeGreaterThan(0);
-      expect(scored.scores.crossCuttingConsistency.value).toBeLessThan(100);
+      // integration dir (20) + cache hit/miss (20) = 40, no history, no interface, no cross-feature
+      expect(scored.scores.crossCuttingConsistency.value).toBe(40);
+    });
+
+    it('scores 10 when D creates test files outside integration directory with no specific assertions', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({ taskIndex: 2 }),
+          makeTranscript({
+            taskIndex: 3,
+            fileChanges: [
+              {
+                path: 'src/services/__tests__/stuff.test.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                diff: '+describe("stuff", () => { it("works", () => {}); });',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, DECISION_VOLUME_RECOVERY_GROUND_TRUTH);
+      // Only partial credit for test file outside integration dir (10 pts)
+      expect(scored.scores.crossCuttingConsistency.value).toBe(10);
     });
 
     it('scores 0 when agent D is missing', async () => {
@@ -684,7 +782,11 @@ describe('DecisionVolumeRecoveryScenario', () => {
                 changeType: 'added',
                 linesAdded: 70,
                 linesRemoved: 0,
-                diff: '+describe("integration", () => { it("cache hit", () => {}); it("order history transition", () => {}); })',
+                diff: `+import { IUserRepository } from '../../src/repositories/user.repository';
++describe("integration", () => {
++  it("cache hit returns cached value", () => { expect(fromCache).toBe(true); });
++  it("records order status transition with timestamp", () => { expect(entry.timestamp).toBeDefined(); });
++})`,
               },
             ],
           }),

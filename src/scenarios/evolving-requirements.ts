@@ -299,8 +299,9 @@ export class EvolvingRequirementsScenario extends BaseScenario {
   /**
    * Score requirement adaptation (weight 0.30).
    *
-   * Checks session 3's diffs for priority router creation and priority patterns
-   * (urgent, normal, low). Higher score = better adaptation to the new requirement.
+   * Checks session 3's diffs for priority router creation with actual routing
+   * logic (not just file existence), and verifies that routing patterns connect
+   * priority levels to specific channels (urgent->SMS, normal->email, low->webhook).
    */
   private scoreRequirementAdaptation(rawResults: RawResults): DimensionScore {
     const transcript3 = rawResults.transcripts[2];
@@ -319,38 +320,75 @@ export class EvolvingRequirementsScenario extends BaseScenario {
       .join('\n');
 
     const files3 = transcript3.fileChanges.map((c) => c.path).join('\n');
-    const content = diffs3 + '\n' + files3;
 
     const details: string[] = [];
     let score = 0;
 
-    // Check for priority router creation (up to 50 points)
-    const hasPriorityRouter = /priorityRout|priority.?router|PriorityRout/i.test(content);
-    if (hasPriorityRouter) {
-      score += 50;
-      details.push('Priority router created.');
-    } else {
-      details.push('Priority router not found in session 3 output.');
-    }
+    // Check 1: Priority router file created (15 points for file, 15 more for routing logic in diff)
+    const hasPriorityRouterFile = /priority.?router/i.test(files3);
+    if (hasPriorityRouterFile) {
+      score += 15;
+      details.push('Priority router file created.');
 
-    // Check for routing patterns: urgent, normal, low (up to 50 points, ~16.7 each)
-    const patterns: Array<[string, RegExp]> = [
-      ['urgent', /urgent|URGENT/],
-      ['normal', /normal|NORMAL/],
-      ['low', /\blow\b|LOW/],
-    ];
-
-    let patternCount = 0;
-    for (const [label, re] of patterns) {
-      if (re.test(content)) {
-        patternCount++;
-        details.push(`Priority pattern '${label}' found.`);
+      // Check for actual routing logic in the diff (switch/case, if/else, map-based routing)
+      const hasRoutingLogic =
+        /switch\s*\(.*priority|case\s+['"]urgent|case\s+['"]normal|case\s+['"]low|priority\s*===?\s*['"]|\.get\s*\(\s*.*priority/i.test(diffs3) ||
+        /if\s*\(.*priority\s*===?\s*['"]urgent|if\s*\(.*priority\s*===?\s*['"]normal|if\s*\(.*priority\s*===?\s*['"]low/i.test(diffs3);
+      if (hasRoutingLogic) {
+        score += 15;
+        details.push('Priority routing logic found in diff.');
       } else {
-        details.push(`Priority pattern '${label}' missing.`);
+        details.push('Priority router file exists but no routing logic (switch/if on priority) found in diff.');
+      }
+    } else {
+      // Check if routing logic exists inline somewhere (e.g., in notification service)
+      const hasInlineRouting = /priority.?rout|PriorityRout/i.test(diffs3);
+      if (hasInlineRouting) {
+        score += 10;
+        details.push('Priority routing reference found in diffs but no dedicated router file.');
+      } else {
+        details.push('Priority router not found in session 3 output.');
       }
     }
 
-    score += Math.round((patternCount / patterns.length) * 50);
+    // Check 2: Priority-to-channel mapping (up to 50 points)
+    // Each mapping must connect a priority level to a specific channel in the diff
+    const channelMappings: Array<[string, string, RegExp]> = [
+      ['urgent', 'SMS', /urgent[^}]{0,100}sms|sms[^}]{0,100}urgent/i],
+      ['normal', 'email', /normal[^}]{0,100}email|email[^}]{0,100}normal/i],
+      ['low', 'webhook', /low[^}]{0,100}webhook|webhook[^}]{0,100}low/i],
+    ];
+
+    let mappingCount = 0;
+    for (const [priority, channel, re] of channelMappings) {
+      if (re.test(diffs3)) {
+        mappingCount++;
+        details.push(`Priority-to-channel mapping '${priority}->${channel}' found.`);
+      } else {
+        details.push(`Priority-to-channel mapping '${priority}->${channel}' missing.`);
+      }
+    }
+
+    score += Math.round((mappingCount / channelMappings.length) * 50);
+
+    // Check 3: Notification service updated to use the router (up to 20 points)
+    const notifServiceChanges = transcript3.fileChanges
+      .filter((c) => /notification.?service/i.test(c.path))
+      .map((c) => c.diff ?? '')
+      .join('\n');
+
+    if (notifServiceChanges.length > 0) {
+      const usesRouter = /priority.?router|PriorityRout|route.*priority|priority.*route/i.test(notifServiceChanges);
+      if (usesRouter) {
+        score += 20;
+        details.push('Notification service updated to use priority router.');
+      } else {
+        score += 5;
+        details.push('Notification service modified but no priority router integration found.');
+      }
+    } else {
+      details.push('Notification service not modified in session 3.');
+    }
 
     return {
       value: Math.min(100, score),
@@ -504,14 +542,14 @@ export class EvolvingRequirementsScenario extends BaseScenario {
   /**
    * Score integration completeness (weight 0.20).
    *
-   * Checks session 4's output for:
-   * - audit service creation
-   * - preferences service creation
-   * - integration test patterns
+   * Checks session 4's output for substantive implementations (not just file existence):
+   * - audit service with logging logic in diffs
+   * - preferences service with per-user override logic in diffs
+   * - integration tests that exercise the notification flow in diffs
    */
   private scoreIntegrationCompleteness(
     rawResults: RawResults,
-    groundTruth: ArchitecturalManifest,
+    _groundTruth: ArchitecturalManifest,
   ): DimensionScore {
     const transcript4 = rawResults.transcripts[3];
     if (!transcript4) {
@@ -523,52 +561,128 @@ export class EvolvingRequirementsScenario extends BaseScenario {
       };
     }
 
-    const content4 =
-      transcript4.fileChanges.map((c) => (c.diff ?? '') + c.path).join('\n') +
-      '\n' +
-      transcript4.fileChanges.map((c) => c.path).join('\n');
+    const diffs4 = transcript4.fileChanges
+      .map((c) => c.diff)
+      .filter((d): d is string => d !== undefined)
+      .join('\n');
 
     const details: string[] = [];
-    let found = 0;
-    const total = 3;
+    let score = 0;
 
-    // Check audit service
-    if (/AuditService|auditService|audit.service|audit\.log/i.test(content4)) {
-      found++;
-      details.push('Audit service found.');
+    // Check 1: Audit service (up to 35 points)
+    // Must have a dedicated file AND logging logic in its diff
+    const auditFiles = transcript4.fileChanges.filter(
+      (c) => /audit/i.test(c.path) && c.changeType === 'added',
+    );
+    const auditDiffs = auditFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
+
+    if (auditFiles.length > 0) {
+      score += 15;
+      details.push('Audit service file created.');
+
+      // Check for actual logging/recording logic
+      const hasLoggingLogic =
+        /log\s*\(|record\s*\(|save\s*\(|push\s*\(|append\s*\(|write\s*\(|emit\s*\(/i.test(auditDiffs) &&
+        /notification|dispatch|sent|event|message/i.test(auditDiffs);
+      if (hasLoggingLogic) {
+        score += 20;
+        details.push('Audit service contains logging/recording logic.');
+      } else {
+        details.push('Audit service file exists but lacks substantive logging logic in diff.');
+      }
     } else {
-      details.push('Audit service missing from session 4.');
+      // Check if audit logic was added to an existing file
+      if (/class\s+Audit|audit.*log|AuditService/i.test(diffs4)) {
+        score += 10;
+        details.push('Audit logic found in diffs but no dedicated audit file.');
+      } else {
+        details.push('Audit service missing from session 4.');
+      }
     }
 
-    // Check preferences service
-    if (/Preferences|preferences|PreferencesService/i.test(content4)) {
-      found++;
-      details.push('Preferences service found.');
+    // Check 2: Preferences service (up to 35 points)
+    // Must have a dedicated file AND per-user preference logic
+    const prefFiles = transcript4.fileChanges.filter(
+      (c) => /preference/i.test(c.path) && c.changeType === 'added',
+    );
+    const prefDiffs = prefFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
+
+    if (prefFiles.length > 0) {
+      score += 15;
+      details.push('Preferences service file created.');
+
+      // Check for per-user preference logic (user ID + channel/override)
+      const hasPreferenceLogic =
+        /user|userId|user_id/i.test(prefDiffs) &&
+        /channel|override|preference|getPreference|setPreference/i.test(prefDiffs);
+      if (hasPreferenceLogic) {
+        score += 20;
+        details.push('Preferences service contains per-user preference logic.');
+      } else {
+        details.push('Preferences service file exists but lacks per-user logic in diff.');
+      }
     } else {
-      details.push('Preferences service missing from session 4.');
+      // Check if preferences logic was added to an existing file
+      if (/class\s+.*Preferences|PreferencesService|notification.?preferences/i.test(diffs4)) {
+        score += 10;
+        details.push('Preferences logic found in diffs but no dedicated preferences file.');
+      } else {
+        details.push('Preferences service missing from session 4.');
+      }
     }
 
-    // Check integration tests
-    if (/integration.?test|describe.*integration|it\(.*flow|it\(.*end.to.end/i.test(content4)) {
-      found++;
-      details.push('Integration tests found.');
+    // Check 3: Integration tests (up to 30 points)
+    // Must have test files with actual test cases that reference the notification flow
+    const testFiles = transcript4.fileChanges.filter(
+      (c) => /test|spec/i.test(c.path) && /integration|flow|e2e|end.to.end/i.test(c.path + (c.diff ?? '')),
+    );
+    const testDiffs = testFiles
+      .map((c) => c.diff ?? '')
+      .join('\n');
+
+    if (testFiles.length > 0) {
+      score += 10;
+      details.push('Integration test file(s) found.');
+
+      // Check for actual test assertions
+      const hasAssertions = /expect\s*\(|assert\s*\(|should\s*\.|toBe|toEqual|toHave|toContain/i.test(testDiffs);
+      if (hasAssertions) {
+        score += 10;
+        details.push('Integration tests contain assertions.');
+      } else {
+        details.push('Integration test files lack assertions.');
+      }
+
+      // Check tests reference the notification flow (priority, routing, channels)
+      const referencesFlow =
+        /priority|route|sms|email|webhook|notification|channel/i.test(testDiffs);
+      if (referencesFlow) {
+        score += 10;
+        details.push('Integration tests reference notification flow components.');
+      } else {
+        details.push('Integration tests do not reference notification flow (priority/routing/channels).');
+      }
     } else {
-      details.push('Integration tests missing from session 4.');
-    }
-
-    const score = Math.round((found / total) * 100);
-
-    // Also check audit-and-preferences ground truth decision
-    const auditDecision = groundTruth.decisions.find((d) => d.id === 'audit-and-preferences');
-    if (auditDecision) {
-      // Already checked above — just use the score
+      // Fallback: check if test patterns exist in any session 4 diffs
+      const hasAnyTestPattern =
+        /describe\s*\(\s*['"].*integration|it\s*\(\s*['"].*flow|it\s*\(\s*['"].*end.to.end/i.test(diffs4);
+      if (hasAnyTestPattern) {
+        score += 10;
+        details.push('Integration test patterns found in session 4 diffs (not in dedicated test file).');
+      } else {
+        details.push('Integration tests missing from session 4.');
+      }
     }
 
     return {
-      value: score,
-      confidence: content4.length > 0 ? 'high' : 'medium',
+      value: Math.min(100, score),
+      confidence: diffs4.length > 0 ? 'high' : 'medium',
       method: 'automated',
-      justification: `${found}/${total} integration completeness checks passed. ${details.join(' ')}`,
+      justification: `Score ${score}/100. ${details.join(' ')}`,
     };
   }
 }
