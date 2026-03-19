@@ -18,6 +18,10 @@ def main():
         dest="output_format",
     )
     analyze_parser.add_argument("--output", type=Path, help="Output directory (default: run_dir/analysis/)")
+    analyze_parser.add_argument(
+        "--min-tokens", type=int, default=0,
+        help="Exclude scores/transcripts with totalTokens below this threshold (filters failed runs)",
+    )
 
     # compare <run-dir-1> <run-dir-2>
     compare_parser = subparsers.add_parser("compare", help="Compare two runs")
@@ -51,7 +55,21 @@ def run_analyze(args):
     from .reports import markdown, html, json_report
 
     run = load_run(args.run_dir)
-    print(f"Loaded run {run.metadata.id}: {len(run.scores)} scores, {len(run.transcripts)} transcripts")
+    total_scores = len(run.scores)
+    total_transcripts = len(run.transcripts)
+
+    # Filter out failed runs (e.g. rate-limited sessions with zero tokens)
+    if args.min_tokens > 0:
+        run.scores = [s for s in run.scores if s.metrics.totalTokens >= args.min_tokens]
+        run.transcripts = [t for t in run.transcripts if t.tokenUsage.total >= args.min_tokens]
+        run.session_data = [sd for sd in run.session_data if sd.transcript.tokenUsage.total >= args.min_tokens]
+        filtered_scores = total_scores - len(run.scores)
+        filtered_transcripts = total_transcripts - len(run.transcripts)
+        print(f"Loaded run {run.metadata.id}: {total_scores} scores, {total_transcripts} transcripts")
+        print(f"  Filtered {filtered_scores} scores and {filtered_transcripts} transcripts with <{args.min_tokens} tokens")
+        print(f"  Analyzing {len(run.scores)} scores, {len(run.transcripts)} transcripts")
+    else:
+        print(f"Loaded run {run.metadata.id}: {len(run.scores)} scores, {len(run.transcripts)} transcripts")
 
     results: dict = {}
 
