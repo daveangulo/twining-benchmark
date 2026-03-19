@@ -248,71 +248,104 @@ export class RunOrchestrator {
         ? seededShuffle(tuples, this.seed)
         : tuples;
 
-      for (let orderIndex = 0; orderIndex < executionOrder.length; orderIndex++) {
-        const { scenario, condition, iteration } = executionOrder[orderIndex]!;
+      // Filter out already-completed iterations (resume support)
+      const pendingTuples = executionOrder.filter(({ scenario, condition, iteration }) => {
+        const iterationKey = `${scenario.getMetadata().name}:${condition.name}:${iteration}`;
+        if (completedIterationKeys.has(iterationKey)) {
+          this.emitProgress({
+            type: 'iteration-complete',
+            runId,
+            scenario: scenario.getMetadata().name,
+            condition: condition.name,
+            iteration,
+            message: `Skipping ${iterationKey} (already completed)`,
+          });
+          return false;
+        }
+        return true;
+      });
+
+      const concurrency = Math.max(1, this.config.concurrency);
+
+      // Process a single iteration: execute, persist, emit progress
+      const processIteration = async (tuple: ExecutionTuple): Promise<void> => {
+        const { scenario, condition, iteration } = tuple;
         const scenarioMeta = scenario.getMetadata();
         const iterationKey = `${scenarioMeta.name}:${condition.name}:${iteration}`;
 
-            // Skip already-completed iterations when resuming
-            if (completedIterationKeys.has(iterationKey)) {
-              this.emitProgress({
-                type: 'iteration-complete',
-                runId,
-                scenario: scenarioMeta.name,
-                condition: condition.name,
-                iteration,
-                message: `Skipping ${iterationKey} (already completed)`,
-              });
-              continue;
-            }
+        this.emitProgress({
+          type: 'session-start',
+          runId,
+          scenario: scenarioMeta.name,
+          condition: condition.name,
+          iteration,
+          message: `Running ${iterationKey}`,
+        });
 
-            this.emitProgress({
-              type: 'session-start',
-              runId,
-              scenario: scenarioMeta.name,
-              condition: condition.name,
-              iteration,
-              message: `Running ${iterationKey}`,
-            });
+        const result = await this.executeIteration({
+          runId,
+          scenario,
+          condition,
+          iteration,
+          collector,
+        });
 
-            const result = await this.executeIteration({
-              runId,
-              scenario,
-              condition,
-              iteration,
-              collector,
-            });
+        // Persist scored results and transcripts via store
+        if (this.resultsStore && result.scoredResults) {
+          await this.resultsStore.saveScores(result.scoredResults);
+        }
+        if (this.resultsStore) {
+          for (const session of result.sessions) {
+            await this.resultsStore.saveTranscript(session.transcript);
+          }
+        }
 
-            iterations.push(result);
+        // Thread-safe: push + add + save are serialized by JS event loop
+        iterations.push(result);
+        completedIterationKeys.add(iterationKey);
+        const allSessions = iterations.flatMap(it => it.sessions);
+        await collector.savePartialRunState(runId, allSessions, {
+          currentScenario: scenarioMeta.name,
+          currentCondition: condition.name,
+          currentIteration: iteration,
+          completedIterationKeys: [...completedIterationKeys],
+        });
 
-            // Persist scored results and transcripts via store
-            if (this.resultsStore && result.scoredResults) {
-              await this.resultsStore.saveScores(result.scoredResults);
-            }
-            if (this.resultsStore) {
-              for (const session of result.sessions) {
-                await this.resultsStore.saveTranscript(session.transcript);
-              }
-            }
+        this.emitProgress({
+          type: 'iteration-complete',
+          runId,
+          scenario: scenarioMeta.name,
+          condition: condition.name,
+          iteration,
+          message: `Completed ${iterationKey}: ${result.sessions.length} sessions, ${result.errors.length} errors`,
+        });
+      };
 
-            // Incremental save after each iteration (crash-safe)
-            completedIterationKeys.add(iterationKey);
-            const allSessions = iterations.flatMap(it => it.sessions);
-            await collector.savePartialRunState(runId, allSessions, {
-              currentScenario: scenarioMeta.name,
-              currentCondition: condition.name,
-              currentIteration: iteration,
-              completedIterationKeys: [...completedIterationKeys],
-            });
+      // Execute with concurrency limit
+      if (concurrency <= 1) {
+        // Sequential execution (original behavior)
+        for (const tuple of pendingTuples) {
+          await processIteration(tuple);
+        }
+      } else {
+        // Parallel execution with concurrency limit
+        this.emitProgress({
+          type: 'session-start',
+          runId,
+          message: `Running ${pendingTuples.length} iterations with concurrency=${concurrency}`,
+        });
 
-            this.emitProgress({
-              type: 'iteration-complete',
-              runId,
-              scenario: scenarioMeta.name,
-              condition: condition.name,
-              iteration,
-              message: `Completed ${iterationKey}: ${result.sessions.length} sessions, ${result.errors.length} errors`,
-            });
+        // Simple concurrency limiter: maintain a pool of at most N in-flight promises
+        const inFlight = new Set<Promise<void>>();
+        for (const tuple of pendingTuples) {
+          const promise = processIteration(tuple).finally(() => inFlight.delete(promise));
+          inFlight.add(promise);
+          if (inFlight.size >= concurrency) {
+            await Promise.race(inFlight);
+          }
+        }
+        // Wait for remaining in-flight iterations
+        await Promise.all(inFlight);
       }
 
       runMetadata.status = 'completed';

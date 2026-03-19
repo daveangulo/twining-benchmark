@@ -25,6 +25,8 @@ export interface BenchmarkConfig {
   dashboardPort: number;
   /** Claude model for agent sessions (e.g. 'claude-sonnet-4-6'). If unset, uses CLI default. */
   agentModel?: string;
+  /** Max iterations to run in parallel (default: 1 = sequential). Each uses its own working directory. */
+  concurrency: number;
   /** LLM-as-judge model to use (default: claude-sonnet-4-6) */
   evaluatorModel: string;
   /** Composite score weights per scenario (overrides defaults) */
@@ -58,6 +60,7 @@ export const DEFAULT_CONFIG: BenchmarkConfig = {
   retryCount: 0,
   dashboardPort: 3838,
   evaluatorModel: 'claude-sonnet-4-6',
+  concurrency: 1,
 };
 
 export const DEFAULT_SCORE_WEIGHTS: ScoreWeights = {

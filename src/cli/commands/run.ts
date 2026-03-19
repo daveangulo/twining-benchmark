@@ -172,6 +172,7 @@ export function createRunCommand(): Command {
     )
     .option('--output <dir>', 'Output directory for results', DEFAULT_CONFIG.outputDirectory)
     .option('--model <model>', 'Claude model for agent sessions (e.g. claude-sonnet-4-6)')
+    .option('--concurrency <n>', 'Max iterations to run in parallel (default: 1)', '1')
     .option('--dry-run', 'Validate config and estimate cost without executing')
     .option('--verbose', 'Enable verbose logging')
     .action(async (opts: {
@@ -187,6 +188,7 @@ export function createRunCommand(): Command {
       scaleFactor?: string;
       output?: string;
       model?: string;
+      concurrency: string;
       dryRun?: boolean;
       verbose?: boolean;
     }) => {
@@ -265,6 +267,7 @@ export function createRunCommand(): Command {
           budgetDollars: budget,
           outputDirectory: opts.output ?? fileConfig.outputDirectory,
           ...(opts.model ? { agentModel: opts.model } : {}),
+          concurrency: parseInt(opts.concurrency, 10) || 1,
         };
 
         // Create scenario and condition instances
