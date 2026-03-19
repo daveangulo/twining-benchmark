@@ -555,7 +555,7 @@ export class ScaleStressTestScenario extends BaseScenario {
       };
     }
 
-    const lastTranscript = transcripts[transcripts.length - 1];
+    const lastTranscript = transcripts[transcripts.length - 1]!;
     const details: string[] = [];
     let score = 0;
 
@@ -606,19 +606,19 @@ export class ScaleStressTestScenario extends BaseScenario {
     // Do later sessions touch files created by earlier sessions?
     const filesBySession: Map<number, Set<string>> = new Map();
     for (let i = 0; i < transcripts.length; i++) {
-      filesBySession.set(i, new Set(transcripts[i].fileChanges.map((fc) => fc.path)));
+      filesBySession.set(i, new Set(transcripts[i]!.fileChanges.map((fc) => fc.path)));
     }
     let crossSessionTouches = 0;
     let totalLateFiles = 0;
     const midpoint = Math.floor(transcripts.length / 2);
     const earlyFiles = new Set<string>();
     for (let i = 0; i < midpoint; i++) {
-      for (const fc of transcripts[i].fileChanges) {
+      for (const fc of transcripts[i]!.fileChanges) {
         earlyFiles.add(fc.path);
       }
     }
     for (let i = midpoint; i < transcripts.length; i++) {
-      for (const fc of transcripts[i].fileChanges) {
+      for (const fc of transcripts[i]!.fileChanges) {
         totalLateFiles++;
         if (earlyFiles.has(fc.path)) {
           crossSessionTouches++;
@@ -628,7 +628,7 @@ export class ScaleStressTestScenario extends BaseScenario {
     // Also check: do late sessions read early files? (via Read tool calls)
     let crossSessionReads = 0;
     for (let i = midpoint; i < transcripts.length; i++) {
-      for (const tc of transcripts[i].toolCalls) {
+      for (const tc of transcripts[i]!.toolCalls) {
         if (tc.toolName === 'Read' && tc.parameters) {
           const filePath = String(tc.parameters.file_path || tc.parameters.path || '');
           if (earlyFiles.has(filePath)) {

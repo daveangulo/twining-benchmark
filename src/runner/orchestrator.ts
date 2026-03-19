@@ -115,8 +115,8 @@ export function captureEnvironment(): RunEnvironment {
   return {
     nodeVersion: process.version,
     platform: process.platform,
-    claudeModel: process.env['ANTHROPIC_MODEL'] ?? 'claude-sonnet-4-5-20250929',
-    evaluatorModel: process.env['EVALUATOR_MODEL'] ?? 'claude-sonnet-4-5-20250929',
+    claudeModel: process.env['ANTHROPIC_MODEL'] ?? 'claude-sonnet-4-6',
+    evaluatorModel: process.env['EVALUATOR_MODEL'] ?? 'claude-sonnet-4-6',
     harnessVersion: pkg.version,
     harnessCommitSha,
     twiningMcpVersion,
@@ -388,6 +388,7 @@ export class RunOrchestrator {
           workingDir: workingDir.path,
           agentConfig: conditionCtx.agentConfig,
           timeoutMs: this.config.agentTimeoutMs,
+          model: this.config.agentModel,
         });
 
         // 6. Execute tasks sequentially

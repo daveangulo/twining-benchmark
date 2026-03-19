@@ -23,7 +23,9 @@ export interface BenchmarkConfig {
   retryCount: number;
   /** Dashboard server port (default: 3838) */
   dashboardPort: number;
-  /** LLM-as-judge model to use (default: claude-sonnet) */
+  /** Claude model for agent sessions (e.g. 'claude-sonnet-4-6'). If unset, uses CLI default. */
+  agentModel?: string;
+  /** LLM-as-judge model to use (default: claude-sonnet-4-6) */
   evaluatorModel: string;
   /** Composite score weights per scenario (overrides defaults) */
   scoreWeights?: Record<string, ScoreWeights>;
@@ -55,7 +57,7 @@ export const DEFAULT_CONFIG: BenchmarkConfig = {
   maxTurns: 50,
   retryCount: 0,
   dashboardPort: 3838,
-  evaluatorModel: 'claude-sonnet-4-5-20250929',
+  evaluatorModel: 'claude-sonnet-4-6',
 };
 
 export const DEFAULT_SCORE_WEIGHTS: ScoreWeights = {

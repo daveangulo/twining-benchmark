@@ -35,6 +35,8 @@ export interface AgentSessionOptions {
   agentConfig: AgentConfiguration;
   /** Session timeout in milliseconds (default: 15 min) */
   timeoutMs?: number;
+  /** Claude model to use (e.g. 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'). Defaults to CLI default. */
+  model?: string;
 }
 
 /**
@@ -188,6 +190,7 @@ export class AgentSessionManager {
   private readonly workingDir: string;
   private readonly agentConfig: AgentConfiguration;
   private readonly timeoutMs: number;
+  private readonly model?: string;
   private conversationHistory: string[] = [];
 
   constructor(options: AgentSessionOptions) {
@@ -197,6 +200,7 @@ export class AgentSessionManager {
     this.workingDir = options.workingDir;
     this.agentConfig = options.agentConfig;
     this.timeoutMs = options.timeoutMs ?? 15 * 60 * 1000;
+    this.model = options.model;
   }
 
   /**
@@ -402,6 +406,7 @@ export class AgentSessionManager {
       allowedTools: this.agentConfig.allowedTools,
       persistSession: false,
       env: cleanEnv,
+      ...(this.model ? { model: this.model } : {}),
     };
 
     // System prompt
