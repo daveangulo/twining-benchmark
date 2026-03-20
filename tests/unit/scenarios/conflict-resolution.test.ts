@@ -312,6 +312,149 @@ describe('ConflictResolutionScenario', () => {
       expect(scored.scores['decision-documentation'].value).toBe(0);
     });
 
+    it('scores decision documentation for Twining decide tool calls', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({
+            taskIndex: 2,
+            toolCalls: [
+              {
+                toolName: 'mcp__plugin_twining_twining__twining_decide',
+                parameters: { summary: 'Use event-driven architecture' },
+                timestamp: '2026-02-20T10:10:00Z',
+                durationMs: 100,
+              },
+            ],
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 10,
+                linesRemoved: 5,
+                diff: '+// unified notification approach',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONFLICT_RESOLUTION_GROUND_TRUTH);
+
+      // Twining decide tool should earn 60 points (equal to coordination files)
+      expect(scored.scores['decision-documentation'].value).toBeGreaterThanOrEqual(60);
+    });
+
+    it('scores decision documentation for .twining/decisions/ file changes', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: '.twining/decisions/01ABC123.json',
+                changeType: 'added',
+                linesAdded: 20,
+                linesRemoved: 0,
+                diff: '+{"summary": "Use event-driven architecture"}',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONFLICT_RESOLUTION_GROUND_TRUTH);
+
+      // .twining/decisions/ files should count as coordination files (+60)
+      expect(scored.scores['decision-documentation'].value).toBeGreaterThanOrEqual(60);
+    });
+
+    it('Twining decide + inline docs scores same as COORDINATION.md + inline docs', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Twining approach: twining_decide + inline comments
+      const twiningResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({
+            taskIndex: 2,
+            toolCalls: [
+              {
+                toolName: 'mcp__plugin_twining_twining__twining_decide',
+                parameters: { summary: 'Unified notification' },
+                timestamp: '',
+                durationMs: 100,
+              },
+            ],
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 3,
+                diff: '+// Decision: use event-driven notification pattern for decoupling',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      // File approach: COORDINATION.md + inline comments
+      const fileResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({ taskIndex: 1 }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              {
+                path: 'COORDINATION.md',
+                changeType: 'added',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+# Decision: unified notification architecture',
+              },
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 3,
+                diff: '+// Decision: use event-driven notification pattern for decoupling',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const twiningScored = await scenario.score(twiningResults, CONFLICT_RESOLUTION_GROUND_TRUTH);
+      const fileScored = await scenario.score(fileResults, CONFLICT_RESOLUTION_GROUND_TRUTH);
+
+      // Both approaches should score the same on decision-documentation
+      expect(twiningScored.scores['decision-documentation'].value).toBe(
+        fileScored.scores['decision-documentation'].value,
+      );
+    });
+
     it('computes weighted composite score', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 

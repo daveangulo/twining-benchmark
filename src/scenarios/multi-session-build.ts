@@ -451,7 +451,7 @@ export class MultiSessionBuildScenario extends BaseScenario {
       }
     }
 
-    // Check: Were Session 1's files preserved (not deleted/replaced)?
+    // Check 1: Were Session 1's files preserved?
     let preservedFiles = 0;
     for (const f of session1Files) {
       if (allFinalFiles.has(f)) {
@@ -466,14 +466,15 @@ export class MultiSessionBuildScenario extends BaseScenario {
         details.push(
           `Only ${preservedFiles}/${session1Files.size} files from Session 1 survived. Significant structural drift.`,
         );
-      } else {
+      } else if (preservationRatio < 1.0) {
+        score -= 10;
         details.push(
-          `${preservedFiles}/${session1Files.size} files from Session 1 preserved.`,
+          `${preservedFiles}/${session1Files.size} files from Session 1 preserved (some lost).`,
         );
       }
     }
 
-    // Check: Do later sessions' diffs contain Session 1's design patterns?
+    // Check 2: Do later sessions' diffs contain Session 1's design patterns?
     const laterChanges = rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges);
     const laterDiffs = laterChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
     const hasMissingDiffs = laterChanges.some((c) => c.diff === undefined);
@@ -496,9 +497,18 @@ export class MultiSessionBuildScenario extends BaseScenario {
         score -= 15;
         details.push(`Design element "${decision.id}" not found in later sessions.`);
       }
+      // Also check anti-patterns
+      const antiPatternHits = decision.antiPatterns.filter(
+        (p) => new RegExp(p, 'i').test(laterDiffs),
+      );
+      if (antiPatternHits.length > 0) {
+        score -= 15;
+        details.push(`Anti-pattern detected for "${decision.id}" in later sessions.`);
+      }
     }
 
-    // Check: How many later sessions modified Session 1's files?
+    // Check 3: How many later sessions modified Session 1's files?
+    // Graduated penalty: any net-negative modification is a signal of drift
     let sessionsModifyingDesign = 0;
     for (let i = 1; i < rawResults.transcripts.length; i++) {
       const t = rawResults.transcripts[i]!;
@@ -508,11 +518,33 @@ export class MultiSessionBuildScenario extends BaseScenario {
       if (modifiesSession1) sessionsModifyingDesign++;
     }
 
-    if (sessionsModifyingDesign > 2) {
-      score -= 20;
+    if (sessionsModifyingDesign > 0) {
+      // Graduated: 1 session = -5, 2 = -10, 3+ = -20
+      const penalty = sessionsModifyingDesign >= 3 ? 20 : sessionsModifyingDesign * 5;
+      score -= penalty;
       details.push(
-        `${sessionsModifyingDesign} later sessions made net-negative changes to Session 1 files.`,
+        `${sessionsModifyingDesign} later session(s) made net-negative changes to Session 1 files (-${penalty} pts).`,
       );
+    }
+
+    // Check 4: Did later sessions read Session 1 decisions before writing?
+    // This measures whether agents used coordination context to stay aligned.
+    let sessionsReadingContext = 0;
+    for (let i = 1; i < rawResults.transcripts.length; i++) {
+      const t = rawResults.transcripts[i]!;
+      const readsContext = t.toolCalls.some((tc) =>
+        /twining_assemble|twining_read|twining_query|twining_search_decisions/.test(tc.toolName) ||
+        (tc.toolName === 'Read' && /COORDINATION|CONTEXT|DECISIONS|ARCHITECTURE|CLAUDE\.md|\.twining\//i.test(
+          String(tc.parameters?.file_path ?? ''),
+        )),
+      );
+      if (readsContext) sessionsReadingContext++;
+    }
+
+    const laterSessionCount = rawResults.transcripts.length - 1;
+    if (laterSessionCount > 0 && sessionsReadingContext === 0) {
+      score -= 10;
+      details.push('No later sessions read prior context/decisions before starting.');
     }
 
     return {

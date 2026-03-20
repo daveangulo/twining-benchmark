@@ -719,13 +719,20 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
       const fileReadScore = Math.round((aFilesRead / aModifiedFiles.size) * 25);
 
-      // Sub-score 2: Did agent use coordination tools?
+      // Sub-score 2: Did agent use coordination tools OR read coordination files?
       const coordToolCalls = earlyToolCalls.filter((tc) =>
         COORDINATION_TOOLS.some((ct) => tc.toolName.includes(ct)),
       );
-      // 25 pts if any coordination tool used, scaled: 1 call = 15, 2+ = 25
-      const coordScore = coordToolCalls.length === 0 ? 0
-        : coordToolCalls.length === 1 ? 15
+      // Also check if agent read coordination-related files (non-Twining conditions)
+      const coordFileReads = earlyToolCalls.filter((tc) => {
+        if (tc.toolName !== 'Read') return false;
+        const fp = (tc.parameters?.file_path ?? tc.parameters?.path ?? '') as string;
+        return /COORDINATION\.md|CONTEXT\.md|DECISIONS\.md|ARCHITECTURE\.md|ADR|CLAUDE\.md|\.twining\//i.test(fp);
+      });
+      const totalCoordActions = coordToolCalls.length + coordFileReads.length;
+      // 25 pts if any coordination action, scaled: 1 = 15, 2+ = 25
+      const coordScore = totalCoordActions === 0 ? 0
+        : totalCoordActions === 1 ? 15
         : 25;
 
       const agentScore = fileReadScore + coordScore;

@@ -556,7 +556,9 @@ describe('RefactoringHandoffScenario', () => {
 
       const scored = await scenario.score(rawResults, REFACTORING_HANDOFF_GROUND_TRUTH);
 
-      expect(scored.scores.rework.value).toBeLessThan(50);
+      // B removed 25 of A's 30 lines = 83% line rework (60% weight) + 0% investigation rework (40% weight)
+      // Score = (1 - 0.833*0.6) * 100 = 50
+      expect(scored.scores.rework.value).toBeLessThanOrEqual(50);
       expect(scored.scores.rework.justification).toContain('removed');
     });
 

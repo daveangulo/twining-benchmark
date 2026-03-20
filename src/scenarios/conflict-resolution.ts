@@ -351,6 +351,7 @@ export class ConflictResolutionScenario extends BaseScenario {
       /DECISIONS\.md/i,
       /ARCHITECTURE\.md/i,
       /ADR/i,
+      /\.twining\/decisions\//i,
     ];
 
     const changedPaths = transcriptC.fileChanges.map((c) => c.path);
@@ -377,7 +378,8 @@ export class ConflictResolutionScenario extends BaseScenario {
     }
 
     if (twinToolCalls.length > 0) {
-      score += 40;
+      // Structured decision tools are equivalent to coordination files
+      score += 60;
       details.push(`Used Twining decision tracking (${twinToolCalls.length} calls).`);
     }
 

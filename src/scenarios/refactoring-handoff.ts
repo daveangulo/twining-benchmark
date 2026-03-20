@@ -469,7 +469,7 @@ export class RefactoringHandoffScenario extends BaseScenario {
       transcriptA.fileChanges.map((c) => c.path),
     );
 
-    // Count how many of A's files were modified by B and how much
+    // Part 1: Line-level rework (B deleting A's additions)
     let totalALines = 0;
     let reworkedLines = 0;
 
@@ -479,32 +479,69 @@ export class RefactoringHandoffScenario extends BaseScenario {
 
     for (const bChange of transcriptB.fileChanges) {
       if (aFiles.has(bChange.path)) {
-        // B modified a file that A changed — count removed lines as rework
         reworkedLines += bChange.linesRemoved;
       }
     }
 
+    // Part 2: Investigation overlap (B re-reading files A already investigated)
+    const aReadFiles = new Set<string>();
+    for (const tc of transcriptA.toolCalls) {
+      if (tc.toolName === 'Read' || tc.toolName === 'Edit') {
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp) {
+          const basename = fp.split('/').pop() ?? fp;
+          aReadFiles.add(basename);
+        }
+      }
+    }
+
+    let bOverlapReads = 0;
+    let bTotalReads = 0;
+    for (const tc of transcriptB.toolCalls) {
+      if (tc.toolName === 'Read') {
+        bTotalReads++;
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp) {
+          const basename = fp.split('/').pop() ?? fp;
+          if (aReadFiles.has(basename)) bOverlapReads++;
+        }
+      }
+    }
+
     // Avoid division by zero
-    if (totalALines === 0) {
+    if (totalALines === 0 && aReadFiles.size === 0) {
       return {
         value: 100,
         confidence: 'low',
         method: 'automated',
-        justification: 'Agent A made no changes, so no rework is possible.',
+        justification: 'Agent A made no changes and investigated no files, so no rework is possible.',
       };
     }
 
-    const reworkRatio = Math.min(1, reworkedLines / totalALines);
-    const score = Math.round((1 - reworkRatio) * 100);
+    // Combine: line rework (60%) + investigation overlap (40%)
+    const lineReworkRatio = totalALines > 0 ? Math.min(1, reworkedLines / totalALines) : 0;
+    const investigationReworkRatio = bTotalReads > 0 && aReadFiles.size > 0
+      ? bOverlapReads / bTotalReads
+      : 0;
+    const combinedRework = lineReworkRatio * 0.6 + investigationReworkRatio * 0.4;
+    const score = Math.round((1 - combinedRework) * 100);
+
+    const details: string[] = [];
+    if (reworkedLines > 0) {
+      details.push(`Agent B removed ${reworkedLines} lines from files Agent A modified (${totalALines} lines added by A).`);
+    }
+    if (bOverlapReads > 0) {
+      details.push(`Agent B re-read ${bOverlapReads} of ${bTotalReads} files A had already investigated.`);
+    }
+    if (details.length === 0) {
+      details.push('Agent B preserved all of Agent A\'s work and avoided redundant investigation.');
+    }
 
     return {
       value: score,
       confidence: 'medium',
       method: 'automated',
-      justification:
-        reworkedLines === 0
-          ? 'Agent B preserved all of Agent A\'s work.'
-          : `Agent B removed ${reworkedLines} lines from files Agent A modified (${totalALines} lines added by A). Rework ratio: ${(reworkRatio * 100).toFixed(1)}%.`,
+      justification: details.join(' '),
     };
   }
 

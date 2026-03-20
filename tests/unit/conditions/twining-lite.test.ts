@@ -22,7 +22,7 @@ describe('TwiningLiteCondition', () => {
     expect(condition.name).toBe('twining-lite');
   });
 
-  it('allows exactly 8 Twining tools', async () => {
+  it('allows exactly 9 Twining tools', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
@@ -30,7 +30,8 @@ describe('TwiningLiteCondition', () => {
       t.startsWith('mcp__plugin_twining_twining__'),
     );
 
-    expect(twiningTools).toHaveLength(8);
+    expect(twiningTools).toHaveLength(9);
+    expect(twiningTools).toContain('mcp__plugin_twining_twining__twining_assemble');
     expect(twiningTools).toContain('mcp__plugin_twining_twining__twining_post');
     expect(twiningTools).toContain('mcp__plugin_twining_twining__twining_read');
     expect(twiningTools).toContain('mcp__plugin_twining_twining__twining_query');
@@ -52,7 +53,6 @@ describe('TwiningLiteCondition', () => {
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_verify');
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_trace');
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_why');
-    expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_assemble');
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_summarize');
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_reconsider');
     expect(config.allowedTools).not.toContain('mcp__plugin_twining_twining__twining_override');

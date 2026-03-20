@@ -11,16 +11,16 @@ import { resolveTwiningPluginPath } from './full-twining.js';
 /**
  * FR-CND-007: Twining Lite
  *
- * Agents have CLAUDE.md plus the Twining plugin (MCP server) with only 8 core tools:
- * blackboard (post, read, query, recent), decisions (decide, search_decisions),
- * and handoff (handoff, acknowledge).
+ * Agents have CLAUDE.md plus the Twining plugin (MCP server) with only 9 core tools:
+ * context (assemble), blackboard (post, read, query, recent),
+ * decisions (decide, search_decisions), and handoff (handoff, acknowledge).
  *
  * The Twining project directory is isolated per run via --project flag.
  */
 export class TwiningLiteCondition extends BaseCondition {
   readonly name: ConditionName = 'twining-lite';
   readonly description =
-    'Twining Lite — core blackboard and decision tools only (8 of 26 tools).';
+    'Twining Lite — assemble + core blackboard and decision tools only (9 of 26 tools).';
 
   private projectDir = '';
 
@@ -58,7 +58,8 @@ export class TwiningLiteCondition extends BaseCondition {
         'Bash',
         'Glob',
         'Grep',
-        // Core Twining tools only (8 of 32) — plugin prefix
+        // Core Twining tools only (9 of 32) — plugin prefix
+        'mcp__plugin_twining_twining__twining_assemble',
         'mcp__plugin_twining_twining__twining_post',
         'mcp__plugin_twining_twining__twining_read',
         'mcp__plugin_twining_twining__twining_query',

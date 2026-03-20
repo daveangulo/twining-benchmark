@@ -231,15 +231,41 @@ export class ContextRecoveryScenario extends BaseScenario {
       };
     }
 
-    const timeToFirstAction = transcriptB.timing.timeToFirstActionMs;
+    // Find time to first PRODUCTIVE action (file edit/write/bash), not coordination reads.
+    // Coordination tool calls (twining_*, reading coordination files) are context-gathering,
+    // not wasted time — they should not penalize the orientation score.
+    const coordinationPattern = /twining_|coordination|context|handoff|investigation|finding|note/i;
+
+    let firstProductiveMs: number | null = null;
+    for (const tc of transcriptB.toolCalls) {
+      // Skip coordination tool calls
+      if (coordinationPattern.test(tc.toolName)) continue;
+      // Skip reads of coordination files
+      if (tc.toolName === 'Read') {
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp && coordinationPattern.test(fp)) continue;
+      }
+      // First non-coordination tool call = first productive action
+      if (tc.toolName === 'Edit' || tc.toolName === 'Write' || tc.toolName === 'Bash') {
+        // Use tool timestamp relative to session start if available
+        if (tc.timestamp && transcriptB.timing.startTime) {
+          firstProductiveMs = new Date(tc.timestamp).getTime() - new Date(transcriptB.timing.startTime).getTime();
+        }
+        break;
+      }
+    }
+
+    // Fall back to timeToFirstActionMs if we couldn't compute productive time
+    const effectiveTime = firstProductiveMs ?? transcriptB.timing.timeToFirstActionMs;
+
     let score: number;
-    if (timeToFirstAction < 30000) {
+    if (effectiveTime < 30000) {
       score = 100;
-    } else if (timeToFirstAction < 60000) {
+    } else if (effectiveTime < 60000) {
       score = 80;
-    } else if (timeToFirstAction < 120000) {
+    } else if (effectiveTime < 120000) {
       score = 60;
-    } else if (timeToFirstAction < 180000) {
+    } else if (effectiveTime < 180000) {
       score = 40;
     } else {
       score = 20;
@@ -249,7 +275,7 @@ export class ContextRecoveryScenario extends BaseScenario {
       value: score,
       confidence: 'high',
       method: 'automated',
-      justification: `Agent B's time to first action: ${(timeToFirstAction / 1000).toFixed(1)}s. Score: ${score}.`,
+      justification: `Agent B's time to first productive action: ${(effectiveTime / 1000).toFixed(1)}s (coordination time excluded). Score: ${score}.`,
     };
   }
 
@@ -271,19 +297,47 @@ export class ContextRecoveryScenario extends BaseScenario {
       };
     }
 
+    // Measure TWO kinds of rework: file-level and investigation-level
     const aFiles = new Set(transcriptA.fileChanges.map((c) => c.path));
     const bFiles = transcriptB.fileChanges.map((c) => c.path);
 
-    if (bFiles.length === 0) {
-      // If completion is high (≥67 = 2/3 components found), Agent B correctly
-      // identified A's work was complete and avoided unnecessary rework.
+    // Investigation overlap: did B re-read files A already investigated?
+    const aReadFiles = new Set<string>();
+    for (const tc of transcriptA.toolCalls) {
+      if (tc.toolName === 'Read' || tc.toolName === 'Edit') {
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp) {
+          const basename = fp.split('/').pop() ?? fp;
+          aReadFiles.add(basename);
+        }
+      }
+    }
+
+    let bOverlapReads = 0;
+    let bTotalReads = 0;
+    for (const tc of transcriptB.toolCalls) {
+      if (tc.toolName === 'Read') {
+        bTotalReads++;
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp) {
+          const basename = fp.split('/').pop() ?? fp;
+          if (aReadFiles.has(basename)) bOverlapReads++;
+        }
+      }
+    }
+
+    if (bFiles.length === 0 && bTotalReads === 0) {
+      // B did nothing at all
       if (completion.value >= 67) {
+        // Completion is high — but did B even verify? Check if B made any tool calls
+        const bHasAnyAction = transcriptB.toolCalls.length > 0;
         return {
-          value: 100,
+          value: bHasAnyAction ? 75 : 50,
           confidence: 'medium',
           method: 'automated',
-          justification:
-            'Agent B made no file changes — correctly identified A\'s work was complete and avoided unnecessary rework.',
+          justification: bHasAnyAction
+            ? 'Agent B verified A\'s work was complete without redundant file changes.'
+            : 'Agent B made no tool calls — passive, not actively coordinating.',
         };
       }
       return {
@@ -295,18 +349,33 @@ export class ContextRecoveryScenario extends BaseScenario {
       };
     }
 
-    const overlapping = bFiles.filter((f) => aFiles.has(f)).length;
-    const reworkRatio = overlapping / bFiles.length;
-    const score = Math.round(100 - reworkRatio * 100);
+    // Combine file rework and investigation rework
+    const fileOverlapping = bFiles.filter((f) => aFiles.has(f)).length;
+    const fileReworkRatio = bFiles.length > 0 ? fileOverlapping / bFiles.length : 0;
+    const investigationReworkRatio = bTotalReads > 0 && aReadFiles.size > 0
+      ? bOverlapReads / bTotalReads
+      : 0;
+
+    // Weighted: file rework (60%) + investigation rework (40%)
+    const combinedRework = fileReworkRatio * 0.6 + investigationReworkRatio * 0.4;
+    const score = Math.round((1 - combinedRework) * 100);
+
+    const details: string[] = [];
+    if (fileOverlapping > 0) {
+      details.push(`Agent B modified ${fileOverlapping} of ${bFiles.length} files A had already changed.`);
+    }
+    if (bOverlapReads > 0) {
+      details.push(`Agent B re-read ${bOverlapReads} of ${bTotalReads} files A had already investigated.`);
+    }
+    if (details.length === 0) {
+      details.push('Agent B did not duplicate A\'s work.');
+    }
 
     return {
       value: score,
       confidence: 'medium',
       method: 'automated',
-      justification:
-        overlapping === 0
-          ? 'Agent B did not modify any files that Agent A had already changed.'
-          : `Agent B modified ${overlapping} of ${bFiles.length} files that Agent A had already changed. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%.`,
+      justification: details.join(' '),
     };
   }
 
@@ -477,6 +546,42 @@ export class ContextRecoveryScenario extends BaseScenario {
         details.push('Agent B performed systematic code review in early tool calls.');
       } else {
         details.push('No diff data and limited review activity from Agent B.');
+      }
+    }
+
+    // Signal 4: Warning heeding — did B respect warnings from A?
+    const aWarningCalls = transcriptA.toolCalls.filter((tc) =>
+      /twining.*post/.test(tc.toolName) &&
+      (tc.parameters?.entry_type === 'warning' ||
+       /warning|do not|don't|avoid|never/i.test(String(tc.parameters?.summary ?? ''))),
+    );
+
+    if (aWarningCalls.length > 0) {
+      const warnedFiles = new Set<string>();
+      for (const wc of aWarningCalls) {
+        const text = String(wc.parameters?.summary ?? '') + ' ' + String(wc.parameters?.detail ?? '');
+        const fileMatches = text.match(/[\w/.-]+\.\w{1,4}/g) ?? [];
+        for (const fm of fileMatches) warnedFiles.add(fm);
+      }
+
+      const bModifiedFiles = new Set(transcriptB.fileChanges.map((c) => c.path));
+      let violated = false;
+      for (const wf of warnedFiles) {
+        for (const bf of bModifiedFiles) {
+          if (bf.includes(wf) || wf.includes(bf.split('/').pop() ?? '')) {
+            violated = true;
+            break;
+          }
+        }
+        if (violated) break;
+      }
+
+      if (violated) {
+        score = Math.max(0, score - 15);
+        details.push('Agent B ignored warnings from Agent A and modified warned-about files (-15 pts).');
+      } else if (warnedFiles.size > 0) {
+        score = Math.min(100, score + 5);
+        details.push('Agent B heeded warnings from Agent A (+5 pts).');
       }
     }
 

@@ -252,8 +252,9 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // 1 overlapping out of 2 B files = 50% rework, score = 50
-      expect(scored.scores['redundant-rework'].value).toBe(50);
+      // File overlap: 1/2 = 50% file rework (weight 0.6), no investigation overlap (weight 0.4)
+      // Score = (1 - 0.5*0.6) * 100 = 70
+      expect(scored.scores['redundant-rework'].value).toBe(70);
     });
 
     it('gives full rework score when B only adds new files', async () => {
@@ -389,9 +390,9 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // Completion is 100 (all 3 components from A), so B making no changes = ideal
+      // Completion is high. B made no file changes and A has no tool call investigation trail to duplicate.
+      // File rework = 0, investigation rework = 0 (A has no Read calls). Score = 100.
       expect(scored.scores['redundant-rework'].value).toBe(100);
-      expect(scored.scores['redundant-rework'].justification).toContain('correctly identified');
     });
 
     it('scores redundant-rework 0 when B makes no changes and completion is low', async () => {
@@ -425,6 +426,94 @@ describe('ContextRecoveryScenario', () => {
 
       // Completion is 33 (1/3), B made no changes = failure
       expect(scored.scores['redundant-rework'].value).toBe(0);
+    });
+
+    it('penalizes investigation overlap in redundant-rework', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/models/analytics.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: 'src/services/analytics.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/models/analytics.ts', changeType: 'added', linesAdded: 30, linesRemoved: 0 },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              // B re-reads both files A investigated
+              { toolName: 'Read', parameters: { file_path: 'src/models/analytics.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: 'src/services/analytics.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [
+              { path: 'src/services/analytics.service.ts', changeType: 'added', linesAdded: 50, linesRemoved: 0 },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // B re-read all of A's files (100% investigation overlap at 40% weight) → score < 100
+      expect(scored.scores['redundant-rework'].value).toBeLessThan(100);
+    });
+
+    it('orientation-efficiency excludes coordination tool time', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0 }),
+          makeTranscript({
+            taskIndex: 1,
+            timing: {
+              startTime: '2026-02-20T10:00:00Z',
+              endTime: '2026-02-20T10:05:00Z',
+              durationMs: 300000,
+              timeToFirstActionMs: 120000, // 2 minutes — would score 60 with old logic
+            },
+            toolCalls: [
+              // First 90s: coordination tools (should be excluded)
+              {
+                toolName: 'mcp__plugin_twining_twining__twining_assemble',
+                parameters: {},
+                timestamp: '2026-02-20T10:00:10Z',
+                durationMs: 100,
+              },
+              {
+                toolName: 'Read',
+                parameters: { file_path: 'COORDINATION.md' },
+                timestamp: '2026-02-20T10:00:30Z',
+                durationMs: 100,
+              },
+              // First productive action at 20s — should score 100
+              {
+                toolName: 'Edit',
+                parameters: { file_path: 'src/models/analytics.ts' },
+                timestamp: '2026-02-20T10:00:20Z',
+                durationMs: 100,
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
+
+      // First productive action (Edit) is at 20s — should score 100 (< 30s)
+      expect(scored.scores['orientation-efficiency'].value).toBe(100);
+      expect(scored.scores['orientation-efficiency'].justification).toContain('coordination time excluded');
     });
 
     it('scores context-accuracy from tool calls when B has no diffs', async () => {

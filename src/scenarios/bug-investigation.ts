@@ -342,8 +342,6 @@ export class BugInvestigationScenario extends BaseScenario {
       ),
     );
 
-    const bRecoversPriorContext = bReadsCoordinationFiles || bUsesCoordinationTools;
-
     let score = 0;
     const details: string[] = [];
 
@@ -358,18 +356,60 @@ export class BugInvestigationScenario extends BaseScenario {
       );
     }
 
-    if (bRecoversPriorContext) {
+    // Graduate coordination bonus: both tools and files = +20, one = +10
+    if (bUsesCoordinationTools && bReadsCoordinationFiles) {
       score = Math.min(100, score + 20);
-      if (bReadsCoordinationFiles) {
-        details.push('Agent B checked investigation notes/coordination files.');
+      details.push('Agent B used coordination tools and checked investigation files.');
+    } else if (bUsesCoordinationTools) {
+      score = Math.min(100, score + 15);
+      details.push('Agent B used coordination tools to recover prior context.');
+    } else if (bReadsCoordinationFiles) {
+      score = Math.min(100, score + 10);
+      details.push('Agent B checked investigation notes/coordination files.');
+    }
+
+    // Warning-heeded penalty: if A posted warnings and B violated them, penalize context recovery.
+    // Check if A used twining_post with warning-related content about specific files.
+    const aWarningCalls = transcriptA.toolCalls.filter((tc) =>
+      /twining.*post/.test(tc.toolName) &&
+      (tc.parameters?.entry_type === 'warning' ||
+       /warning|do not|don't|avoid|never/i.test(String(tc.parameters?.summary ?? ''))),
+    );
+
+    if (aWarningCalls.length > 0) {
+      // Extract file paths mentioned in warnings
+      const warnedFiles = new Set<string>();
+      for (const wc of aWarningCalls) {
+        const summary = String(wc.parameters?.summary ?? '');
+        const detail = String(wc.parameters?.detail ?? '');
+        const text = summary + ' ' + detail;
+        // Look for file path patterns in warning text
+        const fileMatches = text.match(/[\w/.-]+\.\w{1,4}/g) ?? [];
+        for (const fm of fileMatches) warnedFiles.add(fm);
       }
-      if (bUsesCoordinationTools) {
-        details.push('Agent B used coordination tools to recover prior context.');
+
+      // Check if B modified any warned-about files
+      const bModifiedFiles = new Set(transcriptB.fileChanges.map((c) => c.path));
+      const violatedWarnings: string[] = [];
+      for (const wf of warnedFiles) {
+        for (const bf of bModifiedFiles) {
+          if (bf.includes(wf) || wf.includes(bf.split('/').pop() ?? '')) {
+            violatedWarnings.push(wf);
+            break;
+          }
+        }
+      }
+
+      if (violatedWarnings.length > 0) {
+        score = Math.max(0, score - 20);
+        details.push(`Agent B ignored warnings and modified: ${violatedWarnings.join(', ')} (-20 pts).`);
+      } else if (warnedFiles.size > 0) {
+        details.push('Agent B heeded warnings from Agent A.');
       }
     }
 
     return {
-      value: Math.min(100, score),
+      value: Math.min(100, Math.max(0, score)),
       confidence: aFileBasenames.size > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
@@ -440,6 +480,16 @@ export class BugInvestigationScenario extends BaseScenario {
         confidence: 'low',
         method: 'automated',
         justification: 'Agent A did not read any files — no investigation to duplicate.',
+      };
+    }
+
+    // If B read zero files and made zero changes, that's not efficiency — it's doing nothing
+    if (bReadFiles.size === 0 && transcriptB.fileChanges.length === 0) {
+      return {
+        value: 0,
+        confidence: 'medium',
+        method: 'automated',
+        justification: 'Agent B did not read any files or make any changes — no investigation performed.',
       };
     }
 
@@ -540,15 +590,39 @@ export class BugInvestigationScenario extends BaseScenario {
       ? bFiles.some((f) => /test|spec/i.test(f))
       : false;
 
+    // --- Step 6: Did Agent A already fix the bug? ---
+    const transcriptA = rawResults.transcripts[0];
+    const aAlreadyFixed = transcriptA
+      ? bugAffectedFiles.some((f) =>
+          transcriptA.fileChanges.some((fc) => fc.path.includes(f) || f.includes(fc.path)),
+        )
+      : false;
+
     // --- Apply gradient scoring ---
     let score: number;
 
     if (!bInvestigatedBugFile && !bModifiedBugFile) {
-      // 0: No investigation, no changes
-      score = 0;
-      details.push('Agent B did not investigate or modify the bug file.');
+      if (aAlreadyFixed) {
+        // Agent A fixed it, Agent B didn't look — missed context but bug is resolved
+        score = 0;
+        details.push('Agent B did not investigate the bug file. Agent A had already fixed the bug.');
+      } else {
+        // 0: No investigation, no changes
+        score = 0;
+        details.push('Agent B did not investigate or modify the bug file.');
+      }
+    } else if (!bModifiedBugFile && aAlreadyFixed) {
+      // Agent A already fixed the bug; Agent B investigated and correctly determined no modification needed.
+      // This is good coordination — credit Agent B for verifying the fix rather than redoing work.
+      score = 50;
+      details.push('Agent A already fixed the bug. Agent B investigated and correctly verified the fix was complete.');
+    } else if (bModifiedBugFile && aAlreadyFixed) {
+      // Agent A already fixed the bug but Agent B redundantly re-modified it.
+      // This is a coordination failure — B didn't check that the work was done.
+      score = 20;
+      details.push('Agent A already fixed the bug. Agent B redundantly re-modified the bug file — coordination failure.');
     } else if (!bModifiedBugFile) {
-      // 15: Investigated but did not modify
+      // 15: Investigated but did not modify (and bug is NOT fixed)
       score = 15;
       details.push('Agent B investigated the bug file but did not modify it.');
     } else if (!hasFixPattern) {

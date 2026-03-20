@@ -484,6 +484,230 @@ describe('BugInvestigationScenario', () => {
       expect(slowScored.scores.timeToResolution.value).toBeLessThan(50);
     });
 
+    it('scores 50 when Agent A already fixed bug and Agent B verifies', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Use the ground truth affected file: src/services/search.service.ts
+      const rawResults: RawResults = {
+        transcripts: [
+          // Agent A fixed the bug and added tests
+          makeTranscript({
+            taskIndex: 0,
+            exitReason: 'completed',
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Edit', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [
+              {
+                path: 'src/services/search.service.ts',
+                changeType: 'modified',
+                linesAdded: 1,
+                linesRemoved: 1,
+                diff: '-const offset = (page - 1) * pageSize - 1;\n+const offset = (page - 1) * pageSize;',
+              },
+              {
+                path: 'tests/services/search.service.test.ts',
+                changeType: 'modified',
+                linesAdded: 15,
+                linesRemoved: 0,
+                diff: '+it("page 2 has no duplicates", () => {',
+              },
+            ],
+          }),
+          // Agent B investigates the bug file and determines fix is complete
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+              { toolName: 'Read', parameters: { file_path: 'tests/services/search.service.test.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [], // No changes — correctly verified fix is done
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // Agent B investigated the bug file and correctly determined no modification needed
+      expect(scored.scores.resolution.value).toBe(50);
+      expect(scored.scores.resolution.justification).toContain('already fixed');
+    });
+
+    it('penalizes redundant re-fix when Agent A already fixed the bug', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          // Agent A already fixed the bug
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              {
+                path: 'src/services/search.service.ts',
+                changeType: 'modified',
+                linesAdded: 1,
+                linesRemoved: 1,
+                diff: '-const offset = (page - 1) * pageSize - 1;\n+const offset = (page - 1) * pageSize;',
+              },
+            ],
+          }),
+          // Agent B re-fixes the already-fixed bug — coordination failure
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [
+              {
+                path: 'src/services/search.service.ts',
+                changeType: 'modified',
+                linesAdded: 1,
+                linesRemoved: 1,
+                diff: '-const offset = (page - 1) * pageSize - 1;\n+const offset = (page - 1) * pageSize;',
+              },
+              {
+                path: 'tests/pagination.test.ts',
+                changeType: 'added',
+                linesAdded: 10,
+                linesRemoved: 0,
+                diff: '+it("no duplicates on page 2")',
+              },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // Redundant re-fix should score much lower than verifying (50) or a genuine fix (85)
+      expect(scored.scores.resolution.value).toBe(20);
+      expect(scored.scores.resolution.justification).toContain('redundantly');
+    });
+
+    it('scores 0 when Agent A fixed but Agent B did not investigate', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              { path: 'src/services/search.service.ts', changeType: 'modified', linesAdded: 1, linesRemoved: 1 },
+            ],
+          }),
+          // Agent B does nothing relevant
+          makeTranscript({ taskIndex: 1, toolCalls: [], fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // Agent B didn't even look — still 0 even though A fixed it
+      expect(scored.scores.resolution.value).toBe(0);
+    });
+
+    it('scores 15 when Agent A did NOT fix but Agent B only investigated', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Agent A did NOT modify the bug file
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0, exitReason: 'timeout', fileChanges: [] }),
+          makeTranscript({
+            taskIndex: 1,
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+            fileChanges: [],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // Agent A didn't fix it, so B investigating without modifying is still just 15
+      expect(scored.scores.resolution.value).toBe(15);
+    });
+
+    it('scores redundantInvestigation 0 when B reads nothing and makes no changes', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            exitReason: 'timeout',
+            toolCalls: [
+              { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+            ],
+          }),
+          // B does absolutely nothing
+          makeTranscript({ taskIndex: 1, toolCalls: [], fileChanges: [] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      // Doing nothing is not efficient investigation — score 0, not 100
+      expect(scored.scores.redundantInvestigation.value).toBe(0);
+    });
+
+    it('graduates coordination bonus: tools+files > tools-only > files-only', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      // Agent with both tools and file reads
+      const bothResult: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0, exitReason: 'timeout', toolCalls: [
+            { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+          ] }),
+          makeTranscript({ taskIndex: 1, toolCalls: [
+            { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: {}, timestamp: '', durationMs: 100 },
+            { toolName: 'Read', parameters: { file_path: 'INVESTIGATION.md' }, timestamp: '', durationMs: 100 },
+          ] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      // Agent with tools only
+      const toolsOnlyResult: RawResults = {
+        transcripts: [
+          makeTranscript({ taskIndex: 0, exitReason: 'timeout', toolCalls: [
+            { toolName: 'Read', parameters: { file_path: 'src/services/search.service.ts' }, timestamp: '', durationMs: 100 },
+          ] }),
+          makeTranscript({ taskIndex: 1, toolCalls: [
+            { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: {}, timestamp: '', durationMs: 100 },
+          ] }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: false,
+        errors: [],
+      };
+
+      const bothScored = await scenario.score(bothResult, BUG_INVESTIGATION_GROUND_TRUTH);
+      const toolsScored = await scenario.score(toolsOnlyResult, BUG_INVESTIGATION_GROUND_TRUTH);
+
+      expect(bothScored.scores.contextRecovery.value).toBeGreaterThan(toolsScored.scores.contextRecovery.value);
+    });
+
     it('handles empty transcripts array', async () => {
       await scenario.setup(makeWorkingDir(), makeConditionContext());
 
