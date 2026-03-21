@@ -10,6 +10,7 @@ import { createContextRecoveryScenario } from './context-recovery.js';
 import { createEvolvingRequirementsScenario } from './evolving-requirements.js';
 import { createIterativeFeatureBuildScenario } from './iterative-feature-build.js';
 import { createDecisionVolumeRecoveryScenario } from './decision-volume-recovery.js';
+import { createSprintSimulationScenario } from './sprint-simulation.js';
 
 /**
  * Registry of all available benchmark scenarios.
@@ -146,6 +147,18 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       excludeFromAll: true,
     },
     create: () => createDecisionVolumeRecoveryScenario(),
+  },
+  'sprint-simulation': {
+    metadata: {
+      name: 'sprint-simulation',
+      description: 'Simulates a 2-week sprint: 12 sessions, 3 engineers, heterogeneous tasks including a mid-sprint requirement change. Measures decision consistency, assumption handling, rework, context recovery, and final quality.',
+      estimatedDurationMinutes: 180,
+      requiredTargetType: 'service-with-dependency',
+      agentSessionCount: 12,
+      scoringDimensions: ['decisionConsistency', 'assumptionHandling', 'cumulativeRework', 'contextRecovery', 'finalQuality'],
+      excludeFromAll: true,
+    },
+    create: () => createSprintSimulationScenario(),
   },
 };
 

@@ -70,8 +70,8 @@ describe('Condition Registry', () => {
 });
 
 describe('Scenario Registry', () => {
-  it('has all 11 scenarios', () => {
-    expect(getAllScenarioNames()).toHaveLength(11);
+  it('has all 12 scenarios', () => {
+    expect(getAllScenarioNames()).toHaveLength(12);
   });
 
   it('has expected scenario names', () => {

@@ -18,7 +18,8 @@ export type ScenarioName =
   | 'context-recovery'
   | 'iterative-feature-build'
   | 'decision-volume-recovery'
-  | 'evolving-requirements';
+  | 'evolving-requirements'
+  | 'sprint-simulation';
 
 /**
  * Metadata describing a scenario.
