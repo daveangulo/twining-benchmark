@@ -48,13 +48,13 @@ const DEFAULT_MAX_TURNS = 50;
 export const BUG_INVESTIGATION_GROUND_TRUTH: ArchitecturalManifest = {
   name: 'bug-investigation',
   description:
-    'Planted bug: off-by-one in pagination offset calculation causes duplicate items on page 2+. File: src/services/search.service.ts, function: paginate().',
+    'Planted bug: off-by-one in pagination offset calculation causes duplicate items on page 2+. File: src/utils/pagination.ts, function: paginate().',
   decisions: [
     {
       id: 'pagination-bug-location',
       description:
-        'The bug is in src/services/search.service.ts in the paginate() or getPage() function. The offset calculation is off by one.',
-      affectedFiles: ['src/services/search.service.ts'],
+        'The bug is in the pagination utility (src/utils/pagination.ts or src/services/search.service.ts) in the paginate() or getPage() function. The offset calculation is off by one.',
+      affectedFiles: ['src/utils/pagination.ts', 'src/services/search.service.ts'],
       expectedPatterns: [
         'offset',
         'page',
@@ -68,7 +68,7 @@ export const BUG_INVESTIGATION_GROUND_TRUTH: ArchitecturalManifest = {
       id: 'pagination-bug-fix',
       description:
         'The fix should correct the offset calculation to `(page - 1) * pageSize` without the extra subtraction.',
-      affectedFiles: ['src/services/search.service.ts'],
+      affectedFiles: ['src/utils/pagination.ts', 'src/services/search.service.ts'],
       expectedPatterns: [
         '\\(page\\s*-\\s*1\\)\\s*\\*\\s*pageSize',
         'offset',
@@ -85,6 +85,7 @@ export const BUG_INVESTIGATION_GROUND_TRUTH: ArchitecturalManifest = {
       affectedFiles: [
         'tests/search.service.test.ts',
         'tests/pagination.test.ts',
+        'tests/utils/pagination.test.ts',
         'src/services/__tests__/search.test.ts',
       ],
       expectedPatterns: [
@@ -316,8 +317,13 @@ export class BugInvestigationScenario extends BaseScenario {
       aFileBasenames.add(this.normalizeFilePath(fc.path));
     }
 
-    // Files B checked early (first 25% of tool calls)
-    const bEarlyCallCount = Math.max(1, Math.floor(transcriptB.toolCalls.length * 0.25));
+    // Files B checked early (first 25% of tool calls).
+    // If B used coordination tools first (assemble/read/query), extend the window
+    // to 50% since the coordination calls consume early slots without reading files.
+    const usedCoordFirst = transcriptB.toolCalls.length > 0 &&
+      /twining_assemble|twining_read|twining_recent|twining_query/.test(transcriptB.toolCalls[0]?.toolName ?? '');
+    const earlyRatio = usedCoordFirst ? 0.5 : 0.25;
+    const bEarlyCallCount = Math.max(1, Math.floor(transcriptB.toolCalls.length * earlyRatio));
     const bEarlyCalls = transcriptB.toolCalls.slice(0, bEarlyCallCount);
 
     let recoveredFiles = 0;
