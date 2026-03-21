@@ -360,6 +360,14 @@ export class BugInvestigationScenario extends BaseScenario {
       details.push(
         `Agent B accessed ${recoveredFiles} of ${aFileBasenames.size} files A investigated in early calls.`,
       );
+
+      // If B used twining_assemble, it received affected_files and findings from A's decisions
+      // without needing to Read each file individually. Grant partial file-recovery credit
+      // since assemble output contains the same information as reading coordination files.
+      if (bUsesCoordinationTools && score < 40) {
+        score = 40;
+        details.push('Agent B used coordination tools that contain A\'s file references and findings (floor: 40).');
+      }
     }
 
     // Graduate coordination bonus: both tools and files = +20, one = +10
