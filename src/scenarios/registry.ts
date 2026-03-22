@@ -156,7 +156,7 @@ export const SCENARIO_REGISTRY: Record<ScenarioName, ScenarioRegistryEntry> = {
       requiredTargetType: 'service-with-dependency',
       agentSessionCount: 12,
       scoringDimensions: ['decisionConsistency', 'assumptionHandling', 'cumulativeRework', 'contextRecovery', 'finalQuality'],
-      excludeFromAll: false,
+      excludeFromAll: true,
     },
     create: () => createSprintSimulationScenario(),
   },
