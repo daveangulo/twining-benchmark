@@ -432,7 +432,6 @@ export class MultiSessionBuildScenario extends BaseScenario {
       };
     }
 
-    let score = 100;
     const details: string[] = [];
 
     // Check design-related ground truth decisions
@@ -451,7 +450,9 @@ export class MultiSessionBuildScenario extends BaseScenario {
       }
     }
 
-    // Check 1: Were Session 1's files preserved?
+    // ---- Component A: File preservation (max 50 points) ----
+    let fileScore = 50;
+
     let preservedFiles = 0;
     for (const f of session1Files) {
       if (allFinalFiles.has(f)) {
@@ -462,53 +463,19 @@ export class MultiSessionBuildScenario extends BaseScenario {
     if (session1Files.size > 0) {
       const preservationRatio = preservedFiles / session1Files.size;
       if (preservationRatio < 0.5) {
-        score -= 30;
+        fileScore -= 30;
         details.push(
           `Only ${preservedFiles}/${session1Files.size} files from Session 1 survived. Significant structural drift.`,
         );
       } else if (preservationRatio < 1.0) {
-        score -= 10;
+        fileScore -= 10;
         details.push(
           `${preservedFiles}/${session1Files.size} files from Session 1 preserved (some lost).`,
         );
       }
     }
 
-    // Check 2: Do later sessions' diffs contain Session 1's design patterns?
-    const laterChanges = rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges);
-    const laterDiffs = laterChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-    const hasMissingDiffs = laterChanges.some((c) => c.diff === undefined);
-
-    if (hasMissingDiffs && laterDiffs.length === 0) {
-      return {
-        value: 0,
-        confidence: 'low',
-        method: 'automated',
-        justification: 'No diff data available for scoring — git enrichment may have failed.',
-        dataQuality: 'missing',
-      };
-    }
-
-    for (const decision of designDecisions) {
-      const patternsFound = decision.expectedPatterns.filter(
-        (p) => new RegExp(p, 'i').test(laterDiffs),
-      );
-      if (patternsFound.length === 0 && decision.expectedPatterns.length > 0) {
-        score -= 15;
-        details.push(`Design element "${decision.id}" not found in later sessions.`);
-      }
-      // Also check anti-patterns
-      const antiPatternHits = decision.antiPatterns.filter(
-        (p) => new RegExp(p, 'i').test(laterDiffs),
-      );
-      if (antiPatternHits.length > 0) {
-        score -= 15;
-        details.push(`Anti-pattern detected for "${decision.id}" in later sessions.`);
-      }
-    }
-
-    // Check 3: How many later sessions modified Session 1's files?
-    // Graduated penalty: any net-negative modification is a signal of drift
+    // Graduated penalty for net-negative modifications to Session 1 files
     let sessionsModifyingDesign = 0;
     for (let i = 1; i < rawResults.transcripts.length; i++) {
       const t = rawResults.transcripts[i]!;
@@ -519,16 +486,127 @@ export class MultiSessionBuildScenario extends BaseScenario {
     }
 
     if (sessionsModifyingDesign > 0) {
-      // Graduated: 1 session = -5, 2 = -10, 3+ = -20
       const penalty = sessionsModifyingDesign >= 3 ? 20 : sessionsModifyingDesign * 5;
-      score -= penalty;
+      fileScore -= penalty;
       details.push(
         `${sessionsModifyingDesign} later session(s) made net-negative changes to Session 1 files (-${penalty} pts).`,
       );
     }
 
-    // Check 4: Did later sessions read Session 1 decisions before writing?
-    // This measures whether agents used coordination context to stay aligned.
+    fileScore = Math.max(0, fileScore);
+
+    // ---- Component B: Pattern preservation (max 50 points) ----
+    // Extract key identifiers (type names, interface names, function names, const names)
+    // from Session 1's added lines, then check if the last 2 sessions still reference them.
+    const session1Diffs = session1.fileChanges
+      .map((c) => c.diff)
+      .filter((d): d is string => d !== undefined)
+      .join('\n');
+    const hasMissingDiffs = [...rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges), ...session1.fileChanges]
+      .some((c) => c.diff === undefined);
+
+    // Extract added lines from Session 1 diffs
+    const session1AddedLines = session1Diffs
+      .split('\n')
+      .filter((line) => line.startsWith('+'))
+      .join('\n');
+
+    // Extract identifiers from Session 1 added lines
+    const identifierPattern = /(?:class|interface|type|function|const|enum|export\s+(?:class|interface|type|function|const|enum))\s+(\w+)/g;
+    const session1Identifiers = new Set<string>();
+    let match: RegExpExecArray | null;
+    while ((match = identifierPattern.exec(session1AddedLines)) !== null) {
+      if (match[1] && match[1].length > 2) { // Skip tiny identifiers like 'id'
+        session1Identifiers.add(match[1]);
+      }
+    }
+
+    let patternScore: number;
+    if (session1Identifiers.size === 0) {
+      // No identifiers to check — fall back to ground truth pattern matching
+      patternScore = 50;
+
+      const laterChanges = rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges);
+      const laterDiffs = laterChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+
+      if (hasMissingDiffs && laterDiffs.length === 0 && session1Diffs.length === 0) {
+        return {
+          value: 0,
+          confidence: 'low',
+          method: 'automated',
+          justification: 'No diff data available for scoring — git enrichment may have failed.',
+          dataQuality: 'missing',
+        };
+      }
+
+      for (const decision of designDecisions) {
+        const patternsFound = decision.expectedPatterns.filter(
+          (p) => new RegExp(p, 'i').test(laterDiffs),
+        );
+        if (patternsFound.length === 0 && decision.expectedPatterns.length > 0) {
+          patternScore -= 15;
+          details.push(`Design element "${decision.id}" not found in later sessions.`);
+        }
+        const antiPatternHits = decision.antiPatterns.filter(
+          (p) => new RegExp(p, 'i').test(laterDiffs),
+        );
+        if (antiPatternHits.length > 0) {
+          patternScore -= 15;
+          details.push(`Anti-pattern detected for "${decision.id}" in later sessions.`);
+        }
+      }
+    } else {
+      // Check how many Session 1 identifiers appear in the last 2 sessions' diffs
+      const lastTwoSessions = rawResults.transcripts.slice(-2);
+      const lastTwoDiffs = lastTwoSessions
+        .flatMap((t) => t.fileChanges)
+        .map((c) => c.diff)
+        .filter((d): d is string => d !== undefined)
+        .join('\n');
+
+      if (hasMissingDiffs && lastTwoDiffs.length === 0 && session1Diffs.length === 0) {
+        return {
+          value: 0,
+          confidence: 'low',
+          method: 'automated',
+          justification: 'No diff data available for scoring — git enrichment may have failed.',
+          dataQuality: 'missing',
+        };
+      }
+
+      let foundCount = 0;
+      for (const id of session1Identifiers) {
+        // Check if the identifier appears in the last 2 sessions' diffs
+        if (lastTwoDiffs.includes(id)) {
+          foundCount++;
+        }
+      }
+
+      const identifierRatio = foundCount / session1Identifiers.size;
+      patternScore = Math.round(identifierRatio * 50);
+      details.push(
+        `${foundCount}/${session1Identifiers.size} Session 1 identifiers referenced in final sessions (pattern preservation: ${Math.round(identifierRatio * 100)}%).`,
+      );
+
+      // Also apply ground truth design pattern checks as additional penalties
+      const laterChanges = rawResults.transcripts.slice(1).flatMap((t) => t.fileChanges);
+      const laterDiffs = laterChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+
+      for (const decision of designDecisions) {
+        const antiPatternHits = decision.antiPatterns.filter(
+          (p) => new RegExp(p, 'i').test(laterDiffs),
+        );
+        if (antiPatternHits.length > 0) {
+          patternScore -= 10;
+          details.push(`Anti-pattern detected for "${decision.id}" in later sessions.`);
+        }
+      }
+    }
+
+    patternScore = Math.max(0, patternScore);
+
+    // ---- Bonus/penalty: Context reading ----
+    let contextBonus = 0;
     let sessionsReadingContext = 0;
     for (let i = 1; i < rawResults.transcripts.length; i++) {
       const t = rawResults.transcripts[i]!;
@@ -543,12 +621,14 @@ export class MultiSessionBuildScenario extends BaseScenario {
 
     const laterSessionCount = rawResults.transcripts.length - 1;
     if (laterSessionCount > 0 && sessionsReadingContext === 0) {
-      score -= 10;
+      contextBonus = -10;
       details.push('No later sessions read prior context/decisions before starting.');
     }
 
+    const score = Math.max(0, Math.min(100, fileScore + patternScore + contextBonus));
+
     return {
-      value: Math.max(0, score),
+      value: score,
       confidence: session1.fileChanges.length > 0 ? 'medium' : 'low',
       method: 'automated',
       justification: details.length > 0

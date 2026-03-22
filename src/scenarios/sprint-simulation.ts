@@ -521,7 +521,7 @@ export class SprintSimulationScenario extends BaseScenario {
         'contextRecovery',
         'finalQuality',
       ],
-      excludeFromAll: true, // Expensive — only run when explicitly requested
+      excludeFromAll: false,
     };
   }
 
@@ -656,7 +656,9 @@ export class SprintSimulationScenario extends BaseScenario {
       if (!t) continue;
       checkedCount++;
 
-      const diffs = t.fileChanges.map((c) => c.diff ?? '').join('\n');
+      const diffs = t.fileChanges
+        .filter((c) => !/.twining|COORDINATION|CONTEXT|coordination/i.test(c.path))
+        .map((c) => c.diff ?? '').join('\n');
       if (patternRegex.test(diffs)) {
         consistentCount++;
       } else {
@@ -670,7 +672,9 @@ export class SprintSimulationScenario extends BaseScenario {
       if (!t) continue;
       checkedCount++;
 
-      const diffs = t.fileChanges.map((c) => c.diff ?? '').join('\n');
+      const diffs = t.fileChanges
+        .filter((c) => !/.twining|COORDINATION|CONTEXT|coordination/i.test(c.path))
+        .map((c) => c.diff ?? '').join('\n');
       if (diffs.length > 0 && patternRegex.test(diffs)) {
         consistentCount++;
       } else if (diffs.length > 0) {
@@ -843,13 +847,35 @@ export class SprintSimulationScenario extends BaseScenario {
     }
 
     const reworkRatio = Math.min(1, totalReworkedLines / totalAddedLines);
-    const score = Math.round((1 - reworkRatio) * 100);
+    // Steeper curve: 5% rework = 85, 10% = 70, 20% = 40, 30% = 10
+    const reworkScore = Math.max(0, Math.round(100 * Math.pow(1 - reworkRatio, 3)));
+
+    // Track file overlap between non-consecutive sessions
+    const fileFirstSeen = new Map<string, number>();
+    let crossSessionOverlap = 0;
+    for (let i = 0; i < transcripts.length; i++) {
+      const t = transcripts[i];
+      if (!t) continue;
+      for (const fc of t.fileChanges) {
+        const firstSeen = fileFirstSeen.get(fc.path);
+        if (firstSeen !== undefined && firstSeen < i - 1) {
+          // File modified by a non-adjacent session — coordination needed
+          crossSessionOverlap++;
+        }
+        if (firstSeen === undefined) {
+          fileFirstSeen.set(fc.path, i);
+        }
+      }
+    }
+    // Penalize cross-session overlap (each overlap reduces score by 2 points)
+    const overlapPenalty = Math.min(20, crossSessionOverlap * 2);
+    const score = Math.max(0, reworkScore - overlapPenalty);
 
     return {
       value: score,
       confidence: 'medium',
       method: 'automated',
-      justification: `${totalReworkedLines} lines reworked out of ${totalAddedLines} total lines added across ${transcripts.length} sessions. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%.`,
+      justification: `${totalReworkedLines} lines reworked out of ${totalAddedLines} total lines added across ${transcripts.length} sessions. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%. Cross-session file overlap: ${crossSessionOverlap} (penalty: ${overlapPenalty}).`,
     };
   }
 
@@ -894,7 +920,7 @@ export class SprintSimulationScenario extends BaseScenario {
       if (usedCoordTools) {
         sessionScore = 100;
       } else if (readCoordFiles) {
-        sessionScore = 70;
+        sessionScore = 80;
       } else {
         // Check if session read any files from earlier sessions before writing
         const firstWriteIdx = t.toolCalls.findIndex((tc) =>
@@ -905,7 +931,7 @@ export class SprintSimulationScenario extends BaseScenario {
           : t.toolCalls
         ).filter((tc) => tc.toolName === 'Read').length;
 
-        sessionScore = Math.min(50, preWriteReads * 10);
+        sessionScore = Math.min(70, preWriteReads * 10);
       }
 
       totalScore += sessionScore;

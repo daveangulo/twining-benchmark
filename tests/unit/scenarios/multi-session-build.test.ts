@@ -220,13 +220,13 @@ describe('MultiSessionBuildScenario', () => {
           makeTranscript({
             taskIndex: 3,
             fileChanges: [
-              { path: 'src/routes/analytics.ts', changeType: 'modified', linesAdded: 25, linesRemoved: 5, diff: '+app.get("/api/analytics/dashboard", handler);\n+async function handler(req, res) { const service = new AggregationService(); }' },
+              { path: 'src/routes/analytics.ts', changeType: 'modified', linesAdded: 25, linesRemoved: 5, diff: '+app.get("/api/analytics/dashboard", handler);\n+async function handler(req, res) { const data: DashboardData = await service.aggregate(); }' },
             ],
           }),
           makeTranscript({
             taskIndex: 4,
             fileChanges: [
-              { path: 'tests/integration/analytics.test.ts', changeType: 'added', linesAdded: 35, linesRemoved: 0, diff: '+describe("integration", () => { it("end-to-end pipeline", () => { request(app).get("/api/analytics"); }); });' },
+              { path: 'tests/integration/analytics.test.ts', changeType: 'added', linesAdded: 35, linesRemoved: 0, diff: '+describe("integration", () => { it("renders DashboardData correctly", () => { request(app).get("/api/analytics"); }); });' },
             ],
           }),
         ],
@@ -283,6 +283,57 @@ describe('MultiSessionBuildScenario', () => {
       const scored = await scenario.score(rawResults, MULTI_SESSION_BUILD_GROUND_TRUTH);
 
       expect(scored.scores.cumulativeRework.value).toBeLessThan(50);
+    });
+
+    it('penalizes architectural drift when final sessions ignore Session 1 identifiers', async () => {
+      await scenario.setup(makeWorkingDir(), makeConditionContext());
+
+      const rawResults: RawResults = {
+        transcripts: [
+          makeTranscript({
+            taskIndex: 0,
+            fileChanges: [
+              { path: 'src/types/analytics.ts', changeType: 'added', linesAdded: 20, linesRemoved: 0, diff: '+interface DashboardData {\n+  metrics: MetricSummary[];\n+}\n+type AnalyticsConfig = { interval: number };' },
+              { path: 'DESIGN.md', changeType: 'added', linesAdded: 10, linesRemoved: 0 },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 1,
+            fileChanges: [
+              { path: 'src/services/data.service.ts', changeType: 'added', linesAdded: 40, linesRemoved: 0, diff: '+class DataService { fetch() {} }' },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 2,
+            fileChanges: [
+              { path: 'tests/data.test.ts', changeType: 'added', linesAdded: 20, linesRemoved: 0, diff: '+describe("data", () => {})' },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 3,
+            fileChanges: [
+              // Session 4 does NOT reference DashboardData or AnalyticsConfig
+              { path: 'src/routes/api.ts', changeType: 'added', linesAdded: 30, linesRemoved: 0, diff: '+app.get("/stats", handler);\n+function handler() { return getStats(); }' },
+            ],
+          }),
+          makeTranscript({
+            taskIndex: 4,
+            fileChanges: [
+              // Session 5 also ignores Session 1 types
+              { path: 'tests/integration.test.ts', changeType: 'added', linesAdded: 20, linesRemoved: 0, diff: '+describe("integration", () => { it("fetches stats", () => {}); });' },
+            ],
+          }),
+        ],
+        finalWorkingDir: '/tmp/test',
+        allSessionsCompleted: true,
+        errors: [],
+      };
+
+      const scored = await scenario.score(rawResults, MULTI_SESSION_BUILD_GROUND_TRUTH);
+
+      // Pattern preservation should be low — Session 1 defined DashboardData and AnalyticsConfig
+      // but final sessions don't reference them at all
+      expect(scored.scores.architecturalDrift.value).toBeLessThan(50);
     });
 
     it('scores low final quality when sessions are incomplete', async () => {

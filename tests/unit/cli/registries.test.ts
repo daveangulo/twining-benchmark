@@ -95,7 +95,7 @@ describe('Scenario Registry', () => {
 
   it('resolveScenarioNames resolves "all" excluding scale-stress-test', () => {
     const names = resolveScenarioNames('all');
-    expect(names).toHaveLength(7);
+    expect(names).toHaveLength(8);
     expect(names).not.toContain('scale-stress-test');
   });
 

@@ -451,6 +451,36 @@ export class BugInvestigationScenario extends BaseScenario {
   }
 
   /**
+   * Robust path comparison: returns true if two paths refer to the same file.
+   *
+   * Handles absolute vs relative paths, leading './', and falls back to
+   * filename-only comparison when includes-based matching fails.
+   */
+  private pathsMatch(pathA: string, pathB: string): boolean {
+    if (!pathA || !pathB) return false;
+
+    // Strip leading './' from both
+    const a = pathA.replace(/^\.\//, '');
+    const b = pathB.replace(/^\.\//, '');
+
+    // Bidirectional includes (handles absolute vs relative)
+    if (a.includes(b) || b.includes(a)) return true;
+
+    // Normalize through the existing helper and compare
+    const na = this.normalizeFilePath(a);
+    const nb = this.normalizeFilePath(b);
+    if (na === nb) return true;
+    if (na.includes(nb) || nb.includes(na)) return true;
+
+    // Filename-only fallback (basename match)
+    const basenameA = a.split('/').pop() ?? '';
+    const basenameB = b.split('/').pop() ?? '';
+    if (basenameA && basenameB && basenameA === basenameB) return true;
+
+    return false;
+  }
+
+  /**
    * Score redundant investigation: Inverse of duplicated investigation steps.
    *
    * Measures overlap between A's and B's file access patterns.
@@ -576,16 +606,16 @@ export class BugInvestigationScenario extends BaseScenario {
       if (tc.toolName !== 'Read' && tc.toolName !== 'Grep') return false;
       const fp = (tc.parameters['file_path'] ?? tc.parameters['path'] ?? '') as string;
       const pattern = (tc.parameters['pattern'] ?? '') as string;
-      // Match against affected file paths
+      // Match against affected file paths using robust path comparison
       return bugAffectedFiles.some(
-        (af) => fp.includes(af) || af.includes(fp) || pattern.includes(af),
+        (af) => this.pathsMatch(fp, af) || (pattern.length > 0 && pattern.includes(af)),
       );
     });
 
     // --- Step 2: Did B modify the bug file? ---
     const bModifiedBugFile = bugFix
       ? bugFix.affectedFiles.some((f) =>
-          bFiles.some((bf) => bf.includes(f) || f.includes(bf)),
+          bFiles.some((bf) => this.pathsMatch(bf, f)),
         )
       : false;
 
@@ -608,7 +638,7 @@ export class BugInvestigationScenario extends BaseScenario {
     const transcriptA = rawResults.transcripts[0];
     const aAlreadyFixed = transcriptA
       ? bugAffectedFiles.some((f) =>
-          transcriptA.fileChanges.some((fc) => fc.path.includes(f) || f.includes(fc.path)),
+          transcriptA.fileChanges.some((fc) => this.pathsMatch(fc.path, f)),
         )
       : false;
 
