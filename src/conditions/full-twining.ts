@@ -146,8 +146,8 @@ export class FullTwiningCondition extends BaseCondition {
   }
 
   private generateClaudeMdWithTwining(): string {
-    // Plugin 1.6.0+ auto-injects Twining lifecycle gates into CLAUDE.md
-    // via ensure-claude-md-gates.sh SessionStart hook. No need to duplicate here.
+    // Plugin 1.6.0+ auto-injects lifecycle gates via ensure-claude-md-gates.sh
+    // SessionStart hook. With CLI execution, hooks fire naturally.
     return BaseCondition.BASE_CLAUDE_MD;
   }
 }

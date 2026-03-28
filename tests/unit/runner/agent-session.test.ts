@@ -131,7 +131,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask());
+    const transcript = await manager.executeTaskViaSdk(makeTask());
 
     expect(transcript.runId).toBe('run-123');
     expect(transcript.scenario).toBe('test-scenario');
@@ -212,7 +212,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask());
+    const transcript = await manager.executeTaskViaSdk(makeTask());
 
     expect(transcript.timing.timeToFirstActionMs).toBeGreaterThanOrEqual(0);
     expect(transcript.toolCalls).toHaveLength(2); // Read + Write
@@ -249,7 +249,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask());
+    const transcript = await manager.executeTaskViaSdk(makeTask());
 
     expect(transcript.exitReason).toBe('error');
     expect(transcript.error).toContain('API rate limit exceeded');
@@ -268,7 +268,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask());
+    const transcript = await manager.executeTaskViaSdk(makeTask());
 
     expect(transcript.exitReason).toBe('error');
     expect(transcript.error).toContain('Connection refused');
@@ -312,7 +312,7 @@ describe('AgentSessionManager', () => {
       }),
     });
 
-    await manager.executeTask(makeTask());
+    await manager.executeTaskViaSdk(makeTask());
 
     expect(mockQuery).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -385,7 +385,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask({ timeoutMs: 200 }));
+    const transcript = await manager.executeTaskViaSdk(makeTask({ timeoutMs: 200 }));
 
     expect(transcript.exitReason).toBe('timeout');
     expect(transcript.timing.durationMs).toBeLessThan(5000);
@@ -433,7 +433,7 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(),
     });
 
-    const transcript = await manager.executeTask(makeTask());
+    const transcript = await manager.executeTaskViaSdk(makeTask());
 
     expect(transcript.timing.timeToFirstActionMs).toBe(-1);
     expect(transcript.toolCalls).toHaveLength(0);
@@ -509,10 +509,10 @@ describe('AgentSessionManager', () => {
     });
 
     // Execute first task
-    await manager.executeTask(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
+    await manager.executeTaskViaSdk(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
 
     // Execute second task — should have history prefix
-    await manager.executeTask(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
+    await manager.executeTaskViaSdk(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
 
     // Check the second call to sdkQuery had augmented prompt
     const secondCall = mockQuery.mock.calls[1]!;
@@ -590,8 +590,8 @@ describe('AgentSessionManager', () => {
       agentConfig: makeAgentConfig(), // persistHistory defaults to undefined/false
     });
 
-    await manager.executeTask(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
-    await manager.executeTask(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
+    await manager.executeTaskViaSdk(makeTask({ prompt: 'First task', sequenceOrder: 0 }));
+    await manager.executeTaskViaSdk(makeTask({ prompt: 'Second task', sequenceOrder: 1 }));
 
     // Second call should have unmodified prompt
     const secondCall = mockQuery.mock.calls[1]!;

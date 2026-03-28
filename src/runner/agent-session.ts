@@ -7,7 +7,9 @@ import type {
   McpStdioServerConfig,
   Query,
 } from '@anthropic-ai/claude-agent-sdk';
+import { execa, type ResultPromise } from 'execa';
 import { v4 as uuidv4 } from 'uuid';
+import { createInterface } from 'node:readline';
 import type {
   AgentConfiguration,
   AgentTask,
@@ -204,9 +206,176 @@ export class AgentSessionManager {
   }
 
   /**
-   * Execute a single agent task and return the transcript.
+   * Execute a single agent task using the Claude CLI (`claude -p`).
+   *
+   * This is the primary execution path. It spawns the full Claude Code CLI,
+   * which means plugins load completely (hooks fire, BEHAVIORS.md is read,
+   * CLAUDE.md gates are injected). This matches what subscription users experience.
+   *
+   * Timeout enforcement is reliable — the process is killed on timeout.
    */
   async executeTask(task: AgentTask): Promise<AgentTranscript> {
+    const sessionId = uuidv4();
+    const startTime = new Date();
+    const toolCalls: ToolCall[] = [];
+    let timeToFirstActionMs = -1;
+    let timedOut = false;
+    let numTurns = 0;
+    let costUsd = 0;
+    let exitSubtype = '';
+    let compactionCount = 0;
+
+    const effectiveTimeoutMs = task.timeoutMs || this.timeoutMs;
+
+    // Build prompt with conversation history for persistent-history conditions
+    let effectivePrompt = task.prompt;
+    if (this.agentConfig.persistHistory && this.conversationHistory.length > 0) {
+      const historyPrefix = this.conversationHistory
+        .map((h, i) => `=== Previous Developer ${i + 1} ===\n${h}`)
+        .join('\n\n');
+      effectivePrompt = `${historyPrefix}\n\n=== Your Task ===\n${task.prompt}`;
+    }
+
+    // Build CLI arguments
+    const cliArgs = [
+      '-p', effectivePrompt,
+      '--output-format', 'stream-json',
+      '--verbose',
+      '--permission-mode', 'bypassPermissions',
+      '--max-turns', String(task.maxTurns || 50),
+    ];
+
+    if (this.model) {
+      cliArgs.push('--model', this.model);
+    }
+
+    // Add system prompt if condition provides one
+    if (this.agentConfig.systemPrompt) {
+      cliArgs.push('--append-system-prompt', this.agentConfig.systemPrompt);
+    }
+
+    // Add plugin directories for Twining conditions
+    if (this.agentConfig.plugins) {
+      for (const plugin of this.agentConfig.plugins) {
+        cliArgs.push('--plugin-dir', plugin.path);
+      }
+    }
+
+    // Strip env vars that prevent nested Claude Code sessions
+    const cleanEnv = { ...process.env };
+    delete cleanEnv['CLAUDECODE'];
+    delete cleanEnv['CLAUDE_CODE_ENTRYPOINT'];
+    if (this.agentConfig.env) {
+      Object.assign(cleanEnv, this.agentConfig.env);
+    }
+
+    let proc: ResultPromise | undefined;
+
+    try {
+      proc = execa('claude', cliArgs, {
+        cwd: this.workingDir,
+        env: cleanEnv,
+        timeout: effectiveTimeoutMs,
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+        reject: false, // Don't throw on non-zero exit
+      });
+
+      // Parse stream-json lines from stdout
+      if (proc.stdout) {
+        const rl = createInterface({ input: proc.stdout });
+        for await (const line of rl) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line);
+
+            if (msg.type === 'assistant') {
+              const content = msg.message?.content;
+              if (Array.isArray(content)) {
+                const now = new Date();
+                for (const block of content) {
+                  if (block.type === 'tool_use') {
+                    const tc: ToolCall = {
+                      toolName: block.name,
+                      parameters: (block.input ?? {}) as Record<string, unknown>,
+                      timestamp: now.toISOString(),
+                      durationMs: 0,
+                    };
+                    toolCalls.push(tc);
+
+                    if (timeToFirstActionMs < 0 && isFileChangingToolCall(tc)) {
+                      timeToFirstActionMs = now.getTime() - startTime.getTime();
+                    }
+                  }
+                }
+              }
+            }
+
+            if (msg.type === 'system' && msg.subtype === 'compact_boundary') {
+              compactionCount++;
+            }
+
+            if (msg.type === 'result') {
+              numTurns = msg.num_turns ?? 0;
+              costUsd = msg.total_cost_usd ?? 0;
+              exitSubtype = msg.subtype ?? '';
+            }
+          } catch {
+            // Skip unparseable lines
+          }
+        }
+      }
+
+      await proc;
+    } catch (err: unknown) {
+      // execa throws on timeout with err.timedOut
+      if (err && typeof err === 'object' && 'timedOut' in err && (err as Record<string, unknown>).timedOut) {
+        timedOut = true;
+      }
+    }
+
+    const endTime = new Date();
+    const exitReason: SessionExitReason = timedOut
+      ? 'timeout'
+      : exitSubtype === 'success' || exitSubtype === 'error_max_turns'
+        ? 'completed'
+        : toolCalls.length > 0 ? 'completed' : 'error';
+
+    const tokenUsage: TokenUsage = {
+      input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0,
+      costUsd,
+    };
+
+    // Accumulate conversation history for persistent-history conditions
+    if (this.agentConfig.persistHistory && toolCalls.length > 0) {
+      this.conversationHistory.push(`[Session completed ${toolCalls.length} tool calls]`);
+    }
+
+    return this.buildTranscript({
+      sessionId,
+      taskIndex: task.sequenceOrder,
+      prompt: task.prompt,
+      toolCalls,
+      startTime,
+      endTime,
+      timeToFirstActionMs,
+      exitReason,
+      error: timedOut ? `Session timed out after ${effectiveTimeoutMs}ms` : undefined,
+      tokenUsage,
+      numTurns,
+      stopReason: exitSubtype || null,
+      contextWindowSize: 0,
+      compactionCount,
+      turnUsage: [],
+    });
+  }
+
+  /**
+   * Execute a single agent task via the SDK query() API.
+   * Kept as fallback — does not execute plugin hooks fully.
+   */
+  async executeTaskViaSdk(task: AgentTask): Promise<AgentTranscript> {
     const sessionId = uuidv4();
     const startTime = new Date();
     const toolCalls: ToolCall[] = [];
