@@ -94,6 +94,8 @@ export class TwiningLiteCondition extends BaseCondition {
   }
 
   private generateClaudeMdWithTwiningLite(): string {
+    // Plugin 1.6.0+ auto-injects Twining lifecycle gates into CLAUDE.md
+    // via ensure-claude-md-gates.sh SessionStart hook. No need to duplicate here.
     return BaseCondition.BASE_CLAUDE_MD;
   }
 }

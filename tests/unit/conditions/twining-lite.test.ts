@@ -96,16 +96,16 @@ describe('TwiningLiteCondition', () => {
     expect(ctx.setupFiles).toContain('CLAUDE.md');
   });
 
-  it('CLAUDE.md contains project guidelines (no Twining-specific instructions)', async () => {
+  it('CLAUDE.md contains project guidelines (plugin injects gates at runtime)', async () => {
     await condition.setup(workDir);
 
     const content = await readFile(join(workDir, 'CLAUDE.md'), 'utf-8');
     // Project guidelines are present
     expect(content).toContain('repository pattern');
     expect(content).toContain('TypeScript strict mode');
-    // No Twining-specific instructions (plugin handles those)
-    expect(content).not.toContain('Twining Lite');
-    expect(content).not.toContain('twining_post');
+    // Gates are NOT in the harness-written CLAUDE.md — plugin 1.6.0+
+    // injects them via ensure-claude-md-gates.sh SessionStart hook at runtime
+    expect(content).not.toContain('twining_assemble');
   });
 
   it('teardown cleans up .twining directory', async () => {

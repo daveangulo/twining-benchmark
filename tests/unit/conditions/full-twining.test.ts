@@ -31,7 +31,7 @@ describe('FullTwiningCondition', () => {
     expect(ctx.setupFiles).toContain('CLAUDE.md');
   });
 
-  it('CLAUDE.md contains project guidelines (no Twining-specific instructions)', async () => {
+  it('CLAUDE.md contains project guidelines (plugin injects gates at runtime)', async () => {
     await condition.setup(workDir);
 
     const content = await readFile(join(workDir, 'CLAUDE.md'), 'utf-8');
@@ -39,9 +39,9 @@ describe('FullTwiningCondition', () => {
     expect(content).toContain('repository pattern');
     expect(content).toContain('TypeScript strict mode');
     expect(content).toContain('vitest');
-    // No Twining-specific instructions (plugin handles those)
+    // Gates are NOT in the harness-written CLAUDE.md — plugin 1.6.0+
+    // injects them via ensure-claude-md-gates.sh SessionStart hook at runtime
     expect(content).not.toContain('twining_assemble');
-    expect(content).not.toContain('Twining Integration');
   });
 
   it('agent config uses Twining plugin (not raw MCP server)', async () => {
