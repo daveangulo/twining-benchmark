@@ -232,6 +232,8 @@ export class AgentSessionManager {
       timeoutReject?.(new Error('TIMEOUT'));
     }, effectiveTimeoutMs);
 
+    let queryStream: Query | undefined;
+
     try {
       // Augment prompt with conversation history when persistHistory is enabled
       let effectivePrompt = task.prompt;
@@ -243,11 +245,12 @@ export class AgentSessionManager {
       }
 
       const sdkOptions = this.buildSdkOptions(task, abortController);
-      const queryStream: Query = sdkQuery({ prompt: effectivePrompt, options: sdkOptions });
+      queryStream = sdkQuery({ prompt: effectivePrompt, options: sdkOptions });
 
       // Wrap iteration in a function so we can race it against the timeout
+      const stream = queryStream!;
       const processStream = async (): Promise<void> => {
-        for await (const message of queryStream) {
+        for await (const message of stream) {
           rawMessages.push(message);
           const now = new Date();
 
@@ -301,6 +304,20 @@ export class AgentSessionManager {
           compactionCount: 0,
           turnUsage: [],
         });
+      }
+
+      // Timeout path: force-stop the SDK query stream.
+      // The abort signal is soft — the SDK may continue processing.
+      // Use interrupt() + a hard grace period to ensure we don't hang.
+      if (queryStream) {
+        try {
+          await Promise.race([
+            queryStream.interrupt(),
+            new Promise<void>((resolve) => setTimeout(resolve, 30_000)),
+          ]);
+        } catch {
+          // interrupt() may throw if stream is already closed — that's fine
+        }
       }
     } finally {
       clearTimeout(timeoutHandle);

@@ -258,24 +258,15 @@ export class ContextRecoveryScenario extends BaseScenario {
     // Fall back to timeToFirstActionMs if we couldn't compute productive time
     const effectiveTime = firstProductiveMs ?? transcriptB.timing.timeToFirstActionMs;
 
-    let score: number;
-    if (effectiveTime < 30000) {
-      score = 100;
-    } else if (effectiveTime < 60000) {
-      score = 80;
-    } else if (effectiveTime < 120000) {
-      score = 60;
-    } else if (effectiveTime < 180000) {
-      score = 40;
-    } else {
-      score = 20;
-    }
+    // Linear scaling: 0s → 100, 120s → 0 (continuous, no step cliffs)
+    const effectiveSec = effectiveTime / 1000;
+    const score = Math.round(Math.max(0, Math.min(100, 100 - (effectiveSec / 120) * 100)));
 
     return {
       value: score,
       confidence: 'high',
       method: 'automated',
-      justification: `Agent B's time to first productive action: ${(effectiveTime / 1000).toFixed(1)}s (coordination time excluded). Score: ${score}.`,
+      justification: `Agent B's time to first productive action: ${effectiveSec.toFixed(1)}s (coordination time excluded). Linear: 0s=100, 120s=0.`,
     };
   }
 
@@ -385,37 +376,48 @@ export class ContextRecoveryScenario extends BaseScenario {
    * Pattern match models, service, and tests in the combined file changes.
    */
   private scoreCompletion(rawResults: RawResults, groundTruth: ArchitecturalManifest): DimensionScore {
-    // Gather all file paths from all transcripts
-    const allFiles = rawResults.transcripts.flatMap((t) => t.fileChanges.map((c) => c.path));
-    const allDiffs = rawResults.transcripts
-      .flatMap((t) => t.fileChanges.map((c) => c.diff))
+    const details: string[] = [];
+    let componentScore = 0;
+
+    // Check for each expected component in source files only (not docs/coordination)
+    const sourceDiffs = rawResults.transcripts
+      .flatMap((t) => t.fileChanges.filter((c) => c.path.startsWith('src/') || c.path.startsWith('tests/')))
+      .map((c) => c.diff)
       .filter((d): d is string => d !== undefined)
       .join('\n');
 
-    const allContent = allFiles.join('\n') + '\n' + allDiffs;
-
-    let found = 0;
-    const details: string[] = [];
-
     for (const decision of groundTruth.decisions) {
       const hasMatch = decision.expectedPatterns.some(
-        (pattern) => new RegExp(pattern, 'i').test(allContent),
+        (pattern) => new RegExp(pattern, 'i').test(sourceDiffs),
       );
       if (hasMatch) {
-        found++;
+        componentScore += 1;
         details.push(`${decision.id}: found`);
       } else {
         details.push(`${decision.id}: missing`);
       }
     }
 
-    const score = Math.round((found / groundTruth.decisions.length) * 100);
+    const componentRatio = componentScore / Math.max(groundTruth.decisions.length, 1);
+
+    // Check if agents ran tests and completed
+    const completionBonus = rawResults.allSessionsCompleted ? 15 : 0;
+    const lastTranscript = rawResults.transcripts[rawResults.transcripts.length - 1];
+    const ranTests = lastTranscript?.toolCalls.some(
+      (tc) =>
+        tc.toolName === 'Bash' &&
+        /(?:test|vitest|jest|npm\s+test)/i.test(JSON.stringify(tc.parameters)),
+    ) ?? false;
+    const testsBonus = ranTests ? 15 : 0;
+
+    // Component presence (70%) + all sessions completed (15%) + ran tests (15%)
+    const score = Math.round(componentRatio * 70 + completionBonus + testsBonus);
 
     return {
-      value: score,
-      confidence: allDiffs.length > 0 ? 'high' : 'medium',
+      value: Math.min(100, score),
+      confidence: sourceDiffs.length > 0 ? 'high' : 'medium',
       method: 'automated',
-      justification: `${found}/${groundTruth.decisions.length} components found. ${details.join('; ')}.`,
+      justification: `${componentScore}/${groundTruth.decisions.length} components found (${Math.round(componentRatio * 70)}/70). Completed: ${completionBonus}/15. Tests: ${testsBonus}/15. ${details.join('; ')}.`,
     };
   }
 

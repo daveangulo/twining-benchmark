@@ -29,15 +29,15 @@ describe('BaselineCondition', () => {
 
     const ctx = await condition.setup(workDir);
 
-    // CLAUDE.md should still exist
+    // CLAUDE.md should still exist (now written by baseline with standard content)
     const files = await readdir(workDir);
     expect(files).toContain('CLAUDE.md');
-    expect(ctx.setupFiles).toEqual([]);
+    expect(ctx.setupFiles).toEqual(['CLAUDE.md']);
   });
 
-  it('succeeds even if no CLAUDE.md exists', async () => {
+  it('writes CLAUDE.md even if none exists', async () => {
     const ctx = await condition.setup(workDir);
-    expect(ctx.setupFiles).toEqual([]);
+    expect(ctx.setupFiles).toEqual(['CLAUDE.md']);
   });
 
   it('removes .claude directory entirely', async () => {

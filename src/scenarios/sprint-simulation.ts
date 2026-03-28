@@ -43,7 +43,7 @@ import {
   ARCHITECTURAL_COHERENCE_TEMPLATE,
 } from '../analyzer/llm-judge.js';
 
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = 25 * 60 * 1000;
 const DEFAULT_MAX_TURNS = 50;
 
 export const SPRINT_SIMULATION_GROUND_TRUTH: ArchitecturalManifest = {
@@ -557,6 +557,30 @@ export class SprintSimulationScenario extends BaseScenario {
     groundTruth: ArchitecturalManifest,
     evaluatorClient?: Anthropic,
   ): Promise<ScoredResults> {
+    // Guard: if most sessions failed (0 tool calls), the iteration is invalid —
+    // score 0 rather than producing misleading results (e.g., cumulativeRework=100
+    // because no code changed).
+    const workingSessions = rawResults.transcripts.filter((t) => t.toolCalls.length > 0);
+    if (workingSessions.length < rawResults.transcripts.length * 0.5) {
+      const failMsg = `${rawResults.transcripts.length - workingSessions.length}/${rawResults.transcripts.length} sessions failed (0 tool calls) — iteration invalid.`;
+      const zeroScore: DimensionScore = { value: 0, confidence: 'high', method: 'automated', justification: failMsg };
+      return {
+        runId: '',
+        scenario: 'sprint-simulation',
+        condition: '',
+        iteration: 0,
+        scores: {
+          decisionConsistency: zeroScore,
+          assumptionHandling: zeroScore,
+          cumulativeRework: zeroScore,
+          contextRecovery: zeroScore,
+          finalQuality: zeroScore,
+        },
+        metrics: this.extractMetrics(rawResults),
+        composite: 0,
+      };
+    }
+
     const decisionConsistency = this.scoreDecisionConsistency(rawResults, groundTruth);
     const assumptionHandling = this.scoreAssumptionHandling(rawResults);
     const cumulativeRework = this.scoreCumulativeRework(rawResults);

@@ -96,26 +96,11 @@ export class FileReloadGenericCondition extends BaseCondition {
   }
 
   private generateClaudeMd(): string {
-    return `# Project Guidelines
-
-## Architecture
-- This project follows the repository pattern for data access
-- Services depend on repositories, never on each other directly
-- Events are preferred over direct cross-service calls for decoupling
-
-## Coding Conventions
-- Use TypeScript strict mode — no \`any\` types
-- All public methods must have JSDoc comments
-- Use dependency injection via constructor parameters
-
+    return BaseCondition.BASE_CLAUDE_MD + `
 ## Context Management
 - ALWAYS read CONTEXT.md at the start of your session
 - ALWAYS update CONTEXT.md before ending your session
 - This is your only coordination mechanism with other agents
-
-## Testing
-- Tests use vitest
-- Run tests before committing
 `;
   }
 }

@@ -238,18 +238,7 @@ export class FileReloadStructuredCondition extends BaseCondition {
   }
 
   private generateClaudeMd(): string {
-    return `# Project Guidelines
-
-## Architecture
-- This project follows the repository pattern for data access
-- Services depend on repositories, never on each other directly
-- Events are preferred over direct cross-service calls for decoupling
-
-## Coding Conventions
-- Use TypeScript strict mode — no \`any\` types
-- All public methods must have JSDoc comments
-- Use dependency injection via constructor parameters
-
+    return BaseCondition.BASE_CLAUDE_MD + `
 ## Structured Coordination
 This project uses a structured multi-agent coordination framework.
 All coordination happens through files in the coordination/ directory:
@@ -261,11 +250,6 @@ All coordination happens through files in the coordination/ directory:
 - coordination/roles/agent-N.md — Role definitions per agent
 
 ALWAYS follow the startup sequence in your role file.
-
-## Testing
-- Tests use vitest
-- Run tests before committing
-- Commit each task atomically
 `;
   }
 }

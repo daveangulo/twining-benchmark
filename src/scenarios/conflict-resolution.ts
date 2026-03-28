@@ -242,37 +242,53 @@ export class ConflictResolutionScenario extends BaseScenario {
       };
     }
 
-    // Collect all text from Agent C's tool calls and diffs
-    const cText = [
-      transcriptC.toolCalls.map((tc) => `${tc.toolName} ${JSON.stringify(tc.parameters)}`).join('\n'),
-      transcriptC.fileChanges.map((c) => c.diff ?? '').join('\n'),
-    ].join('\n').toLowerCase();
+    // Check Agent C's ADDED source code lines for pattern usage
+    const cSourceDiffs = transcriptC.fileChanges
+      .filter((c) => c.path.startsWith('src/') || c.path.startsWith('tests/'))
+      .map((c) => c.diff ?? '')
+      .join('\n');
+    const cAddedLines = cSourceDiffs
+      .split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .join('\n');
+    const cRemovedLines = cSourceDiffs
+      .split('\n')
+      .filter((line) => line.startsWith('-') && !line.startsWith('---'))
+      .join('\n');
 
-    const eventPatterns = /event[\s-]?driven|event[\s-]?bus|emit|listener|subscribe|pub[\s-]?sub/i;
-    const directPatterns = /direct[\s-]?call|service[\s-]?to[\s-]?service|direct.*invoc|inject.*notification|notif.*direct/i;
+    const eventPattern = /EventBus|eventBus|\.emit\(|\.on\(/i;
+    const directPattern = /CallbackRegistry|statusChangeCallbacks|\.register\(|\.notify\(/i;
 
-    const mentionsEvent = eventPatterns.test(cText);
-    const mentionsDirect = directPatterns.test(cText);
+    // Did C remove one pattern from code? (evidence of active unification)
+    const removedEvent = eventPattern.test(cRemovedLines);
+    const removedDirect = directPattern.test(cRemovedLines);
+    const addedEvent = eventPattern.test(cAddedLines);
+    const addedDirect = directPattern.test(cAddedLines);
 
     let score: number;
     let justification: string;
 
-    if (mentionsEvent && mentionsDirect) {
+    // Best case: C removed one pattern and kept/added the other → clear unification
+    if ((removedEvent && !removedDirect && addedDirect) || (removedDirect && !removedEvent && addedEvent)) {
       score = 100;
-      justification = 'Agent C identified both event-driven and direct-call patterns.';
-    } else if (mentionsEvent || mentionsDirect) {
+      const kept = removedEvent ? 'direct-call' : 'event-driven';
+      const removed = removedEvent ? 'event-driven' : 'direct-call';
+      justification = `Agent C unified to ${kept} by removing ${removed} pattern from code.`;
+    } else if (removedEvent || removedDirect) {
+      score = 70;
+      justification = 'Agent C removed at least one pattern — partial unification detected.';
+    } else if (addedEvent || addedDirect) {
       score = 40;
-      const found = mentionsEvent ? 'event-driven' : 'direct-call';
-      const missing = mentionsEvent ? 'direct-call' : 'event-driven';
-      justification = `Agent C mentioned ${found} pattern but did not identify ${missing} pattern.`;
+      const mentioned = addedEvent ? 'event-driven' : 'direct-call';
+      justification = `Agent C added ${mentioned} code but did not remove the alternative pattern.`;
     } else {
       score = 0;
-      justification = 'Agent C did not identify either architectural pattern.';
+      justification = 'Agent C did not modify architectural patterns in source code.';
     }
 
     return {
       value: score,
-      confidence: cText.length > 0 ? 'medium' : 'low',
+      confidence: cSourceDiffs.length > 0 ? 'medium' : 'low',
       method: 'automated',
       justification,
     };
@@ -296,27 +312,63 @@ export class ConflictResolutionScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // Check if Agent C made file changes (indicating unification work)
-    if (transcriptC.fileChanges.length > 0) {
-      score += 40;
-      details.push(`Agent C made ${transcriptC.fileChanges.length} file changes.`);
+    // 1. Did Agent C modify notification source files? (25 pts)
+    const notifFiles = transcriptC.fileChanges.filter(
+      (c) => /notification|order\.service|event/i.test(c.path) && c.path.startsWith('src/'),
+    );
+    if (notifFiles.length >= 2) {
+      score += 25;
+      details.push(`Modified ${notifFiles.length} notification/service files.`);
+    } else if (notifFiles.length === 1) {
+      score += 10;
+      details.push('Modified 1 notification/service file — limited unification scope.');
     } else {
-      details.push('Agent C made no file changes — no unification performed.');
+      details.push('No notification/service files modified.');
     }
 
-    // Check if Agent C completed successfully
+    // 2. Is the final code unified? Check if C's added lines show only ONE pattern. (35 pts)
+    const cSourceAdded = transcriptC.fileChanges
+      .filter((c) => c.path.startsWith('src/'))
+      .map((c) => c.diff ?? '')
+      .join('\n')
+      .split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .join('\n');
+
+    const eventInAdded = /EventBus|eventBus|\.emit\(|\.on\(/i.test(cSourceAdded);
+    const directInAdded = /CallbackRegistry|statusChangeCallbacks|\.register\(|\.notify\(/i.test(cSourceAdded);
+
+    if ((eventInAdded && !directInAdded) || (directInAdded && !eventInAdded)) {
+      score += 35;
+      const unified = eventInAdded ? 'event-driven' : 'direct-call';
+      details.push(`Unified to ${unified} pattern.`);
+    } else if (eventInAdded && directInAdded) {
+      score += 10;
+      details.push('Both patterns present in added code — not fully unified.');
+    } else {
+      details.push('No architectural pattern detected in added code.');
+    }
+
+    // 3. Did Agent C run tests successfully? (25 pts)
+    const ranTests = transcriptC.toolCalls.some(
+      (tc) =>
+        tc.toolName === 'Bash' &&
+        /(?:test|vitest|jest|npm\s+test)/i.test(JSON.stringify(tc.parameters)),
+    );
+    if (rawResults.allSessionsCompleted && ranTests) {
+      score += 25;
+      details.push('All sessions completed and Agent C ran tests.');
+    } else if (rawResults.allSessionsCompleted) {
+      score += 10;
+      details.push('All sessions completed but Agent C did not run tests.');
+    } else {
+      details.push('Not all sessions completed.');
+    }
+
+    // 4. Agent C completed (15 pts)
     if (transcriptC.exitReason === 'completed') {
-      score += 30;
-      details.push('Agent C completed successfully.');
-    } else {
-      details.push(`Agent C exited with: ${transcriptC.exitReason}.`);
-    }
-
-    // Check for notification-related patterns in C's diffs
-    const cDiffs = transcriptC.fileChanges.map((c) => c.diff ?? '').join('\n');
-    if (/notification/i.test(cDiffs)) {
-      score += 30;
-      details.push('Agent C modified notification-related code.');
+      score += 15;
+      details.push('Completed.');
     }
 
     return {

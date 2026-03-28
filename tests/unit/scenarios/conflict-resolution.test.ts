@@ -180,14 +180,14 @@ describe('ConflictResolutionScenario', () => {
                 changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 15,
-                diff: '+// Decision: chose event-driven approach for notification architecture',
+                diff: '-import { EventBus } from "../events/event-bus";\n-    this.eventBus.emit("orderCreated", order);\n+import { CallbackRegistry } from "../callbacks/registry";\n+    this.callbackRegistry.register("orderCreated", handler);',
               },
               {
                 path: 'COORDINATION.md',
                 changeType: 'added',
                 linesAdded: 10,
                 linesRemoved: 0,
-                diff: '+## Architectural Decision\n+Chose event-driven over direct calls for rationale...',
+                diff: '+## Architectural Decision\n+Chose direct-call over event-driven for rationale...',
               },
             ],
           }),
@@ -200,7 +200,7 @@ describe('ConflictResolutionScenario', () => {
       const scored = await scenario.score(rawResults, CONFLICT_RESOLUTION_GROUND_TRUTH);
 
       expect(scored.scores['conflict-detection'].value).toBe(100);
-      expect(scored.scores['conflict-detection'].justification).toContain('both');
+      expect(scored.scores['conflict-detection'].justification).toContain('unified');
     });
 
     it('scores low conflict detection when Agent C mentions only one pattern', async () => {
@@ -221,7 +221,15 @@ describe('ConflictResolutionScenario', () => {
                 turnIndex: 0,
               },
             ],
-            fileChanges: [],
+            fileChanges: [
+              {
+                path: 'src/services/notification.service.ts',
+                changeType: 'modified',
+                linesAdded: 5,
+                linesRemoved: 0,
+                diff: '+import { EventBus } from "../events/event-bus";\n+    this.eventBus.emit("orderCreated", order);',
+              },
+            ],
           }),
         ],
         finalWorkingDir: '/tmp/test',

@@ -75,20 +75,7 @@ export class SharedMarkdownCondition extends BaseCondition {
   }
 
   private generateClaudeMdWithCoordination(): string {
-    return `# Project Guidelines
-
-## Architecture
-- This project follows the repository pattern for data access
-- Services depend on repositories, never on each other directly
-- Events are preferred over direct cross-service calls for decoupling
-- All business logic lives in the service layer
-
-## Coding Conventions
-- Use TypeScript strict mode — no \`any\` types
-- All public methods must have JSDoc comments
-- Use dependency injection via constructor parameters
-- Error handling: throw typed errors, never return null for errors
-
+    return BaseCondition.BASE_CLAUDE_MD + `
 ## Coordination
 - Read COORDINATION.md before starting any work
 - Update COORDINATION.md after completing your work with:
@@ -96,15 +83,6 @@ export class SharedMarkdownCondition extends BaseCondition {
   - Key decisions and their rationale
   - Warnings or context for the next agent
   - Status of your assigned tasks
-
-## Testing
-- Tests use vitest
-- Each module has a corresponding test file in tests/
-- Run tests before committing
-
-## Git Practices
-- Commit atomically per logical change
-- Write descriptive commit messages
 `;
   }
 }

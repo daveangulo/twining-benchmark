@@ -657,14 +657,25 @@ export class BugInvestigationScenario extends BaseScenario {
       }
     } else if (!bModifiedBugFile && aAlreadyFixed) {
       // Agent A already fixed the bug; Agent B investigated and correctly determined no modification needed.
-      // This is good coordination — credit Agent B for verifying the fix rather than redoing work.
-      score = 50;
-      details.push('Agent A already fixed the bug. Agent B investigated and correctly verified the fix was complete.');
+      // Good work leverage — B didn't redo A's work.
+      // Credit further if B added regression tests (productive follow-up instead of redundant rework).
+      if (hasTestFile) {
+        score = 85;
+        details.push('Agent A already fixed the bug. Agent B verified the fix and added a regression test — excellent work leverage.');
+      } else {
+        score = 50;
+        details.push('Agent A already fixed the bug. Agent B investigated and verified the fix was complete.');
+      }
     } else if (bModifiedBugFile && aAlreadyFixed) {
       // Agent A already fixed the bug but Agent B redundantly re-modified it.
       // This is a coordination failure — B didn't check that the work was done.
-      score = 20;
-      details.push('Agent A already fixed the bug. Agent B redundantly re-modified the bug file — coordination failure.');
+      if (hasTestFile) {
+        score = 35;
+        details.push('Agent A already fixed the bug. Agent B redundantly re-modified it but added a regression test.');
+      } else {
+        score = 20;
+        details.push('Agent A already fixed the bug. Agent B redundantly re-modified the bug file — coordination failure.');
+      }
     } else if (!bModifiedBugFile) {
       // 15: Investigated but did not modify (and bug is NOT fixed)
       score = 15;
@@ -717,23 +728,15 @@ export class BugInvestigationScenario extends BaseScenario {
     const durationMs = transcriptB.timing.durationMs;
     const durationMinutes = durationMs / 60_000;
 
-    let score: number;
-    if (durationMinutes <= 3) {
-      score = 100;
-    } else if (durationMinutes <= 10) {
-      // Linear interpolation: 3min=100, 10min=50
-      score = Math.round(100 - ((durationMinutes - 3) / 7) * 50);
-    } else {
-      // Linear interpolation: 10min=50, 15min=0
-      score = Math.round(Math.max(0, 50 - ((durationMinutes - 10) / 5) * 50));
-    }
+    // Linear scaling: 0 min → 100, 10 min → 0 (continuous, no cliff)
+    const score = Math.round(Math.max(0, Math.min(100, 100 - (durationMinutes / 10) * 100)));
 
     return {
       value: score,
       confidence: 'high',
       method: 'automated',
       justification:
-        `Agent B session duration: ${durationMinutes.toFixed(1)} minutes. Score based on resolution speed.`,
+        `Agent B session duration: ${durationMinutes.toFixed(1)} minutes (${score}/100). Linear: 0 min=100, 10 min=0.`,
     };
   }
 

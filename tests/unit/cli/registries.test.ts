@@ -93,10 +93,11 @@ describe('Scenario Registry', () => {
     expect(() => getScenario('nonexistent' as never)).toThrow('Unknown scenario');
   });
 
-  it('resolveScenarioNames resolves "all" excluding scale-stress-test', () => {
+  it('resolveScenarioNames resolves "all" excluding excludeFromAll scenarios', () => {
     const names = resolveScenarioNames('all');
-    expect(names).toHaveLength(8);
+    expect(names).toHaveLength(7);
     expect(names).not.toContain('scale-stress-test');
+    expect(names).not.toContain('sprint-simulation');
   });
 
   it('resolveScenarioNames resolves explicit scale-stress-test', () => {

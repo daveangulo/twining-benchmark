@@ -346,50 +346,51 @@ export class ConcurrentAgentsScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // Check if merge agent addressed conflicts
-    const allText = [
-      mergeTranscript.prompt,
-      ...mergeTranscript.toolCalls.map(tc => JSON.stringify(tc.parameters)),
-      ...mergeTranscript.fileChanges.map(fc => fc.diff ?? ''),
-    ].join('\n');
-
-    const mentionsConflicts = /conflict|merge|inconsisten|overlap|integrat/i.test(allText);
-    if (mentionsConflicts) {
-      score += 40;
-      details.push('Merge agent addressed conflicts/integration issues.');
-    } else {
-      details.push('Merge agent did not explicitly address conflicts.');
-    }
-
-    // Check if merge agent completed
+    // 1. Did merge agent complete? (20 pts)
     if (mergeTranscript.exitReason === 'completed') {
-      score += 30;
-      details.push('Merge agent completed successfully.');
+      score += 20;
+      details.push('Merge agent completed.');
     } else {
       details.push(`Merge agent ended with: ${mergeTranscript.exitReason}.`);
     }
 
-    // Check if merge agent made file changes (actual integration work)
-    if (mergeTranscript.fileChanges.length > 0) {
+    // 2. Did merge agent make integration changes? Graduated by scope. (30 pts)
+    const mergeFileCount = mergeTranscript.fileChanges.length;
+    if (mergeFileCount >= 3) {
+      score += 30;
+      details.push(`Modified ${mergeFileCount} files — broad integration.`);
+    } else if (mergeFileCount >= 1) {
       score += 15;
-      details.push(`Merge agent modified ${mergeTranscript.fileChanges.length} file(s).`);
+      details.push(`Modified ${mergeFileCount} file(s) — limited integration.`);
     } else {
-      details.push('Merge agent made no file changes.');
+      details.push('No file changes — no integration work.');
     }
 
-    // Check if tests were run
-    const ranTests = mergeTranscript.toolCalls.some(
-      tc =>
-        tc.toolName === 'Bash' &&
-        /(?:test|jest|vitest|mocha|npm\s+test|npx\s+.*test|compile|tsc|build)/i.test(
-          JSON.stringify(tc.parameters),
-        ),
+    // 3. Did merge agent modify cross-cutting files (index, config, shared modules)? (20 pts)
+    const crossCutting = mergeTranscript.fileChanges.filter(fc =>
+      /index\.ts|config|app|main|shared|common|integration/i.test(fc.path),
     );
-    if (ranTests) {
-      score += 15;
-      details.push('Merge agent ran tests/compilation checks.');
+    if (crossCutting.length > 0) {
+      score += 20;
+      details.push(`Touched ${crossCutting.length} cross-cutting file(s).`);
     } else {
-      details.push('Merge agent did not run tests.');
+      details.push('No cross-cutting files modified.');
+    }
+
+    // 4. Did merge agent run tests successfully? (30 pts) — outcome measure
+    const ranTests = mergeTranscript.toolCalls.some(
+      (tc) =>
+        tc.toolName === 'Bash' &&
+        /(?:test|vitest|jest|npm\s+test)/i.test(JSON.stringify(tc.parameters)),
+    );
+    if (rawResults.allSessionsCompleted && ranTests) {
+      score += 30;
+      details.push('All sessions completed and merge agent ran tests.');
+    } else if (rawResults.allSessionsCompleted) {
+      score += 15;
+      details.push('All sessions completed but merge agent did not run tests.');
+    } else {
+      details.push('Not all sessions completed.');
     }
 
     return {

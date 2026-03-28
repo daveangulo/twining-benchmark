@@ -25,8 +25,9 @@ import type { WorkingDirectory, ArchitecturalManifest } from '../types/target.js
 import type { ConditionContext } from '../types/condition.js';
 import type { ScoredResults, DimensionScore } from '../types/results.js';
 import type { ScenarioMetadata, AgentTask, RawResults } from '../types/scenario.js';
-import type { AgentTranscript } from '../types/transcript.js';
+import type { AgentTranscript, FileChange } from '../types/transcript.js';
 import { BaseScenario } from './scenario.interface.js';
+import { computeContinuationIndex } from '../analyzer/work-leverage.js';
 import {
   buildEvaluationContextFromResults,
   runSingleEvaluation,
@@ -279,21 +280,7 @@ const CALLBACK_REGISTRY_PATTERNS = [
   /\.notify\(/,
 ];
 
-/** Coordination tool names that indicate intentional decision discovery. */
-const COORDINATION_TOOLS = [
-  'twining_assemble',
-  'twining_why',
-  'twining_query',
-  'twining_search_decisions',
-  'twining_read',
-  'twining_recent',
-  'mcp__plugin_twining_twining__twining_assemble',
-  'mcp__plugin_twining_twining__twining_why',
-  'mcp__plugin_twining_twining__twining_query',
-  'mcp__plugin_twining_twining__twining_search_decisions',
-  'mcp__plugin_twining_twining__twining_read',
-  'mcp__plugin_twining_twining__twining_recent',
-];
+
 
 export class ArchitectureCascadeScenario extends BaseScenario {
   protected buildMetadata(): ScenarioMetadata {
@@ -489,6 +476,18 @@ export class ArchitectureCascadeScenario extends BaseScenario {
   }
 
   /**
+   * Filter fileChanges to source code files only (src/ and tests/ TypeScript).
+   * Excludes documentation and coordination files (CLAUDE.md, COORDINATION.md,
+   * ARCHITECTURE_DECISION.md, .twining/, coordination/) whose text can contain
+   * pattern keywords that skew architectural pattern detection.
+   */
+  private filterToSourceFiles(fileChanges: FileChange[]): FileChange[] {
+    return fileChanges.filter((c) =>
+      (c.path.startsWith('src/') || c.path.startsWith('tests/')) && c.path.endsWith('.ts'),
+    );
+  }
+
+  /**
    * Check whether an agent's diff ONLY uses the added lines (new code) for pattern
    * detection, filtering out context/removed lines to avoid false positives from
    * pre-existing code.
@@ -534,8 +533,9 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    const aDiffs = transcriptA.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-    const aHasMissingDiffs = transcriptA.fileChanges.some((c) => c.diff === undefined);
+    const aSourceFiles = this.filterToSourceFiles(transcriptA.fileChanges);
+    const aDiffs = aSourceFiles.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const aHasMissingDiffs = aSourceFiles.some((c) => c.diff === undefined);
 
     if (aHasMissingDiffs && aDiffs.length === 0) {
       return {
@@ -547,8 +547,11 @@ export class ArchitectureCascadeScenario extends BaseScenario {
       };
     }
 
-    // Detect A's specific pattern choice
-    let aChoice = this.detectPatternChoice(aDiffs);
+    // Detect A's specific pattern choice from added lines in source files only —
+    // removed lines (e.g. deleting CallbackRegistry usage) indicate
+    // the REJECTED pattern, not the chosen one.
+    const aAddedLines = this.extractAddedLines(aDiffs);
+    let aChoice = this.detectPatternChoice(aAddedLines);
 
     // Fallback: if diffs don't reveal a pattern, check Twining tool call parameters
     if (aChoice === 'none') {
@@ -588,8 +591,9 @@ export class ArchitectureCascadeScenario extends BaseScenario {
         continue;
       }
 
-      const agentDiffs = transcript.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-      const agentHasMissingDiffs = transcript.fileChanges.some((c) => c.diff === undefined);
+      const agentSourceFiles = this.filterToSourceFiles(transcript.fileChanges);
+      const agentDiffs = agentSourceFiles.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+      const agentHasMissingDiffs = agentSourceFiles.some((c) => c.diff === undefined);
       if (agentHasMissingDiffs) anyMissingDiffs = true;
 
       if (agentHasMissingDiffs && agentDiffs.length === 0) {
@@ -719,28 +723,17 @@ export class ArchitectureCascadeScenario extends BaseScenario {
 
       const fileReadScore = Math.round((aFilesRead / aModifiedFiles.size) * 25);
 
-      // Sub-score 2: Did agent use coordination tools OR read coordination files?
-      const coordToolCalls = earlyToolCalls.filter((tc) =>
-        COORDINATION_TOOLS.some((ct) => tc.toolName.includes(ct)),
-      );
-      // Also check if agent read coordination-related files (non-Twining conditions)
-      const coordFileReads = earlyToolCalls.filter((tc) => {
-        if (tc.toolName !== 'Read') return false;
-        const fp = (tc.parameters?.file_path ?? tc.parameters?.path ?? '') as string;
-        return /COORDINATION\.md|CONTEXT\.md|DECISIONS\.md|ARCHITECTURE\.md|ADR|CLAUDE\.md|\.twining\//i.test(fp);
-      });
-      const totalCoordActions = coordToolCalls.length + coordFileReads.length;
-      // 25 pts if any coordination action, scaled: 1 = 15, 2+ = 25
-      const coordScore = totalCoordActions === 0 ? 0
-        : totalCoordActions === 1 ? 15
-        : 25;
+      // Sub-score 2: Does this agent's code reference A's new symbols? (continuation index)
+      // Measures whether B/C built on A's abstractions from code artifacts, not process.
+      const contIdx = computeContinuationIndex(transcriptA, transcript);
+      const contScore = Math.round(contIdx * 25);
 
-      const agentScore = fileReadScore + coordScore;
+      const agentScore = fileReadScore + contScore;
       totalScore += agentScore;
 
       details.push(
         `Agent ${label}: read ${aFilesRead}/${aModifiedFiles.size} of A's files before writing (${fileReadScore} pts), ` +
-        `${coordToolCalls.length} coordination tool calls (${coordScore} pts).`,
+        `continuation index ${(contIdx * 100).toFixed(0)}% (${contScore} pts).`,
       );
     }
 
@@ -879,8 +872,9 @@ export class ArchitectureCascadeScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    const aDiffs = transcriptA.fileChanges.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
-    const hasMissingDiffs = transcriptA.fileChanges.some((c) => c.diff === undefined);
+    const aSourceFiles = this.filterToSourceFiles(transcriptA.fileChanges);
+    const aDiffs = aSourceFiles.map((c) => c.diff).filter((d): d is string => d !== undefined).join('\n');
+    const hasMissingDiffs = aSourceFiles.some((c) => c.diff === undefined);
     const decouplingDecision = groundTruth.decisions.find(
       (d) => d.id === 'decouple-notifications',
     );

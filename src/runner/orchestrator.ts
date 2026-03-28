@@ -502,6 +502,31 @@ export class RunOrchestrator {
             totalSessions: tasks.length,
             message: `Task ${i + 1}/${tasks.length} ${retryResult.success ? 'completed' : 'failed'}`,
           });
+
+          // Validate plugin availability after first session:
+          // If condition expects Twining tools but none were used, the plugin
+          // failed to load. Fail fast rather than running N-1 more invalid sessions.
+          if (i === 0 && retryResult.result && conditionCtx.agentConfig.plugins && conditionCtx.agentConfig.plugins.length > 0) {
+            const hasTwiningCalls = retryResult.result.toolCalls.some(
+              (tc) => tc.toolName.includes('twining'),
+            );
+            if (!hasTwiningCalls && retryResult.result.toolCalls.length > 0) {
+              const msg = `Plugin validation failed: condition "${condition.name}" has plugins configured but first session made ${retryResult.result.toolCalls.length} tool calls with zero Twining calls. The plugin likely failed to load.`;
+              this.emitProgress({
+                type: 'session-start',
+                runId,
+                scenario: scenarioMeta.name,
+                condition: condition.name,
+                iteration,
+                sessionIndex: i,
+                totalSessions: tasks.length,
+                message: `⚠ ${msg}`,
+              });
+              errors.push(msg);
+              allCompleted = false;
+              break;
+            }
+          }
         }
 
         // Score the iteration

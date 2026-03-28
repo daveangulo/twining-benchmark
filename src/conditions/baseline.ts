@@ -1,4 +1,4 @@
-import { rm } from 'node:fs/promises';
+import { writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { AgentConfiguration } from '../types/index.js';
 import { BaseCondition } from './condition.interface.js';
@@ -7,7 +7,7 @@ import type { ConditionName } from '../types/index.js';
 /**
  * FR-CND-001: Baseline (No Coordination)
  *
- * Agents have access only to the codebase and CLAUDE.md.
+ * Agents have the codebase and standard CLAUDE.md project guidance.
  * No shared state, no coordination files, no MCP servers.
  * Agents cannot communicate except through code changes committed to the repo.
  */
@@ -18,7 +18,6 @@ export class BaselineCondition extends BaseCondition {
 
   protected async doSetup(workingDir: string): Promise<string[]> {
     // Strip any .claude directory (coordination state — may contain subdirectories)
-    // CLAUDE.md is kept as project documentation.
     const claudeDir = join(workingDir, '.claude');
     try {
       await rm(claudeDir, { recursive: true, force: true });
@@ -26,7 +25,11 @@ export class BaselineCondition extends BaseCondition {
       // Directory doesn't exist — that's fine
     }
 
-    return [];
+    // Write standard CLAUDE.md (same base content as all other conditions)
+    const claudeMdPath = join(workingDir, 'CLAUDE.md');
+    await writeFile(claudeMdPath, BaseCondition.BASE_CLAUDE_MD, 'utf-8');
+
+    return ['CLAUDE.md'];
   }
 
   protected buildAgentConfig(): AgentConfiguration {

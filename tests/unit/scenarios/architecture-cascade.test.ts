@@ -424,14 +424,7 @@ describe('ArchitectureCascadeScenario', () => {
                 changeType: 'modified',
                 linesAdded: 20,
                 linesRemoved: 10,
-                diff: '+export class EventBus { emit() {} subscribe() {} }',
-              },
-              {
-                path: 'DECISIONS.md',
-                changeType: 'added',
-                linesAdded: 5,
-                linesRemoved: 0,
-                diff: '+# Decision: EventBus',
+                diff: '+export class EventBus { emit() {} subscribe() {} }\n+export interface NotificationHandler { handle(): void; }',
               },
             ],
           }),
@@ -440,29 +433,25 @@ describe('ArchitectureCascadeScenario', () => {
             toolCalls: [
               // Read A's file before writing
               { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/src/services/notification.service.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
-              // Coordination tool
-              { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: { task: 'add email' }, timestamp: '2026-02-20T10:00:01Z', durationMs: 200 },
-              { toolName: 'mcp__plugin_twining_twining__twining_why', parameters: { scope: 'src/services/' }, timestamp: '2026-02-20T10:00:02Z', durationMs: 200 },
               // Then write
               { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/email.ts' }, timestamp: '2026-02-20T10:00:03Z', durationMs: 100 },
             ],
             fileChanges: [
-              { path: 'src/notifications/email.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0, diff: '+eventBus.subscribe("order", handleEmail);' },
+              { path: 'src/notifications/email.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0,
+                diff: '+import { EventBus, NotificationHandler } from "../services/notification.service";\n+export class EmailHandler implements NotificationHandler {\n+  constructor(private eventBus: EventBus) { eventBus.subscribe("order", this.handle); }\n+  handle() { /* send email */ }\n+}' },
             ],
           }),
           makeTranscript({
             taskIndex: 2,
             toolCalls: [
-              // Read A's file before writing
+              // Read A's files before writing
               { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/src/services/notification.service.ts' }, timestamp: '2026-02-20T10:00:00Z', durationMs: 100 },
-              { toolName: 'Read', parameters: { file_path: '/tmp/test-repo/DECISIONS.md' }, timestamp: '2026-02-20T10:00:01Z', durationMs: 100 },
-              // Coordination tool
-              { toolName: 'mcp__plugin_twining_twining__twining_assemble', parameters: { task: 'add webhook' }, timestamp: '2026-02-20T10:00:02Z', durationMs: 200 },
               // Then write
               { toolName: 'Write', parameters: { file_path: '/tmp/test-repo/src/notifications/webhook.ts' }, timestamp: '2026-02-20T10:00:03Z', durationMs: 100 },
             ],
             fileChanges: [
-              { path: 'src/notifications/webhook.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0, diff: '+eventBus.subscribe("order", fireWebhook);' },
+              { path: 'src/notifications/webhook.ts', changeType: 'added', linesAdded: 15, linesRemoved: 0,
+                diff: '+import { EventBus, NotificationHandler } from "../services/notification.service";\n+export class WebhookHandler implements NotificationHandler {\n+  constructor(private eventBus: EventBus) { eventBus.subscribe("order", this.fire); }\n+  fire() { /* fire webhook */ }\n+}' },
             ],
           }),
         ],
@@ -473,11 +462,11 @@ describe('ArchitectureCascadeScenario', () => {
 
       const scored = await scenario.score(rawResults, ARCHITECTURE_CASCADE_GROUND_TRUTH);
 
-      // B: read 1/2 files (12 pts) + 2 coord tools (25 pts) = 37
-      // C: read 2/2 files (25 pts) + 1 coord tool (15 pts) = 40
-      // Total: 77
+      // B: read 1/1 source files (25 pts) + high continuation index (25 pts) = 50
+      // C: read 1/1 source files (25 pts) + high continuation index (25 pts) = 50
+      // Total: ~50 (each agent's score is capped at 50, total out of 100)
       expect(scored.scores.decisionDiscovery.value).toBeGreaterThanOrEqual(50);
-      expect(scored.scores.decisionDiscovery.justification).toContain('coordination tool');
+      expect(scored.scores.decisionDiscovery.justification).toContain('continuation index');
     });
 
     it('scores zero decision discovery when B and C do not read A files or use coordination', async () => {

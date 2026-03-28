@@ -197,7 +197,7 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      expect(scored.scores['orientation-efficiency'].value).toBe(100);
+      expect(scored.scores['orientation-efficiency'].value).toBe(88);
     });
 
     it('scores slow orientation lower', async () => {
@@ -223,7 +223,7 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      expect(scored.scores['orientation-efficiency'].value).toBe(40);
+      expect(scored.scores['orientation-efficiency'].value).toBe(0);
     });
 
     it('penalizes redundant rework when B touches A files', async () => {
@@ -330,7 +330,7 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      expect(scored.scores.completion.value).toBe(100);
+      expect(scored.scores.completion.value).toBe(85);
     });
 
     it('scores redundant-rework 100 when B makes no changes and completion is high', async () => {
@@ -511,8 +511,8 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // First productive action (Edit) is at 20s — should score 100 (< 30s)
-      expect(scored.scores['orientation-efficiency'].value).toBe(100);
+      // First productive action (Edit) is at 20s — linear: 100 - (20/120)*100 ≈ 83
+      expect(scored.scores['orientation-efficiency'].value).toBe(83);
       expect(scored.scores['orientation-efficiency'].justification).toContain('coordination time excluded');
     });
 
@@ -605,8 +605,8 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // Only models found (1/3)
-      expect(scored.scores.completion.value).toBe(33);
+      // Only models found (1/3): Math.round((1/3) * 70) = 23, no metrics bonuses
+      expect(scored.scores.completion.value).toBe(23);
     });
 
     it('produces a composite score as weighted average of 4 dimensions', async () => {

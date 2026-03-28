@@ -255,8 +255,8 @@ describe('BugInvestigationScenario', () => {
       // Resolution should be good (fix + test)
       expect(scored.scores.resolution.value).toBeGreaterThanOrEqual(60);
 
-      // Time-to-resolution should be excellent (2 minutes)
-      expect(scored.scores.timeToResolution.value).toBe(100);
+      // Time-to-resolution should be excellent (2 minutes → linear: 80)
+      expect(scored.scores.timeToResolution.value).toBe(80);
     });
 
     it('penalizes redundant investigation when B restarts from scratch', async () => {
@@ -555,7 +555,7 @@ describe('BugInvestigationScenario', () => {
       const fastScored = await scenario.score(fastResult, BUG_INVESTIGATION_GROUND_TRUTH);
       const slowScored = await scenario.score(slowResult, BUG_INVESTIGATION_GROUND_TRUTH);
 
-      expect(fastScored.scores.timeToResolution.value).toBe(100);
+      expect(fastScored.scores.timeToResolution.value).toBe(80);
       expect(slowScored.scores.timeToResolution.value).toBeLessThan(50);
     });
 
@@ -662,7 +662,7 @@ describe('BugInvestigationScenario', () => {
       const scored = await scenario.score(rawResults, BUG_INVESTIGATION_GROUND_TRUTH);
 
       // Redundant re-fix should score much lower than verifying (50) or a genuine fix (85)
-      expect(scored.scores.resolution.value).toBe(20);
+      expect(scored.scores.resolution.value).toBe(35);
       expect(scored.scores.resolution.justification).toContain('redundantly');
     });
 
