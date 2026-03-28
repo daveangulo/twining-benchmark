@@ -61,10 +61,29 @@ def analyze_scorers(scores: list[ScoredResult]) -> dict:
                     "cluster_2_mean": round(float(np.mean(sorted_vals[gap_idx+1:])), 1),
                 })
 
+    # --- Discrimination summary per dimension ---
+    discrimination_summary = []
+    for dim_name, all_values in sorted(dim_all.items()):
+        arr = np.array(all_values)
+        min_val = float(np.min(arr))
+        max_val = float(np.max(arr))
+        spread = max_val - min_val
+        unique_values = len(set(round(float(v), 2) for v in arr))
+        discriminates = spread > 5 and unique_values > 2
+        discrimination_summary.append({
+            "dimension": dim_name,
+            "min": round(min_val, 2),
+            "max": round(max_val, 2),
+            "spread": round(spread, 2),
+            "unique_values": unique_values,
+            "discriminates": discriminates,
+        })
+
     return {
         "ceiling_effects": ceiling_effects,
         "floor_effects": floor_effects,
         "zero_variance": zero_variance,
         "non_discriminating": non_discriminating,
         "bimodal_suspects": bimodal_suspects,
+        "discrimination_summary": discrimination_summary,
     }

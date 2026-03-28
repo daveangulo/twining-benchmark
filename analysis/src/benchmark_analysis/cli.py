@@ -31,6 +31,18 @@ def main():
         dest="output_format",
     )
 
+    # compare-conditions <run-dir-1> <run-dir-2> [<run-dir-3>...]
+    cc_parser = subparsers.add_parser("compare-conditions", help="Compare conditions across multiple runs")
+    cc_parser.add_argument("--runs", nargs="+", type=Path, required=True, help="Paths to benchmark run directories")
+    cc_parser.add_argument(
+        "--conditions", type=str, default=None,
+        help="Comma-separated list of conditions to include (default: all)",
+    )
+    cc_parser.add_argument(
+        "--format", choices=["markdown", "json"], default="markdown",
+        dest="output_format",
+    )
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -40,6 +52,8 @@ def main():
         run_analyze(args)
     elif args.command == "compare":
         run_compare(args)
+    elif args.command == "compare-conditions":
+        run_compare_conditions(args)
 
 
 def run_analyze(args):
@@ -51,6 +65,7 @@ def run_analyze(args):
         behavior_outcome, effect_decomposition, learning_curve,
         interactions, construct_validity, harness_summary,
         recommendations,
+        session_health, behavioral_profile, work_leverage, cost_efficiency,
     )
     from .reports import markdown, html, json_report
 
@@ -103,6 +118,16 @@ def run_analyze(args):
     _run_safe(results, "interactions", lambda: interactions.analyze_interactions(run.scores))
     _run_safe(results, "construct_validity",
               lambda: construct_validity.analyze_construct_validity(run.scores))
+
+    # New dimensions: session health, behavioral profiles, work leverage, cost efficiency
+    _run_safe(results, "session_health",
+              lambda: session_health.analyze_session_health(run.transcripts))
+    _run_safe(results, "behavioral_profile",
+              lambda: behavioral_profile.analyze_behavioral_profiles(run.transcripts))
+    _run_safe(results, "work_leverage",
+              lambda: work_leverage.analyze_work_leverage(run.transcripts))
+    _run_safe(results, "cost_efficiency",
+              lambda: cost_efficiency.analyze_cost_efficiency(run.scores, run.transcripts))
 
     # Harness summary and recommendations depend on previous results
     _run_safe(results, "harness_summary", lambda: harness_summary.generate_harness_summary(results))
@@ -228,6 +253,112 @@ def _print_terminal_summary(results: dict):
         print("\n=== RECOMMENDATIONS ===")
         for rec in recs:
             print(f"  [{rec.get('priority', '?')}] {rec.get('message', '')}")
+
+
+def run_compare_conditions(args):
+    """Compare conditions across multiple benchmark runs."""
+    from collections import defaultdict
+    from .loader import load_run
+    from .stats import cohens_d, interpret_cohens_d
+    import json as json_mod
+
+    condition_filter = None
+    if args.conditions:
+        condition_filter = set(args.conditions.split(","))
+
+    # Load all runs and pool scores
+    all_scores: list = []
+    run_ids: list[str] = []
+    for run_dir in args.runs:
+        run = load_run(run_dir)
+        run_ids.append(run.metadata.id)
+        all_scores.extend(run.scores)
+
+    # Filter conditions if specified
+    if condition_filter:
+        all_scores = [s for s in all_scores if s.condition in condition_filter]
+
+    # Group by condition
+    by_condition: dict[str, list] = defaultdict(list)
+    for s in all_scores:
+        by_condition[s.condition].append(s)
+
+    # Per-condition stats
+    import numpy as np
+    condition_summaries: list[dict] = []
+    for condition in sorted(by_condition):
+        items = by_condition[condition]
+        composites = [s.composite for s in items]
+        arr = np.array(composites, dtype=float)
+        # Per-dimension means
+        dim_means: dict[str, float] = defaultdict(list)
+        for s in items:
+            for dim_name, dim_score in s.scores.items():
+                dim_means[dim_name].append(dim_score.value)
+        dim_avg = {k: round(float(np.mean(v)), 2) for k, v in dim_means.items()}
+
+        condition_summaries.append({
+            "condition": condition,
+            "n_iterations": len(items),
+            "mean_composite": round(float(np.mean(arr)), 2),
+            "std_composite": round(float(np.std(arr, ddof=1)), 2) if len(arr) > 1 else 0.0,
+            "per_dimension_means": dim_avg,
+        })
+
+    # Pairwise effect sizes (Hedges' g)
+    conditions_list = sorted(by_condition.keys())
+    pairwise_effects: list[dict] = []
+    for i, cond_a in enumerate(conditions_list):
+        for cond_b in conditions_list[i + 1:]:
+            vals_a = [s.composite for s in by_condition[cond_a]]
+            vals_b = [s.composite for s in by_condition[cond_b]]
+            d = cohens_d(vals_a, vals_b)
+            pairwise_effects.append({
+                "condition_a": cond_a,
+                "condition_b": cond_b,
+                "hedges_g": round(d, 3),
+                "interpretation": interpret_cohens_d(d),
+                "mean_a": round(float(np.mean(vals_a)), 2),
+                "mean_b": round(float(np.mean(vals_b)), 2),
+                "delta": round(float(np.mean(vals_b)) - float(np.mean(vals_a)), 2),
+            })
+
+    result = {
+        "run_ids": run_ids,
+        "n_runs": len(run_ids),
+        "conditions_compared": conditions_list,
+        "condition_summaries": condition_summaries,
+        "pairwise_effects": pairwise_effects,
+    }
+
+    if args.output_format == "json":
+        print(json_mod.dumps(result, indent=2, default=str))
+    else:
+        _print_condition_comparison(result)
+
+
+def _print_condition_comparison(result: dict):
+    """Print a terminal comparison of conditions across runs."""
+    print(f"\n=== CONDITION COMPARISON ({result['n_runs']} runs) ===")
+    print(f"  Runs: {', '.join(result['run_ids'])}")
+    print()
+
+    # Summary table
+    summaries = result.get("condition_summaries", [])
+    if summaries:
+        print(f"  {'Condition':<28s} {'N':>4s} {'Mean':>7s} {'Std':>7s}")
+        print(f"  {'-'*28} {'-'*4} {'-'*7} {'-'*7}")
+        for s in summaries:
+            print(f"  {s['condition']:<28s} {s['n_iterations']:>4} {s['mean_composite']:>7.2f} {s['std_composite']:>7.2f}")
+
+    # Pairwise effects
+    effects = result.get("pairwise_effects", [])
+    if effects:
+        print(f"\n  {'Comparison':<40s} {'g':>7s} {'Delta':>7s} {'Interpretation':<15s}")
+        print(f"  {'-'*40} {'-'*7} {'-'*7} {'-'*15}")
+        for e in effects:
+            label = f"{e['condition_a']} vs {e['condition_b']}"
+            print(f"  {label:<40s} {e['hedges_g']:>+7.3f} {e['delta']:>+7.2f} {e['interpretation']:<15s}")
 
 
 def _print_comparison(comparison: dict, runs):

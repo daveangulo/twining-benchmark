@@ -334,6 +334,113 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
         add("_No reliability data available._")
         add()
 
+    # --- Session Health ---
+    add("## Session Health")
+    add()
+    health_data = results.get("session_health", {})
+    health_per_condition = health_data.get("per_condition", [])
+    if health_per_condition:
+        headers = ["Condition", "Total", "Completed", "Timed Out", "Errored", "Zero Tools",
+                   "Twining Calls", "Twining/Sess", "Engagement", "Avg Duration"]
+        rows = []
+        for h in health_per_condition:
+            avg_dur_s = h.get("avg_duration_ms", 0) / 1000
+            rows.append([
+                h.get("condition", ""),
+                str(h.get("total_sessions", 0)),
+                str(h.get("completed", 0)),
+                str(h.get("timed_out", 0)),
+                str(h.get("errored", 0)),
+                str(h.get("zero_tool_sessions", 0)),
+                str(h.get("total_twining_calls", 0)),
+                f"{h.get('avg_twining_calls_per_session', 0):.1f}",
+                f"{h.get('twining_engagement_rate', 0):.0%}",
+                f"{avg_dur_s:.0f}s",
+            ])
+        add_table(headers, rows)
+
+        health_warnings = health_data.get("warnings", [])
+        if health_warnings:
+            add("**Warnings:**")
+            add()
+            for w in health_warnings:
+                add(f"- {w}")
+            add()
+    else:
+        add("_No session health data available._")
+        add()
+
+    # --- Behavioral Profiles ---
+    add("## Behavioral Profiles")
+    add()
+    profile_data = results.get("behavioral_profile", {})
+    profile_per_condition = profile_data.get("per_condition", [])
+    if profile_per_condition:
+        headers = ["Condition", "Sessions", "Avg Tools/Sess", "Avg Lines/Sess",
+                   "Coord Reads", "Coord Writes", "Top First Tool"]
+        rows = []
+        for p in profile_per_condition:
+            first_tools = p.get("first_tool_distribution", [])
+            top_first = first_tools[0]["tool"] if first_tools else "N/A"
+            rows.append([
+                p.get("condition", ""),
+                str(p.get("n_sessions", 0)),
+                f"{p.get('avg_tools_per_session', 0):.1f}",
+                f"{p.get('avg_lines_added_per_session', 0):.1f}",
+                str(p.get("coordination_file_reads", 0)),
+                str(p.get("coordination_file_writes", 0)),
+                top_first,
+            ])
+        add_table(headers, rows)
+    else:
+        add("_No behavioral profile data available._")
+        add()
+
+    # --- Work Leverage ---
+    add("## Work Leverage")
+    add()
+    leverage_data = results.get("work_leverage", {})
+    leverage_per_condition = leverage_data.get("per_condition", [])
+    if leverage_per_condition:
+        headers = ["Condition", "Pairs", "Avg Rework Ratio", "Avg Line Survival", "Avg Continuation"]
+        rows = []
+        for lv in leverage_per_condition:
+            rows.append([
+                lv.get("condition", ""),
+                str(lv.get("n_pairs", 0)),
+                f"{lv.get('avg_rework_ratio', 0):.3f}",
+                f"{lv.get('avg_line_survival', 0):.3f}",
+                f"{lv.get('avg_continuation_index', 0):.3f}",
+            ])
+        add_table(headers, rows)
+    else:
+        add("_No work leverage data available._")
+        add()
+
+    # --- Cost Efficiency ---
+    add("## Cost Efficiency")
+    add()
+    efficiency_data = results.get("cost_efficiency", {})
+    efficiency_per_condition = efficiency_data.get("per_condition", [])
+    if efficiency_per_condition:
+        headers = ["Condition", "Total Cost", "$/Iteration", "$/Point", "Avg Time/Iter", "Lines/$", "Calls/$"]
+        rows = []
+        for ce in efficiency_per_condition:
+            avg_time_s = ce.get("avg_time_per_iteration_ms", 0) / 1000
+            rows.append([
+                ce.get("condition", ""),
+                f"${ce.get('total_cost_usd', 0):.2f}",
+                f"${ce.get('cost_per_iteration_usd', 0):.3f}",
+                f"${ce.get('cost_per_quality_point_usd', 0):.4f}",
+                f"{avg_time_s:.0f}s",
+                f"{ce.get('lines_per_dollar', 0):.0f}",
+                f"{ce.get('tool_calls_per_dollar', 0):.0f}",
+            ])
+        add_table(headers, rows)
+    else:
+        add("_No cost efficiency data available._")
+        add()
+
     # --- Recommendations ---
     add("## Recommendations")
     add()
