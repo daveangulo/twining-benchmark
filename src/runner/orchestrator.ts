@@ -503,15 +503,14 @@ export class RunOrchestrator {
             message: `Task ${i + 1}/${tasks.length} ${retryResult.success ? 'completed' : 'failed'}`,
           });
 
-          // Validate plugin availability after first session:
-          // If condition expects Twining tools but none were used, the plugin
-          // failed to load. Fail fast rather than running N-1 more invalid sessions.
+          // Warn (but don't block) if plugin condition doesn't use Twining tools.
+          // The agent may legitimately skip Twining on task 0 (nothing to assemble yet).
+          // Log a warning so we can detect plugin load failures in analysis.
           if (i === 0 && retryResult.result && conditionCtx.agentConfig.plugins && conditionCtx.agentConfig.plugins.length > 0) {
             const hasTwiningCalls = retryResult.result.toolCalls.some(
               (tc) => tc.toolName.includes('twining'),
             );
             if (!hasTwiningCalls && retryResult.result.toolCalls.length > 0) {
-              const msg = `Plugin validation failed: condition "${condition.name}" has plugins configured but first session made ${retryResult.result.toolCalls.length} tool calls with zero Twining calls. The plugin likely failed to load.`;
               this.emitProgress({
                 type: 'session-start',
                 runId,
@@ -520,11 +519,8 @@ export class RunOrchestrator {
                 iteration,
                 sessionIndex: i,
                 totalSessions: tasks.length,
-                message: `⚠ ${msg}`,
+                message: `⚠ Warning: "${condition.name}" has plugins but first session (${retryResult.result.toolCalls.length} tool calls) used zero Twining tools. Plugin may not have loaded, or agent chose not to use it.`,
               });
-              errors.push(msg);
-              allCompleted = false;
-              break;
             }
           }
         }
