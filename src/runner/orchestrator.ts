@@ -445,7 +445,7 @@ export class RunOrchestrator {
           // Execute with retry logic
           const retryOptions: RetryOptions = {
             maxRetries: this.config.retryCount,
-            baseDelayMs: 5000,
+            baseDelayMs: 30_000, // 30s base — rate limits typically clear in 30-60s
             exponentialBackoff: true,
           };
 

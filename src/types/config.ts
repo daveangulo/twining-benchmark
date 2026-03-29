@@ -57,7 +57,7 @@ export const DEFAULT_CONFIG: BenchmarkConfig = {
   budgetDollars: 100,
   outputDirectory: './benchmark-results',
   maxTurns: 50,
-  retryCount: 0,
+  retryCount: 2,
   dashboardPort: 3838,
   evaluatorModel: 'claude-sonnet-4-6',
   concurrency: 1,

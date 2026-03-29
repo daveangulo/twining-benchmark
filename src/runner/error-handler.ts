@@ -104,6 +104,19 @@ export function classifyFailure(transcript: AgentTranscript): ClassifiedFailure 
     };
   }
 
+  // Session "completed" but made zero tool calls — likely API rate limit.
+  // The CLI gets a 429, exits cleanly, but produces nothing useful.
+  if (
+    transcript.exitReason === 'completed' &&
+    transcript.toolCalls.length === 0
+  ) {
+    return {
+      failureClass: 'api-error',
+      retryable: true,
+      description: `Session completed with 0 tool calls in ${(transcript.timing.durationMs / 1000).toFixed(0)}s — likely rate-limited`,
+    };
+  }
+
   // Session completed but no file changes — considered a failure
   if (transcript.fileChanges.length === 0 && transcript.toolCalls.length > 0) {
     return {
@@ -128,11 +141,12 @@ export function classifyFailure(transcript: AgentTranscript): ClassifiedFailure 
 export function isSessionFailed(transcript: AgentTranscript): boolean {
   if (transcript.exitReason === 'timeout') return true;
   if (transcript.exitReason === 'error') return true;
-  // Completed but no changes and no tool calls = probably failed
+  // Completed but no tool calls AND no file changes = likely rate-limited or crashed.
+  // The CLI gets a 429, exits cleanly with "completed", but produces nothing.
   if (
     transcript.exitReason === 'completed' &&
-    transcript.fileChanges.length === 0 &&
-    transcript.toolCalls.length === 0
+    transcript.toolCalls.length === 0 &&
+    transcript.fileChanges.length === 0
   ) {
     return true;
   }
