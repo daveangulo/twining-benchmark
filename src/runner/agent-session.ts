@@ -236,11 +236,15 @@ export class AgentSessionManager {
       effectivePrompt = `${historyPrefix}\n\n=== Your Task ===\n${task.prompt}`;
     }
 
-    // Build CLI arguments
+    // Build CLI arguments.
+    // Use --setting-sources "" to start clean (no user plugins loaded automatically).
+    // Then explicitly add plugins via --plugin-dir for conditions that need them.
+    // This prevents contamination (e.g., baseline getting Twining tools from user install).
     const cliArgs = [
       '-p', effectivePrompt,
       '--output-format', 'stream-json',
       '--verbose',
+      '--setting-sources', '',
       '--permission-mode', 'bypassPermissions',
       '--max-turns', String(task.maxTurns || 50),
     ];
@@ -254,7 +258,7 @@ export class AgentSessionManager {
       cliArgs.push('--append-system-prompt', this.agentConfig.systemPrompt);
     }
 
-    // Add plugin directories for Twining conditions
+    // Add plugin directories ONLY for conditions that configure them
     if (this.agentConfig.plugins) {
       for (const plugin of this.agentConfig.plugins) {
         cliArgs.push('--plugin-dir', plugin.path);
