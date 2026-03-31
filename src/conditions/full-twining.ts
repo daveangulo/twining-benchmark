@@ -73,8 +73,13 @@ export class FullTwiningCondition extends BaseCondition {
 
   protected buildAgentConfig(): AgentConfiguration {
     return {
-      systemPrompt: '', // Plugin provides all instructions via hooks, skills, and BEHAVIORS.md
-      mcpServers: {}, // Plugin handles MCP server
+      systemPrompt: FullTwiningCondition.TWINING_SYSTEM_PROMPT,
+      mcpServers: {
+        twining: {
+          command: 'npx',
+          args: ['-y', 'twining-mcp', '--project', this.projectDir || '.'],
+        },
+      },
       plugins: [
         { type: 'local', path: resolveTwiningPluginPath() },
       ],
@@ -144,6 +149,17 @@ export class FullTwiningCondition extends BaseCondition {
       '.twining/graph/relations.json',
     ];
   }
+
+  /**
+   * System prompt injected via --append-system-prompt.
+   * Guarantees agents know about Twining tools even if hooks and
+   * CLAUDE.md injection both fail.
+   */
+  private static readonly TWINING_SYSTEM_PROMPT = `You have Twining MCP tools for persistent project coordination. Use them:
+- BEFORE work: call twining_assemble with your task description and scope
+- AFTER decisions: call twining_decide for architectural/implementation choices
+- BEFORE completing: call twining_verify on your scope, then twining_post a status summary
+These tools persist across sessions. The next agent benefits from what you record.`;
 
   private generateClaudeMdWithTwining(): string {
     // Plugin 1.6.0+ auto-injects lifecycle gates via ensure-claude-md-gates.sh

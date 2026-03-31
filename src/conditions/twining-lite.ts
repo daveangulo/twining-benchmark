@@ -46,8 +46,13 @@ export class TwiningLiteCondition extends BaseCondition {
 
   protected buildAgentConfig(): AgentConfiguration {
     return {
-      systemPrompt: '', // Plugin provides instructions; allowedTools restricts to 8 core tools
-      mcpServers: {}, // Plugin handles MCP server
+      systemPrompt: TwiningLiteCondition.TWINING_SYSTEM_PROMPT,
+      mcpServers: {
+        twining: {
+          command: 'npx',
+          args: ['-y', 'twining-mcp', '--project', this.projectDir || '.'],
+        },
+      },
       plugins: [
         { type: 'local', path: resolveTwiningPluginPath() },
       ],
@@ -92,6 +97,12 @@ export class TwiningLiteCondition extends BaseCondition {
       '.twining/decisions/index.json',
     ];
   }
+
+  private static readonly TWINING_SYSTEM_PROMPT = `You have Twining MCP tools for persistent project coordination. Use them:
+- BEFORE work: call twining_assemble with your task description and scope
+- AFTER decisions: call twining_decide for architectural/implementation choices
+- BEFORE completing: call twining_post a status summary
+These tools persist across sessions. The next agent benefits from what you record.`;
 
   private generateClaudeMdWithTwiningLite(): string {
     // Plugin 1.6.0+ auto-injects Twining lifecycle gates into CLAUDE.md

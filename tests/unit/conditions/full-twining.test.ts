@@ -44,14 +44,16 @@ describe('FullTwiningCondition', () => {
     expect(content).not.toContain('twining_assemble');
   });
 
-  it('agent config uses Twining plugin (not raw MCP server)', async () => {
+  it('agent config uses Twining plugin plus explicit MCP server', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    // Plugin handles MCP server — mcpServers should be empty
-    expect(Object.keys(config.mcpServers)).toHaveLength(0);
+    // Explicit MCP server for belt-and-suspenders reliability
+    expect(config.mcpServers).toHaveProperty('twining');
+    expect(config.mcpServers.twining.command).toBe('npx');
+    expect(config.mcpServers.twining.args).toContain('twining-mcp');
 
-    // Plugin should be configured
+    // Plugin should also be configured
     expect(config.plugins).toBeDefined();
     expect(config.plugins).toHaveLength(1);
     expect(config.plugins![0]!.type).toBe('local');
@@ -95,11 +97,13 @@ describe('FullTwiningCondition', () => {
     expect(config.allowedTools).toContain('mcp__plugin_twining_twining__twining_verify');
   });
 
-  it('system prompt is empty (plugin provides all instructions)', async () => {
+  it('system prompt includes Twining instructions as fallback', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(config.systemPrompt).toBe('');
+    expect(config.systemPrompt).toContain('twining_assemble');
+    expect(config.systemPrompt).toContain('twining_decide');
+    expect(config.systemPrompt).toContain('twining_verify');
   });
 
   it('Twining plugin is configured with a local path', async () => {
@@ -145,10 +149,11 @@ describe('FullTwiningCondition', () => {
     await customCondition.teardown();
   });
 
-  it('mcpServers is empty (plugin handles MCP)', async () => {
+  it('mcpServers includes twining with --project flag', async () => {
     await condition.setup(workDir);
     const config = condition.getAgentConfig();
 
-    expect(Object.keys(config.mcpServers)).toHaveLength(0);
+    expect(config.mcpServers).toHaveProperty('twining');
+    expect(config.mcpServers.twining.args).toContain('--project');
   });
 });

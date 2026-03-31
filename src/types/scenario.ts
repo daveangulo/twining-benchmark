@@ -87,6 +87,8 @@ export interface RawResults {
   allSessionsCompleted: boolean;
   /** Any errors encountered during execution */
   errors: string[];
+  /** Test results from running the final working directory (populated before scoring) */
+  testResults?: { pass: number; fail: number; compiles: boolean };
 }
 
 /**

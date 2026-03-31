@@ -249,6 +249,11 @@ export class AgentSessionManager {
       '--max-turns', String(task.maxTurns || 50),
     ];
 
+    // Pass allowed tools restriction for conditions that define one (e.g., twining-lite)
+    if (this.agentConfig.allowedTools && this.agentConfig.allowedTools.length > 0) {
+      cliArgs.push('--allowedTools', ...this.agentConfig.allowedTools);
+    }
+
     if (this.model) {
       cliArgs.push('--model', this.model);
     }
@@ -263,6 +268,14 @@ export class AgentSessionManager {
       for (const plugin of this.agentConfig.plugins) {
         cliArgs.push('--plugin-dir', plugin.path);
       }
+    }
+
+    // Add MCP servers explicitly via --mcp-config.
+    // Plugin .mcp.json may not be read when --setting-sources is empty,
+    // so we pass MCP config directly to guarantee server startup.
+    if (this.agentConfig.mcpServers && Object.keys(this.agentConfig.mcpServers).length > 0) {
+      const mcpConfig = JSON.stringify({ mcpServers: this.agentConfig.mcpServers });
+      cliArgs.push('--mcp-config', mcpConfig);
     }
 
     // Strip env vars that prevent nested Claude Code sessions

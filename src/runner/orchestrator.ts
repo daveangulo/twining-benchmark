@@ -525,6 +525,15 @@ export class RunOrchestrator {
           }
         }
 
+        // Run tests BEFORE scoring so scorers can use real test/compilation data
+        let testResults: { pass: number; fail: number; compiles: boolean } | undefined;
+        try {
+          testResults = await runTests(workingDir.path);
+        } catch (testErr: unknown) {
+          const msg = testErr instanceof Error ? testErr.message : String(testErr);
+          errors.push(`Test execution failed: ${msg}`);
+        }
+
         // Score the iteration
         try {
           const rawResults: RawResults = {
@@ -532,6 +541,7 @@ export class RunOrchestrator {
             finalWorkingDir: workingDir.path,
             allSessionsCompleted: allCompleted,
             errors,
+            testResults,
           };
           const groundTruth = this.target.getGroundTruth();
           scoredResults = await scenario.score(rawResults, groundTruth, this.getEvaluatorClient());
@@ -539,15 +549,11 @@ export class RunOrchestrator {
           scoredResults.condition = condition.name;
           scoredResults.iteration = iteration;
 
-          // Run tests on the final working directory state
-          try {
-            const testResults = await runTests(workingDir.path);
+          // Populate metrics from test results
+          if (testResults) {
             scoredResults.metrics.testsPass = testResults.pass;
             scoredResults.metrics.testsFail = testResults.fail;
             scoredResults.metrics.compiles = testResults.compiles;
-          } catch (testErr: unknown) {
-            const msg = testErr instanceof Error ? testErr.message : String(testErr);
-            errors.push(`Test execution failed: ${msg}`);
           }
         } catch (scoreErr: unknown) {
           const msg = scoreErr instanceof Error ? scoreErr.message : String(scoreErr);

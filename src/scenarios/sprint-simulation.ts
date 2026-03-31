@@ -725,11 +725,10 @@ export class SprintSimulationScenario extends BaseScenario {
    * Score assumption handling: Does session 9 correctly handle the requirement
    * change from session 8?
    *
-   * Checks:
-   * 1. Did session 8 flag the email-only assumption? (+30)
-   * 2. Did session 9 read coordination context before modifying preferences? (+20)
-   * 3. Did session 9 update the preferences model to support multi-channel? (+30)
-   * 4. Did session 9 document the decision change? (+20)
+   * Outcome-only checks (no process/tool-usage credit):
+   * 1. Did session 8's code surface the assumption change? (+30)
+   * 2. Did session 9 update the preferences model for multi-channel? (+35)
+   * 3. Did session 9 implement multi-channel routing end-to-end? (+35)
    */
   private scoreAssumptionHandling(rawResults: RawResults): DimensionScore {
     const session8 = rawResults.transcripts[7]; // 0-indexed
@@ -747,43 +746,24 @@ export class SprintSimulationScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // 1. Did session 8 flag the email-only assumption? (+30)
+    // 1. Did session 8's code surface the assumption change? (+30)
+    // Check diffs and tool parameters for assumption-related content
     const s8Text = [
       ...session8.toolCalls.map((tc) => JSON.stringify(tc.parameters)),
       ...session8.fileChanges.map((c) => c.diff ?? ''),
-    ].join('\n').toLowerCase();
+    ].join('\n');
 
     const flaggedAssumption =
-      /email.?only.*assumption|assumption.*email|preference.*need.*update|no longer.*email.?only/i.test(s8Text) ||
-      session8.toolCalls.some((tc) =>
-        /twining.*post|twining.*decide/.test(tc.toolName) &&
-        /assumption|email.?only|preference.*change|channel/i.test(JSON.stringify(tc.parameters)),
-      );
+      /email.?only.*assumption|assumption.*email|preference.*need.*update|no longer.*email.?only/i.test(s8Text);
 
     if (flaggedAssumption) {
       score += 30;
-      details.push('Session 8 flagged the email-only assumption change.');
+      details.push('Session 8 surfaced the email-only assumption change in code/comments.');
     } else {
-      details.push('Session 8 did NOT flag the assumption change.');
+      details.push('Session 8 did NOT surface the assumption change.');
     }
 
-    // 2. Did session 9 read coordination context before modifying? (+20)
-    const s9EarlyTools = session9.toolCalls.slice(0, Math.floor(session9.toolCalls.length * 0.3));
-    const s9ReadsContext = s9EarlyTools.some((tc) =>
-      /twining_assemble|twining_read|twining_recent|twining_query/.test(tc.toolName) ||
-      (tc.toolName === 'Read' && /COORDINATION|CONTEXT|DESIGN|DECISIONS|\.twining/i.test(
-        String(tc.parameters?.file_path ?? ''),
-      )),
-    );
-
-    if (s9ReadsContext) {
-      score += 20;
-      details.push('Session 9 checked coordination context before modifying preferences.');
-    } else {
-      details.push('Session 9 did not check coordination context first.');
-    }
-
-    // 3. Did session 9 update preferences for multi-channel? (+30)
+    // 2. Did session 9 update the preferences model for multi-channel? (+35)
     const s9Diffs = session9.fileChanges.map((c) => c.diff ?? '').join('\n');
     const s9Files = session9.fileChanges.map((c) => c.path).join(' ');
 
@@ -792,25 +772,37 @@ export class SprintSimulationScenario extends BaseScenario {
       /sms|SMS|channel|channels|multi/i.test(s9Diffs);
 
     if (updatedPreferences) {
-      score += 30;
+      score += 35;
       details.push('Session 9 updated preferences model for multi-channel support.');
     } else {
       details.push('Session 9 did NOT update preferences for multi-channel.');
     }
 
-    // 4. Did session 9 document the decision change? (+20)
-    const s9DocumentedChange = session9.toolCalls.some((tc) =>
-      /twining.*decide|twining.*post/.test(tc.toolName) &&
-      /sms|channel|preference|assumption|override|supersede/i.test(JSON.stringify(tc.parameters)),
-    ) || session9.fileChanges.some((c) =>
-      /COORDINATION|DESIGN|DECISIONS|CONTEXT/i.test(c.path),
-    );
+    // 3. Did session 9 implement multi-channel routing end-to-end? (+35)
+    // Check for actual channel routing logic beyond just the preferences model:
+    // adapter/handler code for SMS/push/Slack, channel selection logic, etc.
+    const s9AllDiffs = session9.fileChanges
+      .filter((c) => !/.twining|COORDINATION|CONTEXT/i.test(c.path))
+      .map((c) => c.diff ?? '').join('\n');
 
-    if (s9DocumentedChange) {
+    // Look for implementation patterns: channel routing, adapter instantiation,
+    // notification dispatch across channels
+    const hasChannelRouting =
+      /switch\s*\(.*channel|channel\s*===?\s*['"]sms|NotificationChannel|channelType|sendSms|sendPush|smsAdapter|pushAdapter/i.test(s9AllDiffs);
+    const hasMultipleChannels =
+      (/sms/i.test(s9AllDiffs) && /push|slack|webhook/i.test(s9AllDiffs)) ||
+      /channels?\s*[.:=]\s*\[/i.test(s9AllDiffs);
+    const hasChannelInterface =
+      /interface.*Channel|type.*Channel.*=|abstract.*send/i.test(s9AllDiffs);
+
+    if (hasChannelRouting && hasMultipleChannels) {
+      score += 35;
+      details.push('Session 9 implemented multi-channel routing with multiple channel types.');
+    } else if (hasChannelRouting || hasMultipleChannels || hasChannelInterface) {
       score += 20;
-      details.push('Session 9 documented the decision change.');
+      details.push('Session 9 partially implemented multi-channel routing.');
     } else {
-      details.push('Session 9 did NOT document the decision change.');
+      details.push('Session 9 did NOT implement multi-channel routing logic.');
     }
 
     return {
@@ -825,8 +817,10 @@ export class SprintSimulationScenario extends BaseScenario {
    * Score cumulative rework: How much code from earlier sessions gets deleted
    * or rewritten in later sessions?
    *
-   * Combines file-level rework and investigation overlap, measured at
-   * checkpoints to produce a decay curve.
+   * Uses file-level rework ratio only. No cross-session overlap penalty —
+   * coordination enables informed cross-file modification, which should not
+   * be penalized. Trivial lines (imports, braces, comments) are excluded
+   * to focus on substantive rework.
    */
   private scoreCumulativeRework(rawResults: RawResults): DimensionScore {
     const transcripts = rawResults.transcripts;
@@ -839,8 +833,17 @@ export class SprintSimulationScenario extends BaseScenario {
       };
     }
 
+    // Filter trivial lines that are commonly reorganized, not "reworked"
+    const isTrivialLine = (path: string, line: string): boolean =>
+      /^\s*$/.test(line) ||           // blank
+      /^\s*[{}]\s*$/.test(line) ||    // lone braces
+      /^\s*import\s/.test(line) ||    // import statements
+      /^\s*\/\//.test(line) ||        // comments
+      /^\s*\*/.test(line) ||          // JSDoc lines
+      /\.twining\/|COORDINATION|CONTEXT\.md|DECISIONS|DESIGN/i.test(path); // coordination artifacts
+
     // Track all files each session added lines to
-    const cumulativeFiles = new Map<string, number>(); // path → lines added
+    const cumulativeFiles = new Map<string, number>(); // path → substantive lines added
     let totalReworkedLines = 0;
     let totalAddedLines = 0;
 
@@ -849,15 +852,26 @@ export class SprintSimulationScenario extends BaseScenario {
       if (!t) continue;
 
       for (const fc of t.fileChanges) {
+        // Count substantive lines from diff content when available
+        const diff = fc.diff ?? '';
+        const addedLines = diff.split('\n')
+          .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+          .map((line) => line.slice(1))
+          .filter((line) => !isTrivialLine(fc.path, line));
+        const removedLines = diff.split('\n')
+          .filter((line) => line.startsWith('-') && !line.startsWith('---'))
+          .map((line) => line.slice(1))
+          .filter((line) => !isTrivialLine(fc.path, line));
+
         // Lines removed from files created/modified by earlier sessions = rework
         if (i > 0 && cumulativeFiles.has(fc.path)) {
-          totalReworkedLines += fc.linesRemoved;
+          totalReworkedLines += removedLines.length;
         }
 
         // Track cumulative additions
         const prev = cumulativeFiles.get(fc.path) ?? 0;
-        cumulativeFiles.set(fc.path, prev + fc.linesAdded);
-        totalAddedLines += fc.linesAdded;
+        cumulativeFiles.set(fc.path, prev + addedLines.length);
+        totalAddedLines += addedLines.length;
       }
     }
 
@@ -866,46 +880,36 @@ export class SprintSimulationScenario extends BaseScenario {
         value: 0,
         confidence: 'low',
         method: 'automated',
-        justification: 'No code was added across all sessions.',
+        justification: 'No substantive code was added across all sessions.',
       };
     }
 
     const reworkRatio = Math.min(1, totalReworkedLines / totalAddedLines);
-    // Steeper curve: 5% rework = 85, 10% = 70, 20% = 40, 30% = 10
-    const reworkScore = Math.max(0, Math.round(100 * Math.pow(1 - reworkRatio, 3)));
-
-    // Track file overlap between non-consecutive sessions
-    const fileFirstSeen = new Map<string, number>();
-    let crossSessionOverlap = 0;
-    for (let i = 0; i < transcripts.length; i++) {
-      const t = transcripts[i];
-      if (!t) continue;
-      for (const fc of t.fileChanges) {
-        const firstSeen = fileFirstSeen.get(fc.path);
-        if (firstSeen !== undefined && firstSeen < i - 1) {
-          // File modified by a non-adjacent session — coordination needed
-          crossSessionOverlap++;
-        }
-        if (firstSeen === undefined) {
-          fileFirstSeen.set(fc.path, i);
-        }
-      }
-    }
-    // Penalize cross-session overlap (each overlap reduces score by 2 points)
-    const overlapPenalty = Math.min(20, crossSessionOverlap * 2);
-    const score = Math.max(0, reworkScore - overlapPenalty);
+    // Linear with 6x amplifier: spreads well in 0-5% range
+    // 0% → 100, 1% → 94, 2% → 88, 3% → 82, 5% → 70, 10% → 40
+    const score = Math.max(0, Math.round(100 - reworkRatio * 600));
 
     return {
       value: score,
       confidence: 'medium',
       method: 'automated',
-      justification: `${totalReworkedLines} lines reworked out of ${totalAddedLines} total lines added across ${transcripts.length} sessions. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%. Cross-session file overlap: ${crossSessionOverlap} (penalty: ${overlapPenalty}).`,
+      justification: `${totalReworkedLines} substantive lines reworked out of ${totalAddedLines} substantive lines added across ${transcripts.length} sessions. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%.`,
     };
   }
 
   /**
    * Score context recovery: Do later sessions (8-12) efficiently pick up
-   * context from earlier sessions without re-investigating?
+   * context from earlier sessions without wasteful re-investigation?
+   *
+   * Combines process signal (did the session consult coordination context?)
+   * with outcome signal (how efficiently did it get to productive work?).
+   *
+   * Per-session score (0-100):
+   * - Coordination consultation (0-40): used coord tools/files before writing
+   * - Efficiency ratio (0-35): fraction of tool calls that are productive (Write/Edit/Bash)
+   *   vs. exploratory (Read/Glob/Grep). Higher = session already knew where to work.
+   * - Time-to-first-write (0-25): how early in the session was the first Write/Edit?
+   *   Earlier = recovered context faster.
    */
   private scoreContextRecovery(rawResults: RawResults): DimensionScore {
     // Focus on sessions 8-12 (the "second half" of the sprint)
@@ -925,14 +929,14 @@ export class SprintSimulationScenario extends BaseScenario {
 
     for (let i = 0; i < laterSessions.length; i++) {
       const t = laterSessions[i];
-      if (!t) continue;
+      if (!t || t.toolCalls.length === 0) continue;
       checkedSessions++;
 
       const sessionNum = i + 8;
-      let sessionScore = 0;
 
-      // Did this session use coordination tools early?
+      // --- Process signal (0-40): did session consult coordination context early? ---
       const earlyTools = t.toolCalls.slice(0, Math.max(1, Math.floor(t.toolCalls.length * 0.3)));
+
       const usedCoordTools = earlyTools.some((tc) =>
         /twining_assemble|twining_read|twining_recent|twining_query|twining_why/.test(tc.toolName),
       );
@@ -941,12 +945,13 @@ export class SprintSimulationScenario extends BaseScenario {
         /COORDINATION|CONTEXT|DESIGN|DECISIONS|\.twining/i.test(String(tc.parameters?.file_path ?? '')),
       );
 
+      let processScore: number;
       if (usedCoordTools) {
-        sessionScore = 100;
+        processScore = 40;
       } else if (readCoordFiles) {
-        sessionScore = 80;
+        processScore = 30;
       } else {
-        // Check if session read any files from earlier sessions before writing
+        // Check pre-write reads as fallback
         const firstWriteIdx = t.toolCalls.findIndex((tc) =>
           /^(Write|Edit)$/i.test(tc.toolName),
         );
@@ -954,13 +959,44 @@ export class SprintSimulationScenario extends BaseScenario {
           ? t.toolCalls.slice(0, firstWriteIdx)
           : t.toolCalls
         ).filter((tc) => tc.toolName === 'Read').length;
-
-        sessionScore = Math.min(70, preWriteReads * 10);
+        processScore = Math.min(20, preWriteReads * 5);
       }
 
+      // --- Outcome signal: efficiency ratio (0-35) ---
+      // Productive calls: Write, Edit, Bash (actual work)
+      // Exploratory calls: Read, Glob, Grep, ToolSearch (investigation)
+      const productiveCalls = t.toolCalls.filter((tc) =>
+        /^(Write|Edit|Bash)$/i.test(tc.toolName),
+      ).length;
+      const exploratoryCalls = t.toolCalls.filter((tc) =>
+        /^(Read|Glob|Grep|ToolSearch)$/i.test(tc.toolName),
+      ).length;
+      const totalRelevant = productiveCalls + exploratoryCalls;
+
+      // A well-informed session spends more time producing than exploring
+      // Target: ~50% productive = good recovery (baseline with no context tends lower)
+      const productiveRatio = totalRelevant > 0 ? productiveCalls / totalRelevant : 0;
+      // Scale: 0% productive → 0, 30% → 18, 50% → 30, 70%+ → 35
+      const efficiencyScore = Math.min(35, Math.round(productiveRatio * 50));
+
+      // --- Outcome signal: time-to-first-write (0-25) ---
+      const firstWriteIdx = t.toolCalls.findIndex((tc) =>
+        /^(Write|Edit)$/i.test(tc.toolName),
+      );
+      let firstWriteScore: number;
+      if (firstWriteIdx < 0) {
+        firstWriteScore = 0; // Never wrote anything
+      } else {
+        // Fraction of session spent before first write (lower = better)
+        const fractionBeforeWrite = firstWriteIdx / t.toolCalls.length;
+        // 0% before write → 25, 20% → 20, 50% → 12.5, 80% → 5
+        firstWriteScore = Math.round(25 * (1 - fractionBeforeWrite));
+      }
+
+      const sessionScore = processScore + efficiencyScore + firstWriteScore;
       totalScore += sessionScore;
-      if (sessionScore < 70) {
-        details.push(`Session ${sessionNum}: low context recovery (${sessionScore}).`);
+      if (sessionScore < 60) {
+        details.push(`Session ${sessionNum}: ${sessionScore} (process:${processScore} efficiency:${efficiencyScore} ttfw:${firstWriteScore}).`);
       }
     }
 
@@ -971,13 +1007,23 @@ export class SprintSimulationScenario extends BaseScenario {
       confidence: checkedSessions >= 3 ? 'medium' : 'low',
       method: 'automated',
       justification: details.length > 0
-        ? `Average context recovery across sessions 8-12: ${score}. ${details.join(' ')}`
+        ? `Avg context recovery: ${score}. ${details.join(' ')}`
         : `All ${checkedSessions} later sessions recovered context effectively (avg: ${score}).`,
     };
   }
 
   /**
    * Automated final quality scoring when no LLM evaluator is available.
+   *
+   * Uses real test results (from rawResults.testResults) when available,
+   * plus structural checks for component completeness and architecture consistency.
+   *
+   * Breakdown (100 pts):
+   * - Compilation: 0-20 (binary)
+   * - Test pass rate: 0-30 (proportional)
+   * - Component completeness: 0-25 (per-component with diff verification)
+   * - Architecture consistency: 0-15 (adapters follow same interface pattern)
+   * - Multi-channel integration: 0-10 (channels wired into preferences)
    */
   private scoreFinalQualityAutomated(
     rawResults: RawResults,
@@ -996,58 +1042,128 @@ export class SprintSimulationScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // Check if tests pass (look for test run in last session)
-    const ranTests = lastSession.toolCalls.some((tc) =>
-      tc.toolName === 'Bash' &&
-      /npm test|vitest|jest/i.test(String(tc.parameters?.command ?? '')),
-    );
-    if (ranTests) {
-      score += 30;
-      details.push('Final session ran tests.');
-    }
-
-    // Check final state has all expected components
-    const allFiles = new Set<string>();
-    for (const t of rawResults.transcripts) {
-      for (const fc of t.fileChanges) {
-        allFiles.add(fc.path);
+    // 1. Compilation (0-20)
+    if (rawResults.testResults) {
+      if (rawResults.testResults.compiles) {
+        score += 20;
+        details.push('Compiles.');
+      } else {
+        details.push('Does NOT compile.');
+      }
+    } else {
+      // Fallback: check if final session ran tsc without error signals
+      const ranTsc = lastSession.toolCalls.some((tc) =>
+        tc.toolName === 'Bash' &&
+        /tsc|npm run build|npm test/i.test(String(tc.parameters?.command ?? '')),
+      );
+      if (ranTsc) {
+        score += 10; // Partial credit — we can't confirm it passed
+        details.push('Final session ran build/tests (compilation unverified).');
       }
     }
 
-    // Check for key ground truth components
+    // 2. Test pass rate (0-30)
+    if (rawResults.testResults) {
+      const { pass, fail } = rawResults.testResults;
+      const total = pass + fail;
+      if (total > 0) {
+        const passRate = pass / total;
+        const testScore = Math.round(passRate * 30);
+        score += testScore;
+        details.push(`Tests: ${pass}/${total} pass (${Math.round(passRate * 100)}%).`);
+      } else {
+        details.push('No tests found.');
+      }
+    } else {
+      // Fallback: did the final session at least run tests?
+      const ranTests = lastSession.toolCalls.some((tc) =>
+        tc.toolName === 'Bash' &&
+        /npm test|vitest|jest/i.test(String(tc.parameters?.command ?? '')),
+      );
+      if (ranTests) {
+        score += 10; // Partial credit
+        details.push('Final session ran tests (results unavailable).');
+      }
+    }
+
+    // 3. Component completeness (0-25) — check files AND meaningful diffs
+    const allFiles = new Set<string>();
+    const allDiffs: string[] = [];
+    for (const t of rawResults.transcripts) {
+      for (const fc of t.fileChanges) {
+        allFiles.add(fc.path);
+        if (fc.diff) allDiffs.push(fc.diff);
+      }
+    }
+    const combinedDiffs = allDiffs.join('\n');
+
     const expectedComponents = [
-      { id: 'notification-service', pattern: /notification.*service/i },
-      { id: 'email-adapter', pattern: /email.*adapter|adapter.*email/i },
-      { id: 'sms-adapter', pattern: /sms.*adapter|adapter.*sms/i },
-      { id: 'webhook-adapter', pattern: /webhook.*adapter|adapter.*webhook/i },
-      { id: 'preferences', pattern: /preference/i },
-      { id: 'history', pattern: /history|log.*notification|notification.*log/i },
-      { id: 'tests', pattern: /test/i },
+      { id: 'notification-service', filePattern: /notification.*service/i, diffPattern: /class\s+\w*Notification\w*Service|notification.*service/i },
+      { id: 'email-adapter', filePattern: /email.*adapter|adapter.*email/i, diffPattern: /class\s+\w*Email\w*Adapter|implements\s+\w*Adapter/i },
+      { id: 'sms-adapter', filePattern: /sms.*adapter|adapter.*sms/i, diffPattern: /class\s+\w*Sms\w*Adapter|class\s+\w*SMS\w*Adapter/i },
+      { id: 'webhook-adapter', filePattern: /webhook.*adapter|adapter.*webhook/i, diffPattern: /class\s+\w*Webhook\w*Adapter/i },
+      { id: 'preferences', filePattern: /preference/i, diffPattern: /class\s+\w*Preference|interface\s+\w*Preference|channel/i },
     ];
 
     let componentsFound = 0;
     for (const comp of expectedComponents) {
-      const found = [...allFiles].some((f) => comp.pattern.test(f));
-      if (found) componentsFound++;
+      const fileExists = [...allFiles].some((f) => comp.filePattern.test(f));
+      const hasDiffEvidence = comp.diffPattern.test(combinedDiffs);
+      if (fileExists && hasDiffEvidence) {
+        componentsFound++;
+      }
     }
-
-    const componentScore = Math.round((componentsFound / expectedComponents.length) * 50);
+    const componentScore = Math.round((componentsFound / expectedComponents.length) * 25);
     score += componentScore;
-    details.push(`${componentsFound}/${expectedComponents.length} expected components present.`);
+    details.push(`${componentsFound}/${expectedComponents.length} components verified in code.`);
 
-    // Check for multi-channel support in final state
-    const allDiffs = rawResults.transcripts.flatMap((t) =>
-      t.fileChanges.map((c) => c.diff ?? ''),
+    // 4. Architecture consistency (0-15) — do adapters follow the same interface?
+    const adapterDiffs = allDiffs.filter((d) =>
+      /adapter/i.test(d),
     ).join('\n');
 
-    if (/sms|SMS/.test(allDiffs) && /email|Email/.test(allDiffs) && /webhook|Webhook/.test(allDiffs)) {
-      score += 20;
-      details.push('Multi-channel support (email + SMS + webhook) present.');
+    // Look for a shared interface/pattern across adapters
+    const implementsMatch = adapterDiffs.match(/implements\s+(\w+)/gi) ?? [];
+    const interfaceNames = implementsMatch.map((m) => m.replace(/implements\s+/i, ''));
+    const uniqueInterfaces = new Set(interfaceNames);
+
+    if (interfaceNames.length >= 2 && uniqueInterfaces.size === 1) {
+      score += 15;
+      details.push(`Adapters share interface: ${[...uniqueInterfaces][0]}.`);
+    } else if (interfaceNames.length >= 2 && uniqueInterfaces.size <= 2) {
+      score += 8;
+      details.push(`Adapters use ${uniqueInterfaces.size} different interfaces.`);
+    } else if (interfaceNames.length >= 1) {
+      score += 4;
+      details.push('Only one adapter implements an interface.');
+    } else {
+      details.push('No adapter interface pattern detected.');
+    }
+
+    // 5. Multi-channel integration (0-10) — channels wired into preferences
+    const prefDiffs = rawResults.transcripts.flatMap((t) =>
+      t.fileChanges
+        .filter((c) => /preference/i.test(c.path))
+        .map((c) => c.diff ?? ''),
+    ).join('\n');
+
+    const hasMultiChannelPrefs =
+      /sms|SMS/.test(prefDiffs) && /email|Email/.test(prefDiffs);
+    const hasWebhookInPrefs = /webhook|Webhook/.test(prefDiffs);
+
+    if (hasMultiChannelPrefs && hasWebhookInPrefs) {
+      score += 10;
+      details.push('Multi-channel preferences (email+SMS+webhook).');
+    } else if (hasMultiChannelPrefs) {
+      score += 6;
+      details.push('Multi-channel preferences (email+SMS only).');
+    } else {
+      details.push('Preferences not updated for multi-channel.');
     }
 
     return {
       value: Math.min(100, score),
-      confidence: 'medium',
+      confidence: rawResults.testResults ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
     };
