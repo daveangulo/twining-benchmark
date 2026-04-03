@@ -61,18 +61,19 @@ The session 8→9 handoff is the key test: does the coordination mechanism propa
 ### Sprint-Simulation Dimensions
 | Dimension | Weight | What it measures |
 |-----------|--------|-----------------|
-| assumptionHandling | 25% | Did session 9 discover session 8's requirement change? |
-| decisionConsistency | 25% | Do later sessions follow session 1's architectural pattern? |
+| decisionConsistency | 20% | Do later sessions follow session 1's architectural pattern? (multi-signal detection) |
+| assumptionHandling | 20% | Did session 8 flag the email-only assumption? Did session 9 restructure preferences? (graduated) |
 | cumulativeRework | 20% | Lines reworked / lines added across all sessions |
-| contextRecovery | 15% | How effectively do later sessions recover prior context? |
-| finalQuality | 15% | Components present, tests pass, multi-channel support |
+| contextRecovery | 20% | How effectively do later sessions recover prior context? (coordination tools + efficiency) |
+| finalQuality | 20% | Components, tests, architecture consistency, test coverage depth, API surface consistency |
 
 ### What Drives the Scores
-From all valid runs to date:
-- **assumptionHandling** is the biggest differentiator (baseline ~55, coordination ~95)
-- **contextRecovery** shows graduated difference (baseline 70, shared-md 80, twining 100)
-- **decisionConsistency** and **cumulativeRework** are similar across conditions
-- **finalQuality** has ceiling effect (almost always 100)
+From clean run 6393b4ac (n=5 per condition, re-scored with fixed scorers):
+- **contextRecovery** is the dominant differentiator (baseline 36, coordination 68-69) — coordination tools nearly double context recovery
+- **assumptionHandling** now varies meaningfully (baseline 80-92, coordination 80-100) — graduated scoring requires explicit assumption flagging
+- **decisionConsistency** varies 50-100 with reduced false negatives from broadened pattern detection
+- **cumulativeRework** is similar across conditions (83-94) — all agents produce low rework
+- **finalQuality** has narrow but meaningful spread (89-100) — test coverage depth and API consistency add discrimination
 
 ## Analysis Workflow
 
@@ -129,41 +130,65 @@ benchmark-analysis compare-conditions \
   --conditions baseline,shared-markdown,full-twining,twining-lite
 ```
 
-## Known Issues and Fixes (as of March 29, 2026)
+## Known Issues and Fixes (as of April 2, 2026)
 
 ### Fixed
 - **Scorer bias** — Pattern detection, zero-variance dimensions, process-as-outcome all fixed (d7420c1)
 - **Plugin contamination** — `--setting-sources ''` isolates conditions (bddefdf)
 - **Rate limit handling** — 2 retries with 30s exponential backoff (22f7eb4)
 - **CLI execution** — `claude -p` instead of SDK `query()` for full plugin support (90f54f5)
+- **twining-lite tool restriction** — Belt-and-suspenders MCP enforcement (0ff8b25)
+- **assumptionHandling always 100** — Graduated scoring requires explicit assumption flagging (e10b9d1)
+- **finalQuality 4pt spread** — Added test coverage depth + API consistency sub-scores (e24edab)
+- **decisionConsistency false negatives** — Multi-signal pattern detection, dynamic session selection (b9271ec)
+- **Effect decomposition uninformative** — Renders lite-vs-full comparison, per-tool utilization (38d742d)
+- **Recommendation false positives** — Skip engagement checks for non-coordination conditions (856df63)
+- **Composite weight imbalance** — Equal 20% weights across all 5 dimensions (23f20e6)
 
 ### Open
-- **twining-lite gets all 32 tools** — CLI doesn't support `--allowedTools`; twining-lite is effectively full-twining in CLI mode
 - **Timeout enforcement for CLI** — `execa` timeout should work but not battle-tested at scale
 - **Zero-tool sessions** — Retry helps but persistent rate limits can still produce failures
 
+## Re-Scoring Existing Data
+
+When scorer code changes, existing results can be re-scored without re-running agent sessions:
+
+```bash
+npx tsx scripts/rescore.ts <run-id>
+```
+
+This reads raw transcripts from `sessions/`, reconstructs `RawResults`, and runs the current scenario scorer. Original scores are backed up to `scores/.pre-rescore-backup/`. Test results (pass/fail/compiles) are preserved from original score files since they're not stored in transcripts.
+
+After re-scoring, re-run the analysis:
+```bash
+cd analysis && benchmark-analysis analyze ../benchmark-results/<run-id> --format all
+```
+
 ## Run Validity Quick Reference
 
-Only runs with `--setting-sources ''` (commit bddefdf+) produce valid cross-condition comparisons. Earlier runs are valid only for baseline vs shared-markdown (no plugin contamination for non-plugin conditions).
+Only runs with `--setting-sources ''` (commit bddefdf+) produce valid cross-condition comparisons.
 
-**Valid baseline vs shared-markdown data (Opus):**
-- 16a2e4e1: 3 iterations each, composite baseline=73.8, shared-md=85.4
+**Valid 4-condition sprint-simulation data (Opus 4.6, n=5):**
+- **6393b4ac** + **9f93c5c4** (twining-lite rerun): 240 healthy sessions, all 4 conditions clean
+  - twining-lite: 84.5 (d=3.03, p<0.05)
+  - full-twining: 82.1 (d=1.79, significant)
+  - shared-markdown: 80.9 (d=0.97, large)
+  - baseline: 76.5
 
-**No valid full-twining sprint-simulation data yet.** All prior runs had either:
-- Plugin not loading (SDK mode)
-- Plugin contamination (CLI without --setting-sources '')
+Note: Original twining-lite data in 6393b4ac was corrupted by 75-minute API rate limit. Dead sessions archived to `sessions/.archived-rate-limited/`. Clean rerun 9f93c5c4 data was merged in and original twining-lite scores replaced.
 
 ## Research Findings (Established)
 
-1. **Coordination value compounds with session count**: ~5pt gap at 2-3 sessions → ~13pt gap at 12 sessions
-2. **assumptionHandling is the killer differentiator**: Requirement change propagation is where coordination earns its keep
-3. **shared-markdown is remarkably stable**: 84-87 composite across multiple runs, lowest variance
-4. **Simple beats complex in short scenarios**: shared-markdown >= twining at 2-3 sessions
-5. **Cost efficiency**: shared-markdown is cheapest per quality point (~$0.12/pt vs $0.19/pt baseline)
+1. **Coordination tools produce a large, statistically significant effect** (d=1.79-3.03 vs baseline) driven primarily by context recovery
+2. **Context recovery is the dominant differentiator**: Coordination conditions score 68-69 vs baseline's 36 — nearly doubling context recovery in multi-session work
+3. **Twining-lite and full-twining are functionally equivalent**: 84.5 vs 82.1 composite, near-identical cost (~$11.50/iter), engagement, and tool calls/session. The lite toolset captures the full coordination benefit
+4. **Shared-markdown provides meaningful but smaller lift**: +4.4 over baseline (d=0.97), primarily through context recovery (+24 pts). Coordination tools add another ~10 pts on top
+5. **The core value is in structured context assembly and decision recording**, not heavier lifecycle processes (graph building, verification gates, etc.)
+6. **Cost of coordination is ~20% more per iteration**: $11.50 vs $9.55, but quality gains make $/point comparable
 
 ## Pending Research Questions
 
-1. Does full-twining (with plugin actually working) outperform shared-markdown at 12 sessions?
-2. Does contextRecovery=100 for Twining translate to better outcomes than shared-markdown's 80?
-3. Is twining-lite the sweet spot (structured retrieval without overhead)?
-4. How does the model matter? (Opus vs Sonnet showed different patterns)
+1. Does the coordination advantage hold across different scenarios (not just sprint-simulation)?
+2. Does model choice (Opus vs Sonnet) affect the coordination lift magnitude?
+3. Can the lite toolset be further reduced while maintaining the effect?
+4. At what session count does the coordination advantage become significant? (dose-response)

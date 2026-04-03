@@ -62,7 +62,7 @@ The results display includes a VERDICT (whether Twining helps), CONFIDENCE level
 
 ### Analyze Results (Python)
 
-A standalone Python analysis package provides 16-dimension statistical analysis with interactive reports:
+A standalone Python analysis package provides 20-dimension statistical analysis with interactive reports:
 
 ```bash
 cd analysis
@@ -162,42 +162,23 @@ All 8 coordination conditions form a progression from no coordination to full Tw
 
 ### Scoring
 
-#### Primary Metrics
+#### Sprint-Simulation Scoring (Primary Scenario)
 
-Results display surfaces these metrics prominently, before any composite score:
-
-| Metric | What It Shows |
-|--------|---------------|
-| **Success Rate** | % of iterations where all agent sessions completed |
-| **Test Pass Rate** | Tests passing / total tests |
-| **Cost** | Mean API cost per run (USD) |
-| **Time** | Mean wall time per run |
-| **Compilation** | Whether the final codebase compiles |
-
-#### Dual-Rubric Evaluation
-
-Each run also produces two independent LLM-as-judge scores:
-
-**Coordination Score (CES)** — Evaluates inter-agent coordination quality using 4 dimensions:
+The sprint-simulation scenario scores 5 dimensions, each weighted equally at 20%:
 
 | Dimension | Weight | What It Measures | Method |
 |-----------|--------|-----------------|--------|
-| Consistency | 0.25 | Do agents align with each other's architectural choices? | LLM-judge |
-| Integration | 0.30 | Does the combined output compile, pass tests, and integrate? | Automated |
-| Redundancy | 0.20 | How much redundant or duplicated work occurred? (inverse) | LLM-judge |
-| Coherence | 0.15 | Is the final codebase architecturally coherent? | LLM-judge |
-| Overhead | -0.10 | Penalty for coordination overhead (smooth linear: `ratio × 100`) | Automated |
+| decisionConsistency | 20% | Do later sessions follow session 1's architectural pattern? | Automated (multi-signal pattern detection) |
+| assumptionHandling | 20% | Did agents detect and respond to the session 8 requirement change? | Automated (graduated: explicit flag → restructure → routing) |
+| cumulativeRework | 20% | Lines reworked / lines added across all sessions (lower = better) | Automated (git diff analysis) |
+| contextRecovery | 20% | How effectively do later sessions recover prior context? | Automated (coordination tool usage + efficiency + time-to-first-write) |
+| finalQuality | 20% | Components present, tests pass, test coverage depth, API consistency | Automated (6 sub-dimensions) |
 
-**Standalone Quality Score** — Evaluates output quality independent of coordination (no mention of agents or shared state):
+**Composite** = weighted average of all 5 dimensions (0-100 scale).
 
-| Dimension | Weight | What It Measures |
-|-----------|--------|-----------------|
-| Correctness | 0.25 | Does the code work? Edge cases handled? |
-| Architectural Soundness | 0.25 | Clean separation of concerns, consistent patterns? |
-| Maintainability | 0.25 | Readable, well-named, testable code? |
-| Completeness | 0.25 | Were all requirements implemented? |
+#### LLM-as-Judge Evaluation
 
-**Coordination Lift** = CES - Standalone Score. Positive means coordination helped; negative means overhead hurt net quality.
+When an evaluator model is configured, `finalQuality` uses LLM-as-judge instead of automated scoring. LLM evaluation uses **blind mode** — condition identity and coordination artifacts are stripped to prevent bias.
 
 #### Blinded Evaluation
 
@@ -269,11 +250,11 @@ twining-benchmark-harness/
 │   ├── dashboard/                    # React + Vite web dashboard
 │   └── types/                        # TypeScript interfaces
 ├── tests/
-│   ├── unit/                         # 38 test files
+│   ├── unit/                         # 43 test files
 │   ├── integration/                  # 2 integration test files
 │   └── e2e/                          # CI-gated smoke test
-├── analysis/                          # Python analysis package (16 dimensions, 3 report formats)
-├── scripts/                          # Smoke test and analysis scripts
+├── analysis/                          # Python analysis package (20 dimensions, 3 report formats)
+├── scripts/                          # Smoke test, analysis, and rescore scripts
 ├── Dockerfile                        # Multi-stage build for Fly.io
 ├── fly.toml                          # Fly.io config (4 CPU, 4GB RAM)
 └── PRD.md                            # Full product requirements

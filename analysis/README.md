@@ -115,7 +115,7 @@ Terminal output:
 
 **Behavior-Outcome Correlations** — Spearman rank correlations between agent behaviors (orientation calls, recording calls, etc.) and outcomes (composite score, cost). Identifies which behaviors predict better scores.
 
-**Effect Decomposition** — Attributes score differences to specific coordination mechanisms: orientation, recording, graph building, verification. Labels as descriptive/exploratory (not causal).
+**Effect Decomposition** — Attributes score differences to specific coordination mechanisms: orientation, recording, graph building, verification. When all mechanisms show identical values (same conditions use all tools), collapses into a summary note. Also renders lite-vs-full comparison (delta, conclusion, tool overlap), per-tool utilization counts, and never-called tools list.
 
 **Interactions** — Scenario × condition heatmap. Detects disordinal interactions (ranking reversals across scenarios).
 
@@ -229,7 +229,7 @@ Terminal output:
 
 ```bash
 cd analysis
-python -m pytest tests/ -v          # 216 tests
+python -m pytest tests/ -v          # 219 tests
 python -m pytest tests/ -x -q       # Quick: stop on first failure
 ```
 
