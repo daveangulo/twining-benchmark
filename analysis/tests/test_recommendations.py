@@ -47,6 +47,78 @@ def test_priority_sorting():
     assert priorities == sorted(priorities, key=lambda p: {"high": 0, "medium": 1, "low": 2}[p])
 
 
+def test_non_coordination_conditions_skip_engagement_check():
+    """baseline and shared-markdown should not get flagged for low Twining engagement."""
+    all_results = {
+        "coordination": {
+            "per_condition": [
+                {"condition": "baseline", "engagement_rate": 0.0},
+                {"condition": "shared-markdown", "engagement_rate": 0.0},
+                {"condition": "claude-md-only", "engagement_rate": 0.0},
+                {"condition": "full-twining", "engagement_rate": 0.3},
+            ]
+        }
+    }
+    result = synthesize_recommendations(all_results)
+    coord_items = [i for i in result["items"] if i["category"] == "coordination" and "engagement" in i["message"].lower()]
+    # Only full-twining should be flagged
+    assert len(coord_items) == 1
+    assert "full-twining" in coord_items[0]["message"]
+    assert "baseline" not in coord_items[0]["message"]
+    assert "shared-markdown" not in coord_items[0]["message"]
+
+
+def test_underpowered_large_effect_produces_medium_not_high():
+    """When lift is not significant but effect is large and underpowered, produce medium priority."""
+    all_results = {
+        "coordination_lift": {
+            "summary": {"overall_lift_significant": False},
+        },
+        "reliability": {
+            "power_analysis": [
+                {
+                    "comparison": "baseline vs full-twining",
+                    "cohens_d": 0.94,
+                    "mdes": 1.2,
+                    "observed_power": 0.45,
+                    "n_per_group": 10,
+                }
+            ],
+        },
+    }
+    result = synthesize_recommendations(all_results)
+    lift_items = [i for i in result["items"] if i["category"] == "coordination-lift"]
+    assert len(lift_items) == 1
+    assert lift_items[0]["priority"] == "medium"
+    assert "underpowered" in lift_items[0]["message"]
+    assert "coordination problem" not in lift_items[0]["message"].lower() or "not a coordination problem" in lift_items[0]["message"]
+
+
+def test_no_effect_lift_produces_high():
+    """When lift is not significant and no large effects, produce high priority warning."""
+    all_results = {
+        "coordination_lift": {
+            "summary": {"overall_lift_significant": False},
+        },
+        "reliability": {
+            "power_analysis": [
+                {
+                    "comparison": "baseline vs full-twining",
+                    "cohens_d": 0.2,
+                    "mdes": 0.8,
+                    "observed_power": 0.2,
+                    "n_per_group": 10,
+                }
+            ],
+        },
+    }
+    result = synthesize_recommendations(all_results)
+    lift_items = [i for i in result["items"] if i["category"] == "coordination-lift"]
+    assert len(lift_items) == 1
+    assert lift_items[0]["priority"] == "high"
+    assert "No statistically significant" in lift_items[0]["message"]
+
+
 def test_mdes_based_design_recommendation():
     """Recommendations use MDES-based messaging, not 'need N runs'."""
     all_results = {

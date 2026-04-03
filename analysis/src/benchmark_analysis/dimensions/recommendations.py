@@ -18,11 +18,15 @@ def synthesize_recommendations(all_results: dict) -> dict:
     for entry in coord_entries:
         if not isinstance(entry, dict):
             continue
+        condition = entry.get("condition", "")
+        # Only flag engagement for conditions that SHOULD use Twining
+        if condition in ("baseline", "shared-markdown", "claude-md-only"):
+            continue
         if entry.get("engagement_rate", 1.0) < 0.5:
             items.append({
                 "priority": "high",
                 "category": "coordination",
-                "message": f"Fix activation: Twining engagement rate is {entry['engagement_rate']:.0%} for {entry['condition']} — agents aren't using coordination tools",
+                "message": f"Fix activation: Twining engagement rate is {entry['engagement_rate']:.0%} for {condition} — agents aren't using coordination tools",
             })
         graph_pct = entry.get("avg_graph_building_pct", entry.get("graph_overhead_pct", 0))
         if graph_pct > 20:
@@ -99,12 +103,28 @@ def synthesize_recommendations(all_results: dict) -> dict:
 
     # Check coordination lift
     lift = all_results.get("coordination_lift", {})
-    if lift.get("summary", {}).get("overall_lift_significant") is False:
-        items.append({
-            "priority": "high",
-            "category": "coordination-lift",
-            "message": "No statistically significant coordination lift detected — coordination tools may not be providing measurable value",
-        })
+    lift_summary = lift.get("summary", {})
+    if lift_summary.get("overall_lift_significant") is False:
+        # Check if there's a large effect that's just underpowered
+        reliability = all_results.get("reliability", {})
+        power_analyses = reliability.get("power_analysis", [])
+        large_effects = [pa for pa in power_analyses
+                         if abs(pa.get("cohens_d", 0)) >= 0.8
+                         and abs(pa.get("cohens_d", 0)) < pa.get("mdes", 999)]
+        if large_effects:
+            max_d = max(abs(pa['cohens_d']) for pa in large_effects)
+            items.append({
+                "priority": "medium",
+                "category": "coordination-lift",
+                "message": f"Large coordination effects detected (d={max_d:.2f}) "
+                           f"but study is underpowered to reach significance — increase sample size, not a coordination problem",
+            })
+        else:
+            items.append({
+                "priority": "high",
+                "category": "coordination-lift",
+                "message": "No statistically significant coordination lift detected — coordination tools may not be providing measurable value",
+            })
 
     # Check behavior-outcome correlations — flag overhead candidates
     behavior = all_results.get("behavior_outcome", {})
