@@ -117,27 +117,70 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     add()
     decomp = results.get("effect_decomposition", {})
     mechanisms = decomp.get("mechanism_attribution", [])
+
     if mechanisms:
-        headers = ["Mechanism", "Associated Difference", "Evidence"]
-        rows = []
-        for m in mechanisms:
-            lift = m.get("associated_difference", 0)
-            # Build evidence string from heavy/non-user conditions
-            heavy = m.get("heavy_user_conditions", [])
-            non = m.get("non_user_conditions", [])
-            evidence_parts = []
-            if heavy:
-                evidence_parts.append(f"heavy users: {', '.join(heavy)}")
-            if non:
-                evidence_parts.append(f"non-users: {', '.join(non)}")
-            evidence = "; ".join(evidence_parts) if evidence_parts else "N/A"
-            rows.append([
-                m.get("mechanism", ""),
-                f"{lift:+.2f}",
-                evidence,
-            ])
+        # Check if all mechanisms have the same value (uninformative)
+        diffs = [m.get("associated_difference", 0) for m in mechanisms]
+        all_same = len(set(round(d, 1) for d in diffs)) <= 1
+
+        if all_same:
+            add(f"_All {len(mechanisms)} mechanisms show identical associated difference "
+                f"({diffs[0]:+.1f}) because the same conditions use all Twining tools. "
+                f"See lite-vs-full comparison below for tool surface analysis._")
+            add()
+        else:
+            headers = ["Mechanism", "Diff", "Avg Calls/Sess", "Heavy Users", "Non-Users"]
+            rows = []
+            for m in mechanisms:
+                lift = m.get("associated_difference", 0)
+                avg_calls = m.get("avg_calls_per_session", 0)
+                heavy = ", ".join(m.get("heavy_user_conditions", [])) or "none"
+                non = ", ".join(m.get("non_user_conditions", [])) or "none"
+                rows.append([
+                    m.get("mechanism", ""),
+                    f"{lift:+.1f}",
+                    f"{avg_calls:.1f}",
+                    heavy,
+                    non,
+                ])
+            add_table(headers, rows)
+
+    # Lite vs Full comparison
+    lvf = decomp.get("lite_vs_full", {})
+    if lvf:
+        add("### Lite vs Full Twining")
+        add()
+        add(f"| Metric | Value |")
+        add(f"| --- | --- |")
+        add(f"| twining-lite mean | {lvf.get('twining_lite_mean', 'N/A')} |")
+        add(f"| full-twining mean | {lvf.get('full_twining_mean', 'N/A')} |")
+        delta = lvf.get('delta', 0)
+        add(f"| delta (full - lite) | {delta:+.1f} |")
+        add(f"| conclusion | {lvf.get('conclusion', 'N/A')} |")
+        full_only = lvf.get("full_only_tools", [])
+        shared = lvf.get("shared_tools", [])
+        if full_only:
+            add(f"| full-only tools | {', '.join(full_only)} |")
+        if shared:
+            add(f"| shared tools | {', '.join(shared)} |")
+        add()
+
+    # Tool utilization
+    util = decomp.get("tool_utilization", {})
+    per_tool = util.get("per_tool_counts", [])
+    if per_tool:
+        add("### Tool Utilization")
+        add()
+        headers = ["Condition", "Tool", "Count"]
+        rows = [[t["condition"], t["tool"], str(t["count"])] for t in per_tool]
         add_table(headers, rows)
-    else:
+
+    never = util.get("never_called", [])
+    if never:
+        add(f"**Never-called tools:** {', '.join(never)}")
+        add()
+
+    if not mechanisms and not lvf and not per_tool:
         add("_No effect decomposition data available._")
         add()
 
