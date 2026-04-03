@@ -746,68 +746,83 @@ export class SprintSimulationScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // 1. Did session 8's code surface the assumption change? (+30)
-    // Check diffs and tool parameters for assumption-related content
-    const s8Text = [
-      ...session8.toolCalls.map((tc) => JSON.stringify(tc.parameters)),
-      ...session8.fileChanges.map((c) => c.diff ?? ''),
-    ].join('\n');
+    // --- Session 8: Did it IDENTIFY the assumption conflict? (+40) ---
+    // Session 8's task is "add SMS support and flag assumptions that need updating."
+    // A good response explicitly calls out that preferences were built for email-only.
+    // We check tool call output text AND diffs for explicit assumption language.
+    const s8Diffs = session8.fileChanges
+      .filter((c) => !/.twining|COORDINATION|CONTEXT/i.test(c.path))
+      .map((c) => c.diff ?? '').join('\n');
+    const s8ToolText = session8.toolCalls
+      .map((tc) => JSON.stringify(tc.parameters)).join('\n');
+    const s8Combined = s8Diffs + '\n' + s8ToolText;
 
-    const flaggedAssumption =
-      /email.?only.*assumption|assumption.*email|preference.*need.*update|no longer.*email.?only/i.test(s8Text);
+    // Strong signal: explicit mention of the assumption conflict
+    const explicitAssumptionFlag =
+      /assum.*email.?only|email.?only.*assum|preferences?.*(need|require|must).*(updat|chang|refactor|extend)|single.?channel.*assum|hardcoded.*email/i.test(s8Combined);
+    // Weak signal: just mentions preferences need work alongside SMS
+    const weakAssumptionFlag =
+      /preference.*multi|preference.*sms|preference.*channel|update.*preference/i.test(s8Combined) &&
+      !explicitAssumptionFlag;
 
-    if (flaggedAssumption) {
-      score += 30;
-      details.push('Session 8 surfaced the email-only assumption change in code/comments.');
+    if (explicitAssumptionFlag) {
+      score += 40;
+      details.push('Session 8 explicitly flagged the email-only assumption.');
+    } else if (weakAssumptionFlag) {
+      score += 15;
+      details.push('Session 8 mentioned preference updates but did not explicitly flag the assumption conflict.');
     } else {
-      details.push('Session 8 did NOT surface the assumption change.');
+      details.push('Session 8 did NOT flag any assumption about email-only design.');
     }
 
-    // 2. Did session 9 update the preferences model for multi-channel? (+35)
-    const s9Diffs = session9.fileChanges.map((c) => c.diff ?? '').join('\n');
-    const s9Files = session9.fileChanges.map((c) => c.path).join(' ');
-
-    const updatedPreferences =
-      /preference/i.test(s9Files) &&
-      /sms|SMS|channel|channels|multi/i.test(s9Diffs);
-
-    if (updatedPreferences) {
-      score += 35;
-      details.push('Session 9 updated preferences model for multi-channel support.');
-    } else {
-      details.push('Session 9 did NOT update preferences for multi-channel.');
-    }
-
-    // 3. Did session 9 implement multi-channel routing end-to-end? (+35)
-    // Check for actual channel routing logic beyond just the preferences model:
-    // adapter/handler code for SMS/push/Slack, channel selection logic, etc.
+    // --- Session 9: Did it RESTRUCTURE preferences for multi-channel? (+35) ---
+    // Not just "does the diff mention SMS" but did the preferences model actually
+    // change from email-centric to channel-generic?
+    const s9PrefDiffs = session9.fileChanges
+      .filter((c) => /preference/i.test(c.path) && !/.twining|COORDINATION|CONTEXT/i.test(c.path))
+      .map((c) => c.diff ?? '').join('\n');
     const s9AllDiffs = session9.fileChanges
       .filter((c) => !/.twining|COORDINATION|CONTEXT/i.test(c.path))
       .map((c) => c.diff ?? '').join('\n');
 
-    // Look for implementation patterns: channel routing, adapter instantiation,
-    // notification dispatch across channels
-    const hasChannelRouting =
-      /switch\s*\(.*channel|channel\s*===?\s*['"]sms|NotificationChannel|channelType|sendSms|sendPush|smsAdapter|pushAdapter/i.test(s9AllDiffs);
-    const hasMultipleChannels =
-      (/sms/i.test(s9AllDiffs) && /push|slack|webhook/i.test(s9AllDiffs)) ||
-      /channels?\s*[.:=]\s*\[/i.test(s9AllDiffs);
-    const hasChannelInterface =
-      /interface.*Channel|type.*Channel.*=|abstract.*send/i.test(s9AllDiffs);
+    // Strong: preferences model changed to support channel types (not just email fields)
+    const prefRestructured =
+      /channel.*type|NotificationChannel|ChannelPreference|channels?\s*[.:=]\s*\[|Map<.*channel/i.test(s9PrefDiffs) &&
+      s9PrefDiffs.length > 100; // must be a substantive change, not a comment
+    // Weak: preferences file touched but only minor additions
+    const prefTouched = s9PrefDiffs.length > 20 && /sms|channel/i.test(s9PrefDiffs);
 
-    if (hasChannelRouting && hasMultipleChannels) {
+    if (prefRestructured) {
       score += 35;
-      details.push('Session 9 implemented multi-channel routing with multiple channel types.');
-    } else if (hasChannelRouting || hasMultipleChannels || hasChannelInterface) {
-      score += 20;
-      details.push('Session 9 partially implemented multi-channel routing.');
+      details.push('Session 9 restructured preferences model for multi-channel.');
+    } else if (prefTouched) {
+      score += 15;
+      details.push('Session 9 touched preferences but did not restructure for multi-channel.');
     } else {
-      details.push('Session 9 did NOT implement multi-channel routing logic.');
+      details.push('Session 9 did NOT update preferences model.');
+    }
+
+    // --- Session 9: End-to-end multi-channel routing? (+25) ---
+    // Check for channel dispatch logic that actually routes based on preference
+    const hasPreferenceBasedRouting =
+      /preference.*channel|channel.*preference|getPreferred|channelFor/i.test(s9AllDiffs) &&
+      /switch|if.*channel|forEach.*channel|map.*channel/i.test(s9AllDiffs);
+    const hasBasicMultiChannel =
+      /sms/i.test(s9AllDiffs) && /webhook|push|slack/i.test(s9AllDiffs);
+
+    if (hasPreferenceBasedRouting) {
+      score += 25;
+      details.push('Session 9 implemented preference-based channel routing.');
+    } else if (hasBasicMultiChannel) {
+      score += 10;
+      details.push('Session 9 added multiple channels but without preference-based routing.');
+    } else {
+      details.push('Session 9 did NOT implement multi-channel routing.');
     }
 
     return {
       value: score,
-      confidence: 'medium',
+      confidence: score > 50 ? 'medium' : 'low',
       method: 'automated',
       justification: details.join(' '),
     };
