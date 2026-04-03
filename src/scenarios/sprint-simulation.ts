@@ -609,11 +609,11 @@ export class SprintSimulationScenario extends BaseScenario {
     };
 
     const composite =
-      decisionConsistency.value * 0.25 +
-      assumptionHandling.value * 0.25 +
+      decisionConsistency.value * 0.20 +
+      assumptionHandling.value * 0.20 +
       cumulativeRework.value * 0.20 +
-      contextRecovery.value * 0.15 +
-      finalQuality.value * 0.15;
+      contextRecovery.value * 0.20 +
+      finalQuality.value * 0.20;
 
     return {
       runId: '',
