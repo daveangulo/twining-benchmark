@@ -651,65 +651,96 @@ export class SprintSimulationScenario extends BaseScenario {
     }
 
     // Detect which notification pattern Session 1 chose
-    const s1Diffs = session1.fileChanges.map((c) => c.diff ?? '').join('\n').toLowerCase();
-    const usesEventBus = /event[\s-]?bus|emit|listener|subscribe|pub[\s-]?sub/i.test(s1Diffs);
-    const usesDirectCalls = /direct.*call|inject.*service|notification.*service\./i.test(s1Diffs);
+    const s1Diffs = session1.fileChanges
+      .filter((c) => !/.twining|COORDINATION|CONTEXT/i.test(c.path))
+      .map((c) => c.diff ?? '').join('\n');
 
-    if (!usesEventBus && !usesDirectCalls) {
-      return {
-        value: 50,
-        confidence: 'low',
-        method: 'automated',
-        justification: 'Could not detect notification pattern from Session 1 diffs.',
-      };
+    // Broader pattern detection — multiple signals per pattern type
+    const eventDrivenSignals = [
+      /event[\s-]?bus/i,
+      /\.emit\s*\(/i,
+      /\.on\s*\(\s*['"][a-z]/i,
+      /addEventListener|subscribe|listener/i,
+      /pub[\s-]?sub|EventEmitter/i,
+      /new\s+Event/i,
+      /observer|Observable/i,
+    ];
+    const directCallSignals = [
+      /notif.*service\./i,
+      /service\.send|service\.notify/i,
+      /inject.*service|@Inject/i,
+      /new\s+\w*Service\s*\(/i,
+      /this\.\w*service\.\w+\(/i,
+    ];
+
+    const eventScore = eventDrivenSignals.filter((r) => r.test(s1Diffs)).length;
+    const directScore = directCallSignals.filter((r) => r.test(s1Diffs)).length;
+
+    if (eventScore === 0 && directScore === 0) {
+      const hasServiceFile = session1.fileChanges.some((c) =>
+        /service/i.test(c.path) && (c.diff?.length ?? 0) > 50,
+      );
+      if (!hasServiceFile) {
+        return {
+          value: 50,
+          confidence: 'low',
+          method: 'automated',
+          justification: 'Could not detect notification pattern from Session 1 diffs — no service files created.',
+        };
+      }
+      // Default to direct-calls if there's a service but no event patterns
+      return this.checkConsistencyAgainstPattern(rawResults, 'direct-calls', directCallSignals);
     }
 
-    const chosenPattern = usesEventBus ? 'event-driven' : 'direct-calls';
-    const patternRegex = usesEventBus
-      ? /event[\s-]?bus|\.emit\(|\.on\(|subscribe|listener/i
-      : /notification.*service|service\.notify|service\.send/i;
+    const chosenPattern = eventScore > directScore ? 'event-driven' : 'direct-calls';
+    const patternSignals = chosenPattern === 'event-driven' ? eventDrivenSignals : directCallSignals;
 
-    // Check adapter sessions (2, 6, 8) for pattern consistency
-    const adapterSessions = [1, 5, 7]; // 0-indexed: sessions 2, 6, 8
+    return this.checkConsistencyAgainstPattern(rawResults, chosenPattern, patternSignals);
+  }
+
+  private checkConsistencyAgainstPattern(
+    rawResults: RawResults,
+    chosenPattern: string,
+    patternSignals: RegExp[],
+  ): DimensionScore {
+    // Check ALL sessions that produce notification-related code (not hardcoded indices)
     let consistentCount = 0;
     let checkedCount = 0;
     const details: string[] = [];
 
-    for (const idx of adapterSessions) {
+    for (let idx = 1; idx < rawResults.transcripts.length; idx++) {
       const t = rawResults.transcripts[idx];
       if (!t) continue;
-      checkedCount++;
 
       const diffs = t.fileChanges
         .filter((c) => !/.twining|COORDINATION|CONTEXT|coordination/i.test(c.path))
         .map((c) => c.diff ?? '').join('\n');
-      if (patternRegex.test(diffs)) {
+
+      // Skip sessions that don't touch notification-related code
+      if (!/notification|adapter|service.*notify|event.*bus/i.test(diffs)) {
+        continue;
+      }
+
+      checkedCount++;
+      const matchCount = patternSignals.filter((r) => r.test(diffs)).length;
+
+      if (matchCount >= 1) {
         consistentCount++;
       } else {
         details.push(`Session ${idx + 1} did not follow ${chosenPattern} pattern.`);
       }
     }
 
-    // Also check sessions 9-12 for consistency
-    for (let idx = 8; idx < Math.min(12, rawResults.transcripts.length); idx++) {
-      const t = rawResults.transcripts[idx];
-      if (!t) continue;
-      checkedCount++;
-
-      const diffs = t.fileChanges
-        .filter((c) => !/.twining|COORDINATION|CONTEXT|coordination/i.test(c.path))
-        .map((c) => c.diff ?? '').join('\n');
-      if (diffs.length > 0 && patternRegex.test(diffs)) {
-        consistentCount++;
-      } else if (diffs.length > 0) {
-        details.push(`Session ${idx + 1} did not follow ${chosenPattern} pattern.`);
-      } else {
-        // No diffs — doesn't count against
-        checkedCount--;
-      }
+    if (checkedCount === 0) {
+      return {
+        value: 50,
+        confidence: 'low',
+        method: 'automated',
+        justification: `Pattern: ${chosenPattern}. No later sessions touched notification-related code.`,
+      };
     }
 
-    const score = checkedCount > 0 ? Math.round((consistentCount / checkedCount) * 100) : 50;
+    const score = Math.round((consistentCount / checkedCount) * 100);
 
     return {
       value: score,
