@@ -1057,51 +1057,7 @@ export class SprintSimulationScenario extends BaseScenario {
     let score = 0;
     const details: string[] = [];
 
-    // 1. Compilation (0-20)
-    if (rawResults.testResults) {
-      if (rawResults.testResults.compiles) {
-        score += 20;
-        details.push('Compiles.');
-      } else {
-        details.push('Does NOT compile.');
-      }
-    } else {
-      // Fallback: check if final session ran tsc without error signals
-      const ranTsc = lastSession.toolCalls.some((tc) =>
-        tc.toolName === 'Bash' &&
-        /tsc|npm run build|npm test/i.test(String(tc.parameters?.command ?? '')),
-      );
-      if (ranTsc) {
-        score += 10; // Partial credit — we can't confirm it passed
-        details.push('Final session ran build/tests (compilation unverified).');
-      }
-    }
-
-    // 2. Test pass rate (0-30)
-    if (rawResults.testResults) {
-      const { pass, fail } = rawResults.testResults;
-      const total = pass + fail;
-      if (total > 0) {
-        const passRate = pass / total;
-        const testScore = Math.round(passRate * 30);
-        score += testScore;
-        details.push(`Tests: ${pass}/${total} pass (${Math.round(passRate * 100)}%).`);
-      } else {
-        details.push('No tests found.');
-      }
-    } else {
-      // Fallback: did the final session at least run tests?
-      const ranTests = lastSession.toolCalls.some((tc) =>
-        tc.toolName === 'Bash' &&
-        /npm test|vitest|jest/i.test(String(tc.parameters?.command ?? '')),
-      );
-      if (ranTests) {
-        score += 10; // Partial credit
-        details.push('Final session ran tests (results unavailable).');
-      }
-    }
-
-    // 3. Component completeness (0-25) — check files AND meaningful diffs
+    // Collect all files and diffs across sessions
     const allFiles = new Set<string>();
     const allDiffs: string[] = [];
     for (const t of rawResults.transcripts) {
@@ -1112,6 +1068,49 @@ export class SprintSimulationScenario extends BaseScenario {
     }
     const combinedDiffs = allDiffs.join('\n');
 
+    // 1. Compilation (0-15)
+    if (rawResults.testResults) {
+      if (rawResults.testResults.compiles) {
+        score += 15;
+        details.push('Compiles.');
+      } else {
+        details.push('Does NOT compile.');
+      }
+    } else {
+      const ranTsc = lastSession.toolCalls.some((tc) =>
+        tc.toolName === 'Bash' &&
+        /tsc|npm run build|npm test/i.test(String(tc.parameters?.command ?? '')),
+      );
+      if (ranTsc) {
+        score += 8;
+        details.push('Final session ran build/tests (compilation unverified).');
+      }
+    }
+
+    // 2. Test pass rate (0-20)
+    if (rawResults.testResults) {
+      const { pass, fail } = rawResults.testResults;
+      const total = pass + fail;
+      if (total > 0) {
+        const passRate = pass / total;
+        const testScore = Math.round(passRate * 20);
+        score += testScore;
+        details.push(`Tests: ${pass}/${total} pass (${Math.round(passRate * 100)}%).`);
+      } else {
+        details.push('No tests found.');
+      }
+    } else {
+      const ranTests = lastSession.toolCalls.some((tc) =>
+        tc.toolName === 'Bash' &&
+        /npm test|vitest|jest/i.test(String(tc.parameters?.command ?? '')),
+      );
+      if (ranTests) {
+        score += 7;
+        details.push('Final session ran tests (results unavailable).');
+      }
+    }
+
+    // 3. Component completeness (0-20)
     const expectedComponents = [
       { id: 'notification-service', filePattern: /notification.*service/i, diffPattern: /class\s+\w*Notification\w*Service|notification.*service/i },
       { id: 'email-adapter', filePattern: /email.*adapter|adapter.*email/i, diffPattern: /class\s+\w*Email\w*Adapter|implements\s+\w*Adapter/i },
@@ -1128,16 +1127,12 @@ export class SprintSimulationScenario extends BaseScenario {
         componentsFound++;
       }
     }
-    const componentScore = Math.round((componentsFound / expectedComponents.length) * 25);
+    const componentScore = Math.round((componentsFound / expectedComponents.length) * 20);
     score += componentScore;
     details.push(`${componentsFound}/${expectedComponents.length} components verified in code.`);
 
     // 4. Architecture consistency (0-15) — do adapters follow the same interface?
-    const adapterDiffs = allDiffs.filter((d) =>
-      /adapter/i.test(d),
-    ).join('\n');
-
-    // Look for a shared interface/pattern across adapters
+    const adapterDiffs = allDiffs.filter((d) => /adapter/i.test(d)).join('\n');
     const implementsMatch = adapterDiffs.match(/implements\s+(\w+)/gi) ?? [];
     const interfaceNames = implementsMatch.map((m) => m.replace(/implements\s+/i, ''));
     const uniqueInterfaces = new Set(interfaceNames);
@@ -1155,26 +1150,49 @@ export class SprintSimulationScenario extends BaseScenario {
       details.push('No adapter interface pattern detected.');
     }
 
-    // 5. Multi-channel integration (0-10) — channels wired into preferences
-    const prefDiffs = rawResults.transcripts.flatMap((t) =>
-      t.fileChanges
-        .filter((c) => /preference/i.test(c.path))
-        .map((c) => c.diff ?? ''),
-    ).join('\n');
-
-    const hasMultiChannelPrefs =
-      /sms|SMS/.test(prefDiffs) && /email|Email/.test(prefDiffs);
-    const hasWebhookInPrefs = /webhook|Webhook/.test(prefDiffs);
-
-    if (hasMultiChannelPrefs && hasWebhookInPrefs) {
-      score += 10;
-      details.push('Multi-channel preferences (email+SMS+webhook).');
-    } else if (hasMultiChannelPrefs) {
-      score += 6;
-      details.push('Multi-channel preferences (email+SMS only).');
-    } else {
-      details.push('Preferences not updated for multi-channel.');
+    // 5. Test coverage depth (0-15) — test files per component
+    const testFiles = [...allFiles].filter((f) => /test/i.test(f) && !/.twining|COORDINATION|CONTEXT/i.test(f));
+    const componentTestPatterns = [
+      { id: 'notification', pattern: /notification/i },
+      { id: 'email-adapter', pattern: /email/i },
+      { id: 'sms-adapter', pattern: /sms/i },
+      { id: 'webhook-adapter', pattern: /webhook/i },
+      { id: 'preferences', pattern: /preference/i },
+      { id: 'validation', pattern: /validat/i },
+      { id: 'pagination', pattern: /paginat/i },
+    ];
+    let testedComponents = 0;
+    for (const comp of componentTestPatterns) {
+      if (testFiles.some((f) => comp.pattern.test(f))) {
+        testedComponents++;
+      }
     }
+    const coverageRatio = componentTestPatterns.length > 0 ? testedComponents / componentTestPatterns.length : 0;
+    const coverageScore = Math.round(coverageRatio * 15);
+    score += coverageScore;
+    details.push(`${testedComponents}/${componentTestPatterns.length} components have test files.`);
+
+    // 6. API surface consistency (0-15) — naming and export patterns
+    const serviceFiles = [...allFiles].filter((f) => /service/i.test(f) && /^src\//i.test(f));
+    const adapterFiles = [...allFiles].filter((f) => /adapter/i.test(f) && /^src\//i.test(f));
+
+    const consistentServiceNaming = serviceFiles.length > 0 &&
+      serviceFiles.every((f) => /\.service\.(ts|js)$/i.test(f));
+    const consistentAdapterNaming = adapterFiles.length > 0 &&
+      adapterFiles.every((f) => /\.adapter\.(ts|js)$/i.test(f));
+
+    const hasExportedTypes = /export\s+(interface|type)\s+\w+/i.test(combinedDiffs);
+    const adapterMethods = adapterDiffs.match(/(?:async\s+)?(\w+)\s*\([^)]*\)\s*[:{]/g) ?? [];
+    const methodNames = adapterMethods.map((m) => m.match(/(\w+)\s*\(/)?.[1]).filter(Boolean);
+    const hasSendMethod = methodNames.filter((n) => /^send$/i.test(n!)).length;
+
+    let apiScore = 0;
+    if (consistentServiceNaming) apiScore += 4;
+    if (consistentAdapterNaming) apiScore += 4;
+    if (hasExportedTypes) apiScore += 4;
+    if (hasSendMethod >= 2) apiScore += 3;
+    score += apiScore;
+    details.push(`API consistency: ${apiScore}/15 (naming=${consistentServiceNaming && consistentAdapterNaming ? 'consistent' : 'mixed'}, types=${hasExportedTypes ? 'exported' : 'implicit'}, methods=${hasSendMethod >= 2 ? 'consistent' : 'varied'}).`);
 
     return {
       value: Math.min(100, score),
