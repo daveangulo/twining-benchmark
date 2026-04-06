@@ -13,8 +13,8 @@ import {
 } from '../../../src/scenarios/registry.js';
 
 describe('Condition Registry', () => {
-  it('has all 8 conditions', () => {
-    expect(getAllConditionNames()).toHaveLength(8);
+  it('has all 10 conditions', () => {
+    expect(getAllConditionNames()).toHaveLength(10);
   });
 
   it('has expected condition names', () => {
@@ -26,6 +26,8 @@ describe('Condition Registry', () => {
     expect(names).toContain('file-reload-structured');
     expect(names).toContain('full-twining');
     expect(names).toContain('twining-lite');
+    expect(names).toContain('twining-default');
+    expect(names).toContain('twining-full');
     expect(names).toContain('persistent-history');
   });
 
@@ -42,7 +44,7 @@ describe('Condition Registry', () => {
 
   it('resolveConditionNames resolves "all"', () => {
     const names = resolveConditionNames('all');
-    expect(names).toHaveLength(8);
+    expect(names).toHaveLength(10);
   });
 
   it('resolveConditionNames resolves single names', () => {

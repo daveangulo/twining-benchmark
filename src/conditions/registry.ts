@@ -6,6 +6,8 @@ import { FileReloadGenericCondition } from './file-reload-generic.js';
 import { FileReloadStructuredCondition } from './file-reload-structured.js';
 import { FullTwiningCondition } from './full-twining.js';
 import { TwiningLiteCondition } from './twining-lite.js';
+import { TwiningDefaultCondition } from './twining-default.js';
+import { TwiningFullCondition } from './twining-full.js';
 import { PersistentHistoryCondition } from './persistent-history.js';
 
 /**
@@ -50,9 +52,21 @@ export const CONDITION_REGISTRY: Record<ConditionName, ConditionRegistryEntry> =
   },
   'twining-lite': {
     name: 'twining-lite',
-    description: 'Twining Lite — core blackboard and decision tools only (8 of 26 tools).',
+    description: 'Twining Lite (legacy alias for twining-default) — core blackboard and decision tools.',
     coordinationTools: ['Twining MCP (core: blackboard, decisions, handoff)'],
     create: () => new TwiningLiteCondition(),
+  },
+  'twining-default': {
+    name: 'twining-default',
+    description: 'Twining Default — 5-tool surface (assemble, record, post, why, housekeeping).',
+    coordinationTools: ['Twining MCP (default 5-tool surface)'],
+    create: () => new TwiningDefaultCondition(),
+  },
+  'twining-full': {
+    name: 'twining-full',
+    description: 'Twining Full — all tools via full_surface config (graph, verify, search, coordination).',
+    coordinationTools: ['Twining MCP (all tools via full_surface: true)'],
+    create: () => new TwiningFullCondition(),
   },
   'persistent-history': {
     name: 'persistent-history',

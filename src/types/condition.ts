@@ -11,6 +11,8 @@ export type ConditionName =
   | 'file-reload-structured'
   | 'full-twining'
   | 'twining-lite'
+  | 'twining-default'
+  | 'twining-full'
   | 'persistent-history';
 
 /**
