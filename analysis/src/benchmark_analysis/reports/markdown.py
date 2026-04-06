@@ -190,19 +190,25 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     scenario_data = results.get("scenarios", {})
     per_scenario = scenario_data.get("per_scenario", {})
     if per_scenario:
-        headers = ["Scenario", "Mean", "Std", "Best Condition", "Worst Condition"]
+        headers = ["Scenario", "Spread", "Best Condition", "Best Mean", "Worst Condition", "Worst Mean"]
         rows = []
         # per_scenario may be a dict keyed by scenario name or a list of dicts
         items = per_scenario.items() if isinstance(per_scenario, dict) else [(s.get("scenario", ""), s) for s in per_scenario]
         for scenario_name, s in items:
             if isinstance(s, str):
                 continue
+            best = s.get("best_condition", "")
+            worst = s.get("worst_condition", "")
+            summaries = s.get("condition_summaries", {})
+            best_mean = summaries.get(best, {}).get("mean", 0)
+            worst_mean = summaries.get(worst, {}).get("mean", 0)
             rows.append([
                 scenario_name,
-                f"{s.get('mean', s.get('spread', 0)):.1f}",
-                f"{s.get('std', 0):.1f}",
-                s.get("best_condition", ""),
-                s.get("worst_condition", ""),
+                f"{s.get('spread', 0):.1f}",
+                best,
+                f"{best_mean:.1f}",
+                worst,
+                f"{worst_mean:.1f}",
             ])
         add_table(headers, rows)
     else:

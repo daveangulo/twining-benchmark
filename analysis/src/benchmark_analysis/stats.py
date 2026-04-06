@@ -193,7 +193,15 @@ def power_analysis(
     df = 2 * n_per_group - 2
     ncp = effect_size * math.sqrt(n_per_group / 2)  # Non-centrality parameter
     t_crit = sp_stats.t.ppf(1 - alpha / 2, df)
-    power = 1 - sp_stats.nct.cdf(t_crit, df, ncp) + sp_stats.nct.cdf(-t_crit, df, ncp)
+    # scipy nct.cdf can return NaN for large ncp at certain df values;
+    # the left tail is negligible when ncp is large, so treat NaN as 0
+    right_tail = sp_stats.nct.cdf(t_crit, df, ncp)
+    left_tail = sp_stats.nct.cdf(-t_crit, df, ncp)
+    if math.isnan(right_tail):
+        right_tail = 0.0
+    if math.isnan(left_tail):
+        left_tail = 0.0
+    power = 1 - right_tail + left_tail
     return float(power)
 
 

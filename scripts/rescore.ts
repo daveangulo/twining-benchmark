@@ -170,9 +170,14 @@ for (const [scenarioName, condMap] of byScenarioCondition) {
         testResults,
       };
 
-      // Use the synthetic repo ground truth (all current scenarios use this target)
+      // Use scenario-specific ground truth when available (e.g. context-recovery
+      // has its own 3-decision manifest distinct from the target's 2-decision one).
+      // Fall back to synthetic repo target for scenarios that don't override.
+      // Access protected getGroundTruth via bracket notation since we can't call setup() without a real working dir.
       const target = new SyntheticRepoTarget();
-      const groundTruth = target.getGroundTruth();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const groundTruth = await (scenario as any)['getGroundTruth']()
+        ?? target.getGroundTruth();
 
       try {
         const scored = await scenario.score(rawResults, groundTruth);

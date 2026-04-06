@@ -166,29 +166,70 @@ cd analysis && benchmark-analysis analyze ../benchmark-results/<run-id> --format
 
 ## Run Validity Quick Reference
 
-Only runs with `--setting-sources ''` (commit bddefdf+) produce valid cross-condition comparisons.
+### Validity Requirements
 
-**Valid 4-condition sprint-simulation data (Opus 4.6, n=5):**
-- **6393b4ac** + **9f93c5c4** (twining-lite rerun): 240 healthy sessions, all 4 conditions clean
-  - twining-lite: 84.5 (d=3.03, p<0.05)
-  - full-twining: 82.1 (d=1.79, significant)
-  - shared-markdown: 80.9 (d=0.97, large)
-  - baseline: 76.5
+Two independent requirements determine run validity:
+1. **Plugin isolation** (`--setting-sources ''`, commit bddefdf+) — prevents Twining plugin leaking into non-plugin conditions
+2. **Condition implementation** (commit d7420c1+) — standardized BASE_CLAUDE_MD across all conditions
+3. **twining-lite tool restriction** (commit 0ff8b25+) — belt-and-suspenders enforcement of 9-tool limit
 
-Note: Original twining-lite data in 6393b4ac was corrupted by 75-minute API rate limit. Dead sessions archived to `sessions/.archived-rate-limited/`. Clean rerun 9f93c5c4 data was merged in and original twining-lite scores replaced.
+Runs pre-d7420c1 used different CLAUDE.md content per condition (baseline had no CLAUDE.md, shared-markdown had hardcoded guidelines). Data from those runs is **not comparable** to post-d7420c1 data.
+
+### Valid Runs
+
+All invalid runs archived to `benchmark-results/.archived-invalid/` (50 runs). Valid runs:
+
+| Run ID | Date | Scenarios | Conditions | n | Notes |
+|--------|------|-----------|------------|---|-------|
+| **6393b4ac** | Apr 2 | sprint-simulation | all 4 | 5 | Primary sprint-sim data |
+| **9f93c5c4** | Apr 3 | sprint-simulation | twining-lite | 5 | Clean rerun, merged into 6393b4ac |
+| **66312b64** | Apr 4 | evolving-requirements, conflict-resolution | all 4 | 5 | Tier 2 scenarios |
+| **73972189** | Mar 30 | sprint-simulation | all 4 | 3 | Rescored with current scorers |
+| **d18ab582** | Mar 31 | sprint-simulation | all 4 | 3 | Rescored with current scorers |
+| **5ab87a48** | Apr 3 | context-recovery, multi-session-build | all 4 | 5 | Rescued from interrupted run (status=running but 2 scenarios complete) |
+| **16a2e4e1** | Mar 28 | sprint-simulation | baseline, shared-markdown | 3 | Pre-bddefdf but 0 Twining contamination; twining-lite/full-twining removed |
+
+### Archived Run Assessment
+
+Pre-bddefdf runs were checked for contamination. Run 9be7a749 had 168/215 Twining calls in baseline/shared-markdown — confirmed contamination. Run 16a2e4e1 had 0 Twining calls in baseline/shared-markdown — salvaged. All other pre-bddefdf runs also had condition implementation differences (pre-d7420c1) making them incomparable.
+
+## Pooled Results (All Valid Data)
+
+**7 runs, 5 scenarios, n=31-36 per condition (unbalanced)**
+
+| Condition | N | Mean | Std | Lift | Hedges' g | p-value | Sig |
+|-----------|---|------|-----|------|-----------|---------|-----|
+| twining-lite | 36 | 77.2 | 15.5 | +10.8 | +0.65 (medium) | <0.05 | YES * |
+| full-twining | 31 | 77.2 | 11.8 | +10.7 | +0.70 (medium) | <0.05 | YES * |
+| shared-markdown | 34 | 70.4 | 22.1 | +4.0 | +0.20 (negligible) | NS | no |
+| baseline | 34 | 66.5 | 17.4 | — | — | — | — |
+
+**MDES at n~30: d≥0.69** — sufficient to detect medium effects.
+
+**full-twining vs twining-lite**: delta=0.0, effectively tied — not significantly different.
+
+### Per-Scenario Breakdown
+
+| Scenario | N/cond | baseline | shared-md | twining-lite | full-twining |
+|----------|--------|----------|-----------|--------------|--------------|
+| sprint-simulation | 11-16 | 70.5 | 77.2 | 81.5 | 79.5 |
+| evolving-requirements | 5 | 69.2 | 66.9 | 67.5 | 95.9 |
+| conflict-resolution | 5 | 55.6 | 43.6 | 82.2 | 80.4 |
+| context-recovery | 5 | 60.1 | 54.3 | 65.5 | 66.6 |
+| multi-session-build | 5 | 89.2 | 96.4 | 91.5 | 85.0 |
 
 ## Research Findings (Established)
 
-1. **Coordination tools produce a large, statistically significant effect** (d=1.79-3.03 vs baseline) driven primarily by context recovery
-2. **Context recovery is the dominant differentiator**: Coordination conditions score 68-69 vs baseline's 36 — nearly doubling context recovery in multi-session work
-3. **Twining-lite and full-twining are functionally equivalent**: 84.5 vs 82.1 composite, near-identical cost (~$11.50/iter), engagement, and tool calls/session. The lite toolset captures the full coordination benefit
-4. **Shared-markdown provides meaningful but smaller lift**: +4.4 over baseline (d=0.97), primarily through context recovery (+24 pts). Coordination tools add another ~10 pts on top
-5. **The core value is in structured context assembly and decision recording**, not heavier lifecycle processes (graph building, verification gates, etc.)
-6. **Cost of coordination is ~20% more per iteration**: $11.50 vs $9.55, but quality gains make $/point comparable
+1. **Coordination tools produce a statistically significant effect across 5 scenarios** — full-twining g=0.70, twining-lite g=0.65, both p<0.05
+2. **Context recovery remains the dominant differentiator** in sprint-simulation: baseline 34-41 vs coordination 64-72, nearly 2x
+3. **Full-twining and twining-lite are effectively tied** (both 77.2 composite) — the lite toolset captures the full coordination benefit
+4. **Shared-markdown provides small but non-significant aggregate benefit** (g=0.20, NS) — helps in sprint-sim but hurts in conflict-resolution
+5. **The effect generalizes across scenario types**: sequential handoff, requirement evolution, conflict resolution, context recovery all show coordination advantage
+6. **The core value is in structured context assembly and decision recording**, not heavier lifecycle processes (graph building, verification gates, etc.)
 
 ## Pending Research Questions
 
-1. Does the coordination advantage hold across different scenarios (not just sprint-simulation)?
-2. Does model choice (Opus vs Sonnet) affect the coordination lift magnitude?
-3. Can the lite toolset be further reduced while maintaining the effect?
-4. At what session count does the coordination advantage become significant? (dose-response)
+1. Does model choice (Opus vs Sonnet) affect the coordination lift magnitude?
+2. Can the lite toolset be further reduced while maintaining the effect?
+3. At what session count does the coordination advantage become significant? (dose-response)
+4. Why does shared-markdown hurt in conflict-resolution? (coordination overhead without structured tools may increase confusion)

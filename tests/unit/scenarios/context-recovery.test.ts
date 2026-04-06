@@ -197,7 +197,9 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      expect(scored.scores['orientation-efficiency'].value).toBe(88);
+      // New multi-sub-score: speed(15s→15/30) + breadth(0 A files read) + coord(0) + exploration(0)
+      // Agent B has no tool calls so speed fallback is timeToFirstActionMs=15s → 30 - (15/30)*30 = 15
+      expect(scored.scores['orientation-efficiency'].value).toBe(15);
     });
 
     it('scores slow orientation lower', async () => {
@@ -223,6 +225,7 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
+      // 150s > 30s window → speed=0, no breadth/coord/exploration
       expect(scored.scores['orientation-efficiency'].value).toBe(0);
     });
 
@@ -330,7 +333,11 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      expect(scored.scores.completion.value).toBe(85);
+      // New multi-sub-score: presence 3/3=30, substance(short diffs ~3 lines→2/25),
+      // test depth(1 describe→2/20), file coverage(3 files→12/15), completion(5+0=5)
+      // ~51 total — but exact value depends on line filtering
+      expect(scored.scores.completion.value).toBeGreaterThan(35);
+      expect(scored.scores.completion.value).toBeLessThan(65);
     });
 
     it('scores redundant-rework 100 when B makes no changes and completion is high', async () => {
@@ -511,9 +518,10 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // First productive action (Edit) is at 20s — linear: 100 - (20/120)*100 ≈ 83
-      expect(scored.scores['orientation-efficiency'].value).toBe(83);
-      expect(scored.scores['orientation-efficiency'].justification).toContain('coordination time excluded');
+      // New multi-sub-score: speed(20s→10/30) + breadth(0/0 A files) + coord(2 coord reads→10/20) + exploration(0)
+      // = 20
+      expect(scored.scores['orientation-efficiency'].value).toBe(20);
+      expect(scored.scores['orientation-efficiency'].justification).toContain('coord reads');
     });
 
     it('scores context-accuracy from tool calls when B has no diffs', async () => {
@@ -605,8 +613,10 @@ describe('ContextRecoveryScenario', () => {
 
       const scored = await scenario.score(rawResults, CONTEXT_RECOVERY_GROUND_TRUTH);
 
-      // Only models found (1/3): Math.round((1/3) * 70) = 23, no metrics bonuses
-      expect(scored.scores.completion.value).toBe(23);
+      // New multi-sub-score: presence 1/3=10, substance(1 short line→~0),
+      // test depth(0), file coverage(1 file→5/15), completion(0+0=0) = ~15
+      expect(scored.scores.completion.value).toBeGreaterThan(8);
+      expect(scored.scores.completion.value).toBeLessThan(25);
     });
 
     it('produces a composite score as weighted average of 4 dimensions', async () => {

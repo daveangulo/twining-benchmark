@@ -103,9 +103,9 @@ export function captureEnvironment(): RunEnvironment {
     // Not in a git repo or git not available
   }
 
-  let twiningMcpVersion = 'unknown';
+  let twiningMcpVersion = '';
   try {
-    twiningMcpVersion = execSync('twining-mcp --version', { encoding: 'utf-8' }).trim();
+    twiningMcpVersion = execSync('npm list twining-mcp --depth=0 2>/dev/null | grep twining-mcp || echo ""', { encoding: 'utf-8', timeout: 3000 }).trim();
   } catch {
     // twining-mcp not installed or not available
   }

@@ -78,6 +78,7 @@ MECHANISM_CATEGORIES: dict[str, frozenset[str]] = {
 
 _PREFIXES = (
     "mcp__plugin_twining_twining__twining_",
+    "mcp__twining__twining_",
     "twining__twining_",
     "twining_",
 )

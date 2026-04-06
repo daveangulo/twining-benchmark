@@ -931,15 +931,66 @@ export class SprintSimulationScenario extends BaseScenario {
     }
 
     const reworkRatio = Math.min(1, totalReworkedLines / totalAddedLines);
-    // Linear with 6x amplifier: spreads well in 0-5% range
-    // 0% → 100, 1% → 94, 2% → 88, 3% → 82, 5% → 70, 10% → 40
-    const score = Math.max(0, Math.round(100 - reworkRatio * 600));
+
+    // Sub-score 1: Line rework ratio (0-50)
+    // Exponential decay: 0%→50, 1%→42, 2%→35, 5%→19, 10%→3
+    const lineScore = Math.round(50 * Math.exp(-reworkRatio * 30));
+
+    // Sub-score 2: File churn (0-30)
+    // Count files touched by multiple sessions with removals (rework indicators)
+    let filesWithRework = 0;
+    const filesModifiedBySessions = new Map<string, number[]>(); // path → session indices that modified it
+    for (let i = 0; i < transcripts.length; i++) {
+      const t = transcripts[i];
+      if (!t) continue;
+      for (const fc of t.fileChanges) {
+        if (!filesModifiedBySessions.has(fc.path)) filesModifiedBySessions.set(fc.path, []);
+        filesModifiedBySessions.get(fc.path)!.push(i);
+      }
+    }
+    for (const [path, sessions] of filesModifiedBySessions) {
+      if (isTrivialLine(path, '') || sessions.length < 2) continue;
+      filesWithRework++;
+    }
+    const totalTrackedFiles = cumulativeFiles.size;
+    const churnRatio = totalTrackedFiles > 0 ? filesWithRework / totalTrackedFiles : 0;
+    // 0% churn→30, 20%→22, 40%→14, 60%→8, 80%→3
+    const churnScore = Math.round(30 * Math.exp(-churnRatio * 3));
+
+    // Sub-score 3: Late-session rework (0-20)
+    // Rework in sessions 8-12 (the integration/test phase) is more costly
+    let lateReworkedLines = 0;
+    let lateAddedLines = 0;
+    for (let i = Math.floor(transcripts.length * 0.67); i < transcripts.length; i++) {
+      const t = transcripts[i];
+      if (!t) continue;
+      for (const fc of t.fileChanges) {
+        const diff = fc.diff ?? '';
+        const removed = diff.split('\n')
+          .filter((line) => line.startsWith('-') && !line.startsWith('---'))
+          .map((line) => line.slice(1))
+          .filter((line) => !isTrivialLine(fc.path, line));
+        const added = diff.split('\n')
+          .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+          .map((line) => line.slice(1))
+          .filter((line) => !isTrivialLine(fc.path, line));
+        if (cumulativeFiles.has(fc.path)) {
+          lateReworkedLines += removed.length;
+        }
+        lateAddedLines += added.length;
+      }
+    }
+    const lateReworkRatio = lateAddedLines > 0 ? Math.min(1, lateReworkedLines / lateAddedLines) : 0;
+    // 0%→20, 2%→15, 5%→9, 10%→1
+    const lateScore = Math.round(20 * Math.exp(-lateReworkRatio * 30));
+
+    const score = Math.min(100, lineScore + churnScore + lateScore);
 
     return {
       value: score,
       confidence: 'medium',
       method: 'automated',
-      justification: `${totalReworkedLines} substantive lines reworked out of ${totalAddedLines} substantive lines added across ${transcripts.length} sessions. Rework ratio: ${(reworkRatio * 100).toFixed(1)}%.`,
+      justification: `${totalReworkedLines}/${totalAddedLines} lines reworked (${(reworkRatio * 100).toFixed(1)}%, ${lineScore}/50). ${filesWithRework}/${totalTrackedFiles} files churned (${churnScore}/30). Late-session rework: ${(lateReworkRatio * 100).toFixed(1)}% (${lateScore}/20).`,
     };
   }
 

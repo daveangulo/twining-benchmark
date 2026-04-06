@@ -231,42 +231,85 @@ export class ContextRecoveryScenario extends BaseScenario {
       };
     }
 
-    // Find time to first PRODUCTIVE action (file edit/write/bash), not coordination reads.
-    // Coordination tool calls (twining_*, reading coordination files) are context-gathering,
-    // not wasted time — they should not penalize the orientation score.
     const coordinationPattern = /twining_|coordination|context|handoff|investigation|finding|note/i;
+    const details: string[] = [];
 
-    let firstProductiveMs: number | null = null;
-    for (const tc of transcriptB.toolCalls) {
-      // Skip coordination tool calls
-      if (coordinationPattern.test(tc.toolName)) continue;
-      // Skip reads of coordination files
-      if (tc.toolName === 'Read') {
-        const fp = tc.parameters['file_path'] as string | undefined;
-        if (fp && coordinationPattern.test(fp)) continue;
-      }
-      // First non-coordination tool call = first productive action
-      if (tc.toolName === 'Edit' || tc.toolName === 'Write' || tc.toolName === 'Bash') {
-        // Use tool timestamp relative to session start if available
-        if (tc.timestamp && transcriptB.timing.startTime) {
-          firstProductiveMs = new Date(tc.timestamp).getTime() - new Date(transcriptB.timing.startTime).getTime();
+    // Sub-score 1: Orientation breadth (0-35)
+    // How many of Agent A's source files did Agent B read before first productive action?
+    const agentAFiles = new Set<string>();
+    const transcriptA = rawResults.transcripts[0];
+    if (transcriptA) {
+      for (const fc of transcriptA.fileChanges) {
+        if (fc.path.startsWith('src/') || fc.path.startsWith('tests/')) {
+          agentAFiles.add(fc.path);
         }
-        break;
       }
     }
 
-    // Fall back to timeToFirstActionMs if we couldn't compute productive time
-    const effectiveTime = firstProductiveMs ?? transcriptB.timing.timeToFirstActionMs;
+    let reachedFirstProductive = false;
+    const filesReadBeforeProductive = new Set<string>();
+    let coordinationReadsBeforeProductive = 0;
+    let firstProductiveMs: number | null = null;
 
-    // Linear scaling: 0s → 100, 120s → 0 (continuous, no step cliffs)
+    for (const tc of transcriptB.toolCalls) {
+      if (reachedFirstProductive) break;
+
+      // Track coordination reads
+      if (coordinationPattern.test(tc.toolName)) {
+        coordinationReadsBeforeProductive++;
+        continue;
+      }
+
+      // Track file reads
+      if (tc.toolName === 'Read' || tc.toolName === 'Grep' || tc.toolName === 'Glob') {
+        const fp = tc.parameters['file_path'] as string | undefined;
+        if (fp && coordinationPattern.test(fp)) {
+          coordinationReadsBeforeProductive++;
+          continue;
+        }
+        if (fp) filesReadBeforeProductive.add(fp);
+        continue;
+      }
+
+      // First productive action
+      if (tc.toolName === 'Edit' || tc.toolName === 'Write' || tc.toolName === 'Bash') {
+        reachedFirstProductive = true;
+        if (tc.timestamp && transcriptB.timing.startTime) {
+          firstProductiveMs = new Date(tc.timestamp).getTime() - new Date(transcriptB.timing.startTime).getTime();
+        }
+      }
+    }
+
+    // How many of A's files did B read?
+    const aFilesRead = [...filesReadBeforeProductive].filter(f => agentAFiles.has(f)).length;
+    const aFileRatio = agentAFiles.size > 0 ? aFilesRead / agentAFiles.size : 0;
+    const breadthScore = Math.round(Math.min(35, aFileRatio * 35));
+    details.push(`breadth: read ${aFilesRead}/${agentAFiles.size} of A's files (${breadthScore}/35)`);
+
+    // Sub-score 2: Orientation speed (0-30)
+    // Tighter scale: 0s→30, 30s→0 (actual range is 5-15s)
+    const effectiveTime = firstProductiveMs ?? transcriptB.timing.timeToFirstActionMs;
     const effectiveSec = effectiveTime / 1000;
-    const score = Math.round(Math.max(0, Math.min(100, 100 - (effectiveSec / 120) * 100)));
+    const speedScore = Math.round(Math.max(0, Math.min(30, 30 - (effectiveSec / 30) * 30)));
+    details.push(`speed: ${effectiveSec.toFixed(1)}s to first productive action (${speedScore}/30)`);
+
+    // Sub-score 3: Coordination tool usage (0-20)
+    // Did agent use coordination mechanisms to orient?
+    const coordScore = Math.min(20, coordinationReadsBeforeProductive * 5);
+    details.push(`coordination: ${coordinationReadsBeforeProductive} coord reads before productive (${coordScore}/20)`);
+
+    // Sub-score 4: Exploration depth (0-15)
+    // Total distinct files explored before first productive action
+    const explorationScore = Math.min(15, filesReadBeforeProductive.size * 3);
+    details.push(`exploration: ${filesReadBeforeProductive.size} files explored (${explorationScore}/15)`);
+
+    const score = Math.min(100, breadthScore + speedScore + coordScore + explorationScore);
 
     return {
       value: score,
       confidence: 'high',
       method: 'automated',
-      justification: `Agent B's time to first productive action: ${effectiveSec.toFixed(1)}s (coordination time excluded). Linear: 0s=100, 120s=0.`,
+      justification: details.join('. ') + '.',
     };
   }
 
@@ -377,15 +420,18 @@ export class ContextRecoveryScenario extends BaseScenario {
    */
   private scoreCompletion(rawResults: RawResults, groundTruth: ArchitecturalManifest): DimensionScore {
     const details: string[] = [];
-    let componentScore = 0;
 
-    // Check for each expected component in source files only (not docs/coordination)
+    // Collect all source diffs
     const sourceDiffs = rawResults.transcripts
       .flatMap((t) => t.fileChanges.filter((c) => c.path.startsWith('src/') || c.path.startsWith('tests/')))
       .map((c) => c.diff)
       .filter((d): d is string => d !== undefined)
       .join('\n');
 
+    const allFileChanges = rawResults.transcripts.flatMap((t) => t.fileChanges);
+
+    // Sub-score 1: Component presence (0-30)
+    let componentScore = 0;
     for (const decision of groundTruth.decisions) {
       const hasMatch = decision.expectedPatterns.some(
         (pattern) => new RegExp(pattern, 'i').test(sourceDiffs),
@@ -397,27 +443,58 @@ export class ContextRecoveryScenario extends BaseScenario {
         details.push(`${decision.id}: missing`);
       }
     }
-
     const componentRatio = componentScore / Math.max(groundTruth.decisions.length, 1);
+    const presenceScore = Math.round(componentRatio * 30);
+    details.push(`presence: ${componentScore}/${groundTruth.decisions.length} (${presenceScore}/30)`);
 
-    // Check if agents ran tests and completed
-    const completionBonus = rawResults.allSessionsCompleted ? 15 : 0;
+    // Sub-score 2: Code substance (0-25)
+    // Count substantive lines of source code produced (not trivial)
+    const addedLines = sourceDiffs.split('\n')
+      .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+      .map((line) => line.slice(1))
+      .filter((line) => line.trim().length > 5 && !/^\s*[{}()]\s*$/.test(line) && !/^\s*\/\//.test(line) && !/^\s*import\s/.test(line));
+    // Graduated: 0 lines→0, 25→10, 50→18, 100+→25
+    const substanceScore = Math.min(25, Math.round(25 * (1 - Math.exp(-addedLines.length / 50))));
+    details.push(`substance: ${addedLines.length} lines (${substanceScore}/25)`);
+
+    // Sub-score 3: Test depth (0-20)
+    // Count distinct test assertions/describes/its
+    const testDiffs = rawResults.transcripts
+      .flatMap((t) => t.fileChanges.filter((c) => c.path.includes('test')))
+      .map((c) => c.diff ?? '')
+      .join('\n');
+    const testAssertions = (testDiffs.match(/(?:expect|assert|it\(|test\(|describe\()/g) || []).length;
+    // Graduated: 0→0, 5→10, 10→16, 20+→20
+    const testDepthScore = Math.min(20, Math.round(20 * (1 - Math.exp(-testAssertions / 10))));
+    details.push(`test depth: ${testAssertions} assertions (${testDepthScore}/20)`);
+
+    // Sub-score 4: File coverage (0-15)
+    // How many distinct source files were created/modified?
+    const sourceFiles = new Set(allFileChanges
+      .filter((c) => c.path.startsWith('src/') || c.path.startsWith('tests/'))
+      .map((c) => c.path));
+    // Graduated: 1→3, 3→9, 5→13, 7+→15
+    const coverageScore = Math.min(15, Math.round(15 * (1 - Math.exp(-sourceFiles.size / 4))));
+    details.push(`file coverage: ${sourceFiles.size} files (${coverageScore}/15)`);
+
+    // Sub-score 5: Session completion + test execution (0-10)
+    const completionBonus = rawResults.allSessionsCompleted ? 5 : 0;
     const lastTranscript = rawResults.transcripts[rawResults.transcripts.length - 1];
     const ranTests = lastTranscript?.toolCalls.some(
       (tc) =>
         tc.toolName === 'Bash' &&
         /(?:test|vitest|jest|npm\s+test)/i.test(JSON.stringify(tc.parameters)),
     ) ?? false;
-    const testsBonus = ranTests ? 15 : 0;
+    const testsBonus = ranTests ? 5 : 0;
+    details.push(`completion: ${completionBonus}/5, tests: ${testsBonus}/5`);
 
-    // Component presence (70%) + all sessions completed (15%) + ran tests (15%)
-    const score = Math.round(componentRatio * 70 + completionBonus + testsBonus);
+    const score = Math.min(100, presenceScore + substanceScore + testDepthScore + coverageScore + completionBonus + testsBonus);
 
     return {
-      value: Math.min(100, score),
+      value: score,
       confidence: sourceDiffs.length > 0 ? 'high' : 'medium',
       method: 'automated',
-      justification: `${componentScore}/${groundTruth.decisions.length} components found (${Math.round(componentRatio * 70)}/70). Completed: ${completionBonus}/15. Tests: ${testsBonus}/15. ${details.join('; ')}.`,
+      justification: details.join('. ') + '.',
     };
   }
 
