@@ -1,5 +1,51 @@
 # Contributing to Twining Benchmark Harness
 
+Thanks for your interest in contributing! This guide covers setup, workflow, and conventions.
+
+## Prerequisites
+
+- Node.js >= 20
+- npm
+- Claude Code CLI (`claude`) with authentication
+
+## Setup
+
+```bash
+git clone https://github.com/daveangulo/twining-benchmark.git
+cd twining-benchmark
+npm ci
+npm run build
+npm test
+```
+
+## Development Workflow
+
+1. Fork the repo and create a branch from `main`
+2. Make your changes
+3. Run `npm test` — all tests must pass (812 tests, ~25s)
+4. Run `npm run build` — must compile cleanly
+5. Open a pull request against `main`
+
+## Cost Warning
+
+Running benchmarks costs real money (Claude API calls). A single scenario with 4 conditions and 5 iterations costs approximately $50-100. Always use `--dry-run` first to estimate costs.
+
+## Pull Request Checklist
+
+- [ ] Tests pass (`npm test`)
+- [ ] Build succeeds (`npm run build`)
+- [ ] Analysis tests pass (if Python code changed): `cd analysis && .venv/bin/python -m pytest`
+
+## Reporting Issues
+
+Use [GitHub Issues](https://github.com/daveangulo/twining-benchmark/issues) with the provided templates for bugs and feature requests.
+
+## License
+
+By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+
+---
+
 ## Architecture Overview
 
 The harness has four pluggable extension points. Each uses an abstract base class + registry pattern:
