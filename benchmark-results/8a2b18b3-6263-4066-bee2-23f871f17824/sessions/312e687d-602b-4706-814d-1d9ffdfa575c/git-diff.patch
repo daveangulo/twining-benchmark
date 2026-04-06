@@ -1,0 +1,493 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 591ef9a..8ea2e44 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -38,3 +38,16 @@ Write your updates below. There is no enforced format — use whatever structure
+ - The `EmailNotificationHandler` is a standalone handler that listens on the same EventBus events as `NotificationService`. Both can coexist — `NotificationService` handles in-app notifications, `EmailNotificationHandler` handles email.
+ - TypeScript compiles cleanly; all 85 tests pass (72 existing + 13 new).
+ 
++## Agent 3 — Webhook Notification Handler (Complete)
++
++**What changed:**
++- `src/notifications/webhook-handler.ts` — New `WebhookHandler` class that subscribes to `order:created` and `order:status-changed` events via EventBus. Includes a webhook registry where external URLs can be registered/unregistered for specific event types, with optional secrets for authentication. Uses a `WebhookTransport` interface for HTTP delivery (with `InMemoryWebhookTransport` for testing). Maintains a delivery log tracking success/failure of each dispatch.
++- `tests/notifications/webhook-handler.test.ts` — 17 tests covering registration/unregistration, selective delivery by event type, multi-webhook delivery, secret passing, delivery log tracking (success and failure), payload structure, and edge cases (no registrations, unregistered hooks).
++
++**Key decisions:**
++- Followed the exact same EventBus subscription pattern as `NotificationService` and `EmailNotificationHandler` — constructor takes EventBus + transport, `registerHandlers()` subscribes to events.
++- Used the `WebhookTransport` interface pattern (matching `EmailTransport`) so the handler is decoupled from actual HTTP delivery. `InMemoryWebhookTransport` is provided for testing.
++- Webhook payload separates `event` (type) and `timestamp` (ISO string) at the top level, with remaining event data in a `data` field — clean structure for external consumers.
++- Delivery log records success/failure, status codes, and errors for observability.
++- TypeScript compiles cleanly; all 102 tests pass (85 existing + 17 new).
++
+diff --git a/src/notifications/webhook-handler.ts b/src/notifications/webhook-handler.ts
+new file mode 100644
+index 0000000..b6818cc
+--- /dev/null
++++ b/src/notifications/webhook-handler.ts
+@@ -0,0 +1,218 @@
++/**
++ * Webhook notification handler — dispatches HTTP callbacks when order
++ * lifecycle events occur.
++ *
++ * Integrates with the EventBus-based notification architecture.
++ * See ARCHITECTURE.md for rationale.
++ *
++ * Depends on:
++ * - EventBus (event system) for receiving order lifecycle events
++ */
++
++import type { EventBus } from '../events/event-bus.js';
++import type {
++  AppEvent,
++  EventType,
++  OrderCreatedEvent,
++  OrderStatusChangedEvent,
++} from '../events/event-types.js';
++import { Logger } from '../utils/logger.js';
++
++export interface WebhookRegistration {
++  id: string;
++  url: string;
++  eventType: EventType;
++  secret?: string;
++}
++
++export interface WebhookDelivery {
++  webhookId: string;
++  url: string;
++  eventType: EventType;
++  payload: WebhookPayload;
++  success: boolean;
++  statusCode?: number;
++  error?: string;
++  deliveredAt: Date;
++}
++
++export interface WebhookPayload {
++  event: EventType;
++  timestamp: string;
++  data: Record<string, unknown>;
++}
++
++/**
++ * Interface for HTTP delivery — allows swapping in a real HTTP client
++ * in production or an in-memory recorder for testing.
++ */
++export interface WebhookTransport {
++  deliver(url: string, payload: WebhookPayload, secret?: string): Promise<{ success: boolean; statusCode?: number; error?: string }>;
++}
++
++/**
++ * In-memory transport that records deliveries. Useful for testing.
++ */
++export class InMemoryWebhookTransport implements WebhookTransport {
++  private deliveries: Array<{ url: string; payload: WebhookPayload; secret?: string }> = [];
++  private shouldFail = false;
++
++  async deliver(
++    url: string,
++    payload: WebhookPayload,
++    secret?: string,
++  ): Promise<{ success: boolean; statusCode?: number; error?: string }> {
++    this.deliveries.push({ url, payload, secret });
++    if (this.shouldFail) {
++      return { success: false, statusCode: 500, error: 'Internal Server Error' };
++    }
++    return { success: true, statusCode: 200 };
++  }
++
++  getDeliveries(): Array<{ url: string; payload: WebhookPayload; secret?: string }> {
++    return [...this.deliveries];
++  }
++
++  setShouldFail(fail: boolean): void {
++    this.shouldFail = fail;
++  }
++
++  clear(): void {
++    this.deliveries = [];
++  }
++}
++
++let nextWebhookId = 1;
++
++function generateWebhookId(): string {
++  return `wh-${String(nextWebhookId++).padStart(4, '0')}`;
++}
++
++export function resetWebhookIdCounter(): void {
++  nextWebhookId = 1;
++}
++
++export class WebhookHandler {
++  private logger = new Logger('WebhookHandler');
++  private registrations: Map<string, WebhookRegistration> = new Map();
++  private deliveryLog: WebhookDelivery[] = [];
++
++  constructor(
++    private eventBus: EventBus,
++    private transport: WebhookTransport,
++  ) {
++    this.registerHandlers();
++  }
++
++  /**
++   * Register event handlers via EventBus — same pattern as NotificationService
++   * and EmailNotificationHandler.
++   */
++  private registerHandlers(): void {
++    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
++      return this.dispatchWebhooks(event);
++    });
++
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
++      return this.dispatchWebhooks(event);
++    });
++  }
++
++  /**
++   * Register an external URL to receive webhook callbacks for a given event type.
++   */
++  registerWebhook(url: string, eventType: EventType, secret?: string): WebhookRegistration {
++    const registration: WebhookRegistration = {
++      id: generateWebhookId(),
++      url,
++      eventType,
++      secret,
++    };
++    this.registrations.set(registration.id, registration);
++    this.logger.info(`Webhook registered: ${registration.id} -> ${url} for ${eventType}`);
++    return registration;
++  }
++
++  /**
++   * Remove a webhook registration by ID.
++   */
++  unregisterWebhook(id: string): boolean {
++    const existed = this.registrations.delete(id);
++    if (existed) {
++      this.logger.info(`Webhook unregistered: ${id}`);
++    }
++    return existed;
++  }
++
++  /**
++   * Get all registered webhooks.
++   */
++  getRegistrations(): WebhookRegistration[] {
++    return [...this.registrations.values()];
++  }
++
++  /**
++   * Get registrations for a specific event type.
++   */
++  getRegistrationsForEvent(eventType: EventType): WebhookRegistration[] {
++    return [...this.registrations.values()].filter((r) => r.eventType === eventType);
++  }
++
++  /**
++   * Get the full delivery log.
++   */
++  getDeliveryLog(): WebhookDelivery[] {
++    return [...this.deliveryLog];
++  }
++
++  /**
++   * Clear delivery log (useful for testing).
++   */
++  clearDeliveryLog(): void {
++    this.deliveryLog = [];
++  }
++
++  /**
++   * Dispatch an event to all webhooks registered for that event type.
++   */
++  private async dispatchWebhooks(event: AppEvent): Promise<void> {
++    const matching = this.getRegistrationsForEvent(event.type);
++    if (matching.length === 0) {
++      return;
++    }
++
++    this.logger.info(`Dispatching ${event.type} to ${matching.length} webhook(s)`);
++
++    const payload = this.buildPayload(event);
++
++    for (const registration of matching) {
++      const result = await this.transport.deliver(registration.url, payload, registration.secret);
++
++      this.deliveryLog.push({
++        webhookId: registration.id,
++        url: registration.url,
++        eventType: event.type,
++        payload,
++        success: result.success,
++        statusCode: result.statusCode,
++        error: result.error,
++        deliveredAt: new Date(),
++      });
++
++      if (!result.success) {
++        this.logger.info(
++          `Webhook delivery failed for ${registration.id}: ${result.error ?? 'unknown error'}`,
++        );
++      }
++    }
++  }
++
++  private buildPayload(event: AppEvent): WebhookPayload {
++    const { type, timestamp, ...data } = event;
++    return {
++      event: type,
++      timestamp: timestamp.toISOString(),
++      data: data as Record<string, unknown>,
++    };
++  }
++}
+diff --git a/tests/notifications/webhook-handler.test.ts b/tests/notifications/webhook-handler.test.ts
+new file mode 100644
+index 0000000..c88862e
+--- /dev/null
++++ b/tests/notifications/webhook-handler.test.ts
+@@ -0,0 +1,242 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import {
++  WebhookHandler,
++  InMemoryWebhookTransport,
++  resetWebhookIdCounter,
++} from '../../src/notifications/webhook-handler.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++
++describe('WebhookHandler', () => {
++  let eventBus: EventBus;
++  let transport: InMemoryWebhookTransport;
++  let handler: WebhookHandler;
++
++  beforeEach(() => {
++    eventBus = new EventBus();
++    transport = new InMemoryWebhookTransport();
++    resetWebhookIdCounter();
++    handler = new WebhookHandler(eventBus, transport);
++  });
++
++  function makeOrderCreatedEvent(overrides?: Partial<OrderCreatedEvent>): OrderCreatedEvent {
++    return {
++      type: 'order:created',
++      order: {
++        id: 'order-1',
++        userId: 'user-1',
++        items: [
++          { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },
++        ],
++        total: 20,
++        status: 'pending',
++        createdAt: new Date('2026-01-01'),
++        updatedAt: new Date('2026-01-01'),
++      },
++      user: {
++        id: 'user-1',
++        name: 'Alice',
++        email: 'alice@example.com',
++        createdAt: new Date('2025-01-01'),
++      },
++      timestamp: new Date('2026-01-01T12:00:00Z'),
++      ...overrides,
++    };
++  }
++
++  function makeStatusChangedEvent(
++    overrides?: Partial<OrderStatusChangedEvent>,
++  ): OrderStatusChangedEvent {
++    return {
++      type: 'order:status-changed',
++      order: {
++        id: 'order-1',
++        userId: 'user-1',
++        items: [
++          { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },
++        ],
++        total: 20,
++        status: 'confirmed',
++        createdAt: new Date('2026-01-01'),
++        updatedAt: new Date('2026-01-01'),
++      },
++      previousStatus: 'pending',
++      newStatus: 'confirmed',
++      timestamp: new Date('2026-01-01T13:00:00Z'),
++      ...overrides,
++    };
++  }
++
++  // --- Registration ---
++
++  it('should register a webhook and return a registration object', () => {
++    const reg = handler.registerWebhook('https://example.com/hook', 'order:created');
++    expect(reg.id).toBe('wh-0001');
++    expect(reg.url).toBe('https://example.com/hook');
++    expect(reg.eventType).toBe('order:created');
++  });
++
++  it('should register a webhook with a secret', () => {
++    const reg = handler.registerWebhook('https://example.com/hook', 'order:created', 'my-secret');
++    expect(reg.secret).toBe('my-secret');
++  });
++
++  it('should list all registrations', () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++    handler.registerWebhook('https://b.com/hook', 'order:status-changed');
++    expect(handler.getRegistrations()).toHaveLength(2);
++  });
++
++  it('should list registrations filtered by event type', () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++    handler.registerWebhook('https://b.com/hook', 'order:status-changed');
++    handler.registerWebhook('https://c.com/hook', 'order:created');
++
++    const created = handler.getRegistrationsForEvent('order:created');
++    expect(created).toHaveLength(2);
++    expect(created.map((r) => r.url)).toEqual([
++      'https://a.com/hook',
++      'https://c.com/hook',
++    ]);
++  });
++
++  it('should unregister a webhook by ID', () => {
++    const reg = handler.registerWebhook('https://a.com/hook', 'order:created');
++    expect(handler.unregisterWebhook(reg.id)).toBe(true);
++    expect(handler.getRegistrations()).toHaveLength(0);
++  });
++
++  it('should return false when unregistering a non-existent webhook', () => {
++    expect(handler.unregisterWebhook('wh-9999')).toBe(false);
++  });
++
++  // --- Delivery on order:created ---
++
++  it('should deliver to registered webhooks on order:created', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const deliveries = transport.getDeliveries();
++    expect(deliveries).toHaveLength(1);
++    expect(deliveries[0].url).toBe('https://a.com/hook');
++    expect(deliveries[0].payload.event).toBe('order:created');
++    expect(deliveries[0].payload.timestamp).toBe('2026-01-01T12:00:00.000Z');
++    expect(deliveries[0].payload.data).toHaveProperty('order');
++    expect(deliveries[0].payload.data).toHaveProperty('user');
++  });
++
++  it('should pass secret to transport when delivering', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created', 'secret-123');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const deliveries = transport.getDeliveries();
++    expect(deliveries[0].secret).toBe('secret-123');
++  });
++
++  // --- Delivery on order:status-changed ---
++
++  it('should deliver to registered webhooks on order:status-changed', async () => {
++    handler.registerWebhook('https://b.com/status', 'order:status-changed');
++
++    await eventBus.emit(makeStatusChangedEvent());
++
++    const deliveries = transport.getDeliveries();
++    expect(deliveries).toHaveLength(1);
++    expect(deliveries[0].url).toBe('https://b.com/status');
++    expect(deliveries[0].payload.event).toBe('order:status-changed');
++    expect(deliveries[0].payload.data).toHaveProperty('previousStatus', 'pending');
++    expect(deliveries[0].payload.data).toHaveProperty('newStatus', 'confirmed');
++  });
++
++  // --- Selective delivery ---
++
++  it('should only deliver to webhooks matching the event type', async () => {
++    handler.registerWebhook('https://a.com/created', 'order:created');
++    handler.registerWebhook('https://b.com/status', 'order:status-changed');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const deliveries = transport.getDeliveries();
++    expect(deliveries).toHaveLength(1);
++    expect(deliveries[0].url).toBe('https://a.com/created');
++  });
++
++  it('should deliver to multiple webhooks for the same event type', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++    handler.registerWebhook('https://b.com/hook', 'order:created');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const deliveries = transport.getDeliveries();
++    expect(deliveries).toHaveLength(2);
++    expect(deliveries.map((d) => d.url)).toEqual([
++      'https://a.com/hook',
++      'https://b.com/hook',
++    ]);
++  });
++
++  it('should not deliver when no webhooks are registered', async () => {
++    await eventBus.emit(makeOrderCreatedEvent());
++    expect(transport.getDeliveries()).toHaveLength(0);
++  });
++
++  it('should not deliver to unregistered webhooks', async () => {
++    const reg = handler.registerWebhook('https://a.com/hook', 'order:created');
++    handler.unregisterWebhook(reg.id);
++
++    await eventBus.emit(makeOrderCreatedEvent());
++    expect(transport.getDeliveries()).toHaveLength(0);
++  });
++
++  // --- Delivery log ---
++
++  it('should record successful deliveries in the delivery log', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const log = handler.getDeliveryLog();
++    expect(log).toHaveLength(1);
++    expect(log[0].webhookId).toBe('wh-0001');
++    expect(log[0].success).toBe(true);
++    expect(log[0].statusCode).toBe(200);
++  });
++
++  it('should record failed deliveries in the delivery log', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++    transport.setShouldFail(true);
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const log = handler.getDeliveryLog();
++    expect(log).toHaveLength(1);
++    expect(log[0].success).toBe(false);
++    expect(log[0].statusCode).toBe(500);
++    expect(log[0].error).toBe('Internal Server Error');
++  });
++
++  it('should clear the delivery log', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    handler.clearDeliveryLog();
++    expect(handler.getDeliveryLog()).toHaveLength(0);
++  });
++
++  // --- Payload structure ---
++
++  it('should build payload with event type, ISO timestamp, and data without type/timestamp', async () => {
++    handler.registerWebhook('https://a.com/hook', 'order:created');
++
++    await eventBus.emit(makeOrderCreatedEvent());
++
++    const payload = transport.getDeliveries()[0].payload;
++    expect(payload.event).toBe('order:created');
++    expect(payload.timestamp).toBe('2026-01-01T12:00:00.000Z');
++    // data should not include type or timestamp (they're top-level)
++    expect(payload.data).not.toHaveProperty('type');
++    expect(payload.data).not.toHaveProperty('timestamp');
++  });
++});

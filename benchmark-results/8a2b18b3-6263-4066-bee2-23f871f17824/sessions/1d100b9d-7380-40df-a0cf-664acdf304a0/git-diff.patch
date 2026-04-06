@@ -1,0 +1,501 @@
+diff --git a/src/notifications/webhook-handler.ts b/src/notifications/webhook-handler.ts
+new file mode 100644
+index 0000000..39e08cb
+--- /dev/null
++++ b/src/notifications/webhook-handler.ts
+@@ -0,0 +1,214 @@
++/**
++ * Webhook notification handler — dispatches HTTP callbacks to registered
++ * URLs when order lifecycle events occur.
++ *
++ * Integrates with the existing notification architecture using BOTH patterns:
++ * - EventBus subscription for order:created events
++ * - CallbackRegistry for order:status-changed events
++ *
++ * This mirrors how NotificationService and EmailNotificationHandler register
++ * their handlers (see notification.service.ts for the mixed-pattern discussion).
++ *
++ * Depends on:
++ * - EventBus (event system) for order creation events
++ * - CallbackRegistry (direct callbacks) for status change events
++ */
++
++import type { EventBus } from '../events/event-bus.js';
++import type { EventType, OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
++import { statusChangeCallbacks } from '../utils/callback-registry.js';
++import { Logger } from '../utils/logger.js';
++
++export interface WebhookRegistration {
++  id: string;
++  url: string;
++  eventType: EventType;
++  createdAt: Date;
++}
++
++export interface WebhookDelivery {
++  id: string;
++  webhookId: string;
++  url: string;
++  eventType: EventType;
++  payload: Record<string, unknown>;
++  status: 'success' | 'failure';
++  deliveredAt: Date;
++}
++
++export type WebhookSender = (url: string, payload: Record<string, unknown>) => Promise<boolean>;
++
++/**
++ * Default sender that performs an HTTP POST (stubbed for this demo).
++ * In production this would use fetch/axios; here it always succeeds so
++ * the handler can be tested without network dependencies.
++ */
++const defaultSender: WebhookSender = async () => true;
++
++let nextWebhookId = 1;
++let nextDeliveryId = 1;
++
++function generateWebhookId(): string {
++  return `webhook-${String(nextWebhookId++).padStart(4, '0')}`;
++}
++
++function generateDeliveryId(): string {
++  return `delivery-${String(nextDeliveryId++).padStart(4, '0')}`;
++}
++
++export function resetWebhookIdCounters(): void {
++  nextWebhookId = 1;
++  nextDeliveryId = 1;
++}
++
++export class WebhookHandler {
++  private logger = new Logger('WebhookHandler');
++  private registrations: WebhookRegistration[] = [];
++  private deliveries: WebhookDelivery[] = [];
++  private sender: WebhookSender;
++
++  constructor(private eventBus: EventBus, sender?: WebhookSender) {
++    this.sender = sender ?? defaultSender;
++    this.registerHandlers();
++  }
++
++  // ---------------------------------------------------------------------------
++  // Webhook registry
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register an external URL to receive callbacks for a specific event type.
++   * Returns an unregister function.
++   */
++  registerWebhook(url: string, eventType: EventType): WebhookRegistration {
++    const registration: WebhookRegistration = {
++      id: generateWebhookId(),
++      url,
++      eventType,
++      createdAt: new Date(),
++    };
++    this.registrations.push(registration);
++    this.logger.info(`Webhook registered: ${registration.id} -> ${url} for ${eventType}`);
++    return registration;
++  }
++
++  /**
++   * Remove a webhook registration by ID.
++   */
++  unregisterWebhook(id: string): boolean {
++    const index = this.registrations.findIndex((r) => r.id === id);
++    if (index >= 0) {
++      this.registrations.splice(index, 1);
++      this.logger.info(`Webhook unregistered: ${id}`);
++      return true;
++    }
++    return false;
++  }
++
++  /**
++   * Get all registered webhooks.
++   */
++  getRegistrations(): WebhookRegistration[] {
++    return [...this.registrations];
++  }
++
++  /**
++   * Get registrations for a specific event type.
++   */
++  getRegistrationsForEvent(eventType: EventType): WebhookRegistration[] {
++    return this.registrations.filter((r) => r.eventType === eventType);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Delivery log
++  // ---------------------------------------------------------------------------
++
++  /** Get all delivery records. */
++  getDeliveries(): WebhookDelivery[] {
++    return [...this.deliveries];
++  }
++
++  /** Get deliveries for a specific webhook. */
++  getDeliveriesForWebhook(webhookId: string): WebhookDelivery[] {
++    return this.deliveries.filter((d) => d.webhookId === webhookId);
++  }
++
++  /** Get the count of deliveries. */
++  getDeliveryCount(): number {
++    return this.deliveries.length;
++  }
++
++  /** Clear all registrations and deliveries (useful for testing). */
++  clear(): void {
++    this.registrations = [];
++    this.deliveries = [];
++  }
++
++  // ---------------------------------------------------------------------------
++  // Event handlers (dual-pattern)
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register event handlers following the existing dual-pattern approach.
++   */
++  private registerHandlers(): void {
++    // Pattern 1: EventBus subscription for order creation
++    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
++      this.dispatchWebhooks('order:created', {
++        type: event.type,
++        orderId: event.order.id,
++        userId: event.order.userId,
++        items: event.order.items,
++        total: event.order.total,
++        status: event.order.status,
++        timestamp: event.timestamp.toISOString(),
++      });
++    });
++
++    // Pattern 2: CallbackRegistry for status changes
++    statusChangeCallbacks.register((event) => {
++      this.dispatchWebhooks('order:status-changed', {
++        type: event.type,
++        orderId: event.order.id,
++        userId: event.order.userId,
++        previousStatus: event.previousStatus,
++        newStatus: event.newStatus,
++        timestamp: event.timestamp.toISOString(),
++      });
++    });
++  }
++
++  /**
++   * Dispatch payloads to all webhooks registered for the given event type.
++   */
++  private async dispatchWebhooks(
++    eventType: EventType,
++    payload: Record<string, unknown>,
++  ): Promise<void> {
++    const targets = this.registrations.filter((r) => r.eventType === eventType);
++
++    for (const target of targets) {
++      let status: 'success' | 'failure' = 'failure';
++      try {
++        const ok = await this.sender(target.url, payload);
++        status = ok ? 'success' : 'failure';
++      } catch {
++        status = 'failure';
++      }
++
++      const delivery: WebhookDelivery = {
++        id: generateDeliveryId(),
++        webhookId: target.id,
++        url: target.url,
++        eventType,
++        payload,
++        status,
++        deliveredAt: new Date(),
++      };
++      this.deliveries.push(delivery);
++      this.logger.info(
++        `Webhook delivered: ${delivery.id} to ${target.url} (${status})`,
++      );
++    }
++  }
++}
+diff --git a/tests/services/webhook-handler.test.ts b/tests/services/webhook-handler.test.ts
+new file mode 100644
+index 0000000..b6da356
+--- /dev/null
++++ b/tests/services/webhook-handler.test.ts
+@@ -0,0 +1,275 @@
++import { describe, it, expect, beforeEach, vi } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import {
++  WebhookHandler,
++  resetWebhookIdCounters,
++  type WebhookSender,
++} from '../../src/notifications/webhook-handler.js';
++import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++
++function makeOrderCreatedEvent(overrides?: Partial<OrderCreatedEvent>): OrderCreatedEvent {
++  return {
++    type: 'order:created',
++    order: {
++      id: 'order-1',
++      userId: 'user-1',
++      items: [{ productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 }],
++      total: 20,
++      status: 'pending',
++      createdAt: new Date('2026-01-01'),
++      updatedAt: new Date('2026-01-01'),
++    },
++    user: {
++      id: 'user-1',
++      name: 'Alice',
++      email: 'alice@example.com',
++      role: 'member',
++      createdAt: new Date('2026-01-01'),
++      updatedAt: new Date('2026-01-01'),
++    },
++    timestamp: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++function makeStatusChangedEvent(
++  overrides: Partial<OrderStatusChangedEvent> & { previousStatus: string; newStatus: string },
++): OrderStatusChangedEvent {
++  return {
++    type: 'order:status-changed',
++    order: {
++      id: 'order-1',
++      userId: 'user-1',
++      items: [],
++      total: 20,
++      status: overrides.newStatus as OrderStatusChangedEvent['order']['status'],
++      createdAt: new Date('2026-01-01'),
++      updatedAt: new Date('2026-01-01'),
++    },
++    previousStatus: overrides.previousStatus,
++    newStatus: overrides.newStatus,
++    timestamp: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++describe('WebhookHandler', () => {
++  let eventBus: EventBus;
++  let sender: WebhookSender;
++  let handler: WebhookHandler;
++
++  beforeEach(() => {
++    eventBus = new EventBus();
++    statusChangeCallbacks.clear();
++    sender = vi.fn().mockResolvedValue(true);
++    handler = new WebhookHandler(eventBus, sender);
++    resetWebhookIdCounters();
++  });
++
++  // ---------------------------------------------------------------------------
++  // Registry
++  // ---------------------------------------------------------------------------
++  describe('webhook registry', () => {
++    it('should register a webhook and return its registration', () => {
++      const reg = handler.registerWebhook('https://example.com/hook', 'order:created');
++
++      expect(reg.url).toBe('https://example.com/hook');
++      expect(reg.eventType).toBe('order:created');
++      expect(reg.id).toBeDefined();
++    });
++
++    it('should list all registrations', () => {
++      handler.registerWebhook('https://a.com', 'order:created');
++      handler.registerWebhook('https://b.com', 'order:status-changed');
++
++      expect(handler.getRegistrations()).toHaveLength(2);
++    });
++
++    it('should filter registrations by event type', () => {
++      handler.registerWebhook('https://a.com', 'order:created');
++      handler.registerWebhook('https://b.com', 'order:status-changed');
++      handler.registerWebhook('https://c.com', 'order:created');
++
++      expect(handler.getRegistrationsForEvent('order:created')).toHaveLength(2);
++      expect(handler.getRegistrationsForEvent('order:status-changed')).toHaveLength(1);
++    });
++
++    it('should unregister a webhook by ID', () => {
++      const reg = handler.registerWebhook('https://a.com', 'order:created');
++      expect(handler.unregisterWebhook(reg.id)).toBe(true);
++      expect(handler.getRegistrations()).toHaveLength(0);
++    });
++
++    it('should return false when unregistering a non-existent webhook', () => {
++      expect(handler.unregisterWebhook('webhook-9999')).toBe(false);
++    });
++  });
++
++  // ---------------------------------------------------------------------------
++  // order:created dispatch (EventBus pattern)
++  // ---------------------------------------------------------------------------
++  describe('order:created webhook dispatch', () => {
++    it('should dispatch to registered webhooks on order created', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      expect(sender).toHaveBeenCalledOnce();
++      expect(sender).toHaveBeenCalledWith(
++        'https://a.com/hook',
++        expect.objectContaining({
++          type: 'order:created',
++          orderId: 'order-1',
++          total: 20,
++        }),
++      );
++    });
++
++    it('should dispatch to multiple webhooks for the same event', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++      handler.registerWebhook('https://b.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      expect(sender).toHaveBeenCalledTimes(2);
++    });
++
++    it('should not dispatch to webhooks registered for other event types', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:status-changed');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      expect(sender).not.toHaveBeenCalled();
++    });
++
++    it('should record delivery on successful dispatch', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      const deliveries = handler.getDeliveries();
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.status).toBe('success');
++      expect(deliveries[0]?.url).toBe('https://a.com/hook');
++      expect(deliveries[0]?.eventType).toBe('order:created');
++    });
++
++    it('should include order details in the payload', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      const delivery = handler.getDeliveries()[0]!;
++      expect(delivery.payload).toMatchObject({
++        type: 'order:created',
++        orderId: 'order-1',
++        userId: 'user-1',
++        total: 20,
++        status: 'pending',
++      });
++      expect(delivery.payload['items']).toBeDefined();
++    });
++  });
++
++  // ---------------------------------------------------------------------------
++  // order:status-changed dispatch (CallbackRegistry pattern)
++  // ---------------------------------------------------------------------------
++  describe('order:status-changed webhook dispatch', () => {
++    it('should dispatch to registered webhooks on status change', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:status-changed');
++
++      statusChangeCallbacks.notify(
++        makeStatusChangedEvent({ previousStatus: 'pending', newStatus: 'confirmed' }),
++      );
++
++      // dispatchWebhooks is async; give it a tick to resolve
++      await new Promise((r) => setTimeout(r, 0));
++
++      expect(sender).toHaveBeenCalledOnce();
++      expect(sender).toHaveBeenCalledWith(
++        'https://a.com/hook',
++        expect.objectContaining({
++          type: 'order:status-changed',
++          orderId: 'order-1',
++          previousStatus: 'pending',
++          newStatus: 'confirmed',
++        }),
++      );
++    });
++
++    it('should record delivery for status change webhooks', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:status-changed');
++
++      statusChangeCallbacks.notify(
++        makeStatusChangedEvent({ previousStatus: 'pending', newStatus: 'confirmed' }),
++      );
++
++      await new Promise((r) => setTimeout(r, 0));
++
++      const deliveries = handler.getDeliveries();
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.status).toBe('success');
++      expect(deliveries[0]?.eventType).toBe('order:status-changed');
++    });
++  });
++
++  // ---------------------------------------------------------------------------
++  // Failure handling
++  // ---------------------------------------------------------------------------
++  describe('delivery failure handling', () => {
++    it('should record failure when sender returns false', async () => {
++      (sender as ReturnType<typeof vi.fn>).mockResolvedValue(false);
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      const deliveries = handler.getDeliveries();
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.status).toBe('failure');
++    });
++
++    it('should record failure when sender throws', async () => {
++      (sender as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('network error'));
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      const deliveries = handler.getDeliveries();
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.status).toBe('failure');
++    });
++  });
++
++  // ---------------------------------------------------------------------------
++  // Delivery management
++  // ---------------------------------------------------------------------------
++  describe('delivery management', () => {
++    it('should count deliveries', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++
++      expect(handler.getDeliveryCount()).toBe(0);
++      await eventBus.emit(makeOrderCreatedEvent());
++      expect(handler.getDeliveryCount()).toBe(1);
++    });
++
++    it('should filter deliveries by webhook ID', async () => {
++      const reg = handler.registerWebhook('https://a.com/hook', 'order:created');
++      handler.registerWebhook('https://b.com/hook', 'order:created');
++
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      expect(handler.getDeliveriesForWebhook(reg.id)).toHaveLength(1);
++    });
++
++    it('should clear all data', async () => {
++      handler.registerWebhook('https://a.com/hook', 'order:created');
++      await eventBus.emit(makeOrderCreatedEvent());
++
++      handler.clear();
++
++      expect(handler.getRegistrations()).toHaveLength(0);
++      expect(handler.getDeliveries()).toHaveLength(0);
++    });
++  });
++});

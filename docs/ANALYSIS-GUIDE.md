@@ -187,6 +187,7 @@ All invalid runs archived to `benchmark-results/.archived-invalid/` (50 runs). V
 | **73972189** | Mar 30 | sprint-simulation | all 4 | 3 | Rescored with current scorers |
 | **d18ab582** | Mar 31 | sprint-simulation | all 4 | 3 | Rescored with current scorers |
 | **5ab87a48** | Apr 3 | context-recovery, multi-session-build | all 4 | 5 | Rescued from interrupted run (status=running but 2 scenarios complete) |
+| **8a2b18b3** | Apr 5 | architecture-cascade | all 4 | 5 | Post all fixes, completed |
 | **16a2e4e1** | Mar 28 | sprint-simulation | baseline, shared-markdown | 3 | Pre-bddefdf but 0 Twining contamination; twining-lite/full-twining removed |
 
 ### Archived Run Assessment
@@ -195,35 +196,37 @@ Pre-bddefdf runs were checked for contamination. Run 9be7a749 had 168/215 Twinin
 
 ## Pooled Results (All Valid Data)
 
-**7 runs, 5 scenarios, n=31-36 per condition (unbalanced)**
+**8 runs, 6 scenarios, n=36-41 per condition (unbalanced)**
 
 | Condition | N | Mean | Std | Lift | Hedges' g | p-value | Sig |
 |-----------|---|------|-----|------|-----------|---------|-----|
-| twining-lite | 36 | 77.2 | 15.5 | +10.8 | +0.65 (medium) | <0.05 | YES * |
-| full-twining | 31 | 77.2 | 11.8 | +10.7 | +0.70 (medium) | <0.05 | YES * |
-| shared-markdown | 34 | 70.4 | 22.1 | +4.0 | +0.20 (negligible) | NS | no |
-| baseline | 34 | 66.5 | 17.4 | — | — | — | — |
+| twining-lite | 41 | 75.8 | 15.1 | +10.3 | +0.65 (medium) | <0.05 | YES * |
+| full-twining | 36 | 74.5 | 13.7 | +9.0 | +0.59 (medium) | NS | no (below MDES) |
+| shared-markdown | 39 | 69.1 | 21.7 | +3.7 | +0.19 (negligible) | NS | no |
+| baseline | 39 | 65.5 | 16.5 | — | — | — | — |
 
-**MDES at n~30: d≥0.69** — sufficient to detect medium effects.
+**MDES at n~40: d≥0.64** — sufficient to detect medium effects.
 
-**full-twining vs twining-lite**: delta=0.0, effectively tied — not significantly different.
+**full-twining vs twining-lite**: delta=1.3, not significantly different.
 
 ### Per-Scenario Breakdown
 
 | Scenario | N/cond | baseline | shared-md | twining-lite | full-twining |
 |----------|--------|----------|-----------|--------------|--------------|
-| sprint-simulation | 11-16 | 70.5 | 77.2 | 81.5 | 79.5 |
+| sprint-simulation | 11-16 | 70.5 | 77.2 | 81.4 | 79.5 |
+| architecture-cascade | 5 | 58.9 | 60.3 | 65.6 | 58.1 |
 | evolving-requirements | 5 | 69.2 | 66.9 | 67.5 | 95.9 |
-| conflict-resolution | 5 | 55.6 | 43.6 | 82.2 | 80.4 |
-| context-recovery | 5 | 60.1 | 54.3 | 65.5 | 66.6 |
+| conflict-resolution | 5 | 55.6 | 45.8 | 82.2 | 80.4 |
+| context-recovery | 5 | 60.1 | 54.3 | 65.5 | 66.5 |
 | multi-session-build | 5 | 89.2 | 96.4 | 91.5 | 85.0 |
 
 ## Research Findings (Established)
 
-1. **Coordination tools produce a statistically significant effect across 5 scenarios** — full-twining g=0.70, twining-lite g=0.65, both p<0.05
-2. **Context recovery remains the dominant differentiator** in sprint-simulation: baseline 34-41 vs coordination 64-72, nearly 2x
-3. **Full-twining and twining-lite are effectively tied** (both 77.2 composite) — the lite toolset captures the full coordination benefit
-4. **Shared-markdown provides small but non-significant aggregate benefit** (g=0.20, NS) — helps in sprint-sim but hurts in conflict-resolution
+1. **Twining-lite produces a statistically significant effect across 6 scenarios** — g=0.65, adequately powered (power=0.81)
+2. **Full-twining shows a medium effect** (g=0.59) but falls just below MDES at current sample size — likely significant with more data
+3. **Context recovery remains the dominant differentiator** in sprint-simulation: baseline 34-41 vs coordination 64-72, nearly 2x
+4. **Full-twining and twining-lite are not significantly different** (delta=1.3) — the lite toolset captures the coordination benefit
+5. **Shared-markdown provides small non-significant aggregate benefit** (g=0.19, NS) — helps in sprint-sim but hurts in conflict-resolution
 5. **The effect generalizes across scenario types**: sequential handoff, requirement evolution, conflict resolution, context recovery all show coordination advantage
 6. **The core value is in structured context assembly and decision recording**, not heavier lifecycle processes (graph building, verification gates, etc.)
 
