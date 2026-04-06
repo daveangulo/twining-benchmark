@@ -105,7 +105,7 @@ export function captureEnvironment(): RunEnvironment {
 
   let twiningMcpVersion = '';
   try {
-    twiningMcpVersion = execSync('npm list twining-mcp --depth=0 2>/dev/null | grep twining-mcp || echo ""', { encoding: 'utf-8', timeout: 3000 }).trim();
+    twiningMcpVersion = execSync('twining-mcp --version', { encoding: 'utf-8', timeout: 5000 }).trim();
   } catch {
     // twining-mcp not installed or not available
   }
