@@ -1,0 +1,228 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 9c9b39a..0bc18df 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -492,3 +492,38 @@ The user preferences system (built in Session 3 by Agent 3) was designed with an
+ - **253 tests pass** (223 previous + 30 new multi-channel preference tests)
+ - **Compilation clean** (tsc --noEmit succeeds)
+ 
++---
++
++## Agent 10 — Notification Delivery Ordering Fix
++
++### Status: COMPLETE
++
++### What I Did
++1. **Added dispatch queue to `src/services/notification.service.ts`** — The `dispatch()` method now chains onto a `dispatchQueue` promise, ensuring all notification dispatches are serialized in FIFO order. The actual dispatch logic was moved to a new `processDispatch()` method.
++
++### Root Cause
++The `dispatch()` method was `async` with no serialization. When multiple events were emitted concurrently (e.g., `order:created` and `order:status-changed` fired without awaiting between them), the async `dispatch()` calls would race. If an adapter's `send()` was slower for the first notification (e.g., due to retries), the second notification could complete first — causing "payment confirmed" to arrive before "order placed."
++
++### Fix
++Added a promise-chain queue (`dispatchQueue`) to the `NotificationService`:
++- `dispatch()` chains each call onto the queue, so concurrent dispatches execute sequentially in call order
++- Errors in one dispatch don't block subsequent dispatches (`task.catch(() => {})` on the queue)
++- The returned promise still resolves/rejects for the individual dispatch, so callers can still handle errors
++
++### Tests Added
++2 new tests in `tests/services/notification.service.test.ts`:
++- **"should deliver notifications in order even when adapter is slow for first notification"** — Uses a custom adapter that blocks on the first `send()` call. Emits both events concurrently, resolves the slow call after both are queued, and verifies `order_confirmation` arrives before `order_status_update`.
++- **"should preserve ordering across rapid sequential events"** — Fires events without awaiting individually and verifies ordering is preserved.
++
++### Key Decisions
++- **Queue in NotificationService, not EventBus** — The EventBus is a general-purpose pub/sub system. Ordering is a notification-specific concern, so the fix belongs in `NotificationService.dispatch()`.
++- **Promise chain, not explicit queue data structure** — Minimal approach: each dispatch chains onto the previous promise. No new data structures or dependencies needed.
++- **Error isolation** — `this.dispatchQueue = task.catch(() => {})` ensures a failed dispatch doesn't block the queue, while the caller still gets the error from the returned `task` promise.
++
++### Key Files
++- `src/services/notification.service.ts` — Added `dispatchQueue`, split `dispatch()` into `dispatch()` + `processDispatch()`
++- `tests/services/notification.service.test.ts` — 2 new ordering tests
++
++### Test Results
++- **255 tests pass** (253 previous + 2 new ordering tests)
++
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index eb5975d..2ea298f 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -50,6 +50,7 @@ export class NotificationService {
+   private adapters: NotificationAdapter[] = [];
+   private preferencesService: PreferencesService | null = null;
+   private historyService: NotificationHistoryService | null = null;
++  private dispatchQueue: Promise<void> = Promise.resolve();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerHandlers();
+@@ -139,10 +140,22 @@ export class NotificationService {
+ 
+   /**
+    * Dispatch a notification payload through all registered adapters.
++   * Queues dispatches to guarantee FIFO ordering — concurrent calls are serialized
++   * so notifications are delivered in the order they were triggered.
++   */
++  private dispatch(payload: NotificationPayload): Promise<void> {
++    const task = this.dispatchQueue.then(() => this.processDispatch(payload));
++    // Prevent a failed dispatch from blocking subsequent dispatches
++    this.dispatchQueue = task.catch(() => {});
++    return task;
++  }
++
++  /**
++   * Process a single notification dispatch through all registered adapters.
+    * Checks user preferences per channel before sending (if PreferencesService is set).
+    * If no adapters are registered, stores the notification with channel 'email' as a fallback record.
+    */
+-  private async dispatch(payload: NotificationPayload): Promise<void> {
++  private async processDispatch(payload: NotificationPayload): Promise<void> {
+     const userId = payload.metadata?.['userId'] as string | undefined;
+ 
+     if (this.adapters.length === 0) {
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 67e9dfc..ee44806 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,6 +5,8 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload, NotificationResult, NotificationChannel } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -343,4 +345,135 @@ describe('NotificationService', () => {
+       expect(notifications[0]?.status).toBe('sent');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in order even when adapter is slow for first notification', async () => {
++      // Create an adapter with controllable delay to simulate slow delivery
++      const deliveryLog: string[] = [];
++      let firstCallResolve: (() => void) | null = null;
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          if (deliveryLog.length === 0) {
++            // First notification: delay delivery to simulate slow send
++            await new Promise<void>((resolve) => {
++              firstCallResolve = resolve;
++            });
++          }
++          deliveryLog.push(payload.type);
++          return { success: true, channel: 'email' };
++        },
++      };
++
++      service.registerAdapter(slowAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit both events concurrently (don't await individually)
++      const p1 = eventBus.emit(orderCreatedEvent);
++      const p2 = eventBus.emit(statusChangedEvent);
++
++      // Resolve the slow first adapter call after both events have been emitted
++      // Use a microtask to ensure both dispatches have been queued
++      await new Promise<void>((r) => setTimeout(r, 10));
++      firstCallResolve!();
++
++      await Promise.all([p1, p2]);
++
++      // The dispatch queue should guarantee order: order_confirmation before order_status_update
++      expect(deliveryLog).toEqual(['order_confirmation', 'order_status_update']);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++
++    it('should preserve ordering across rapid sequential events', async () => {
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire events without awaiting — simulates rapid successive events
++      const p1 = eventBus.emit(orderCreatedEvent);
++      const p2 = eventBus.emit(statusChangedEvent);
++      await Promise.all([p1, p2]);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++  });
+ });

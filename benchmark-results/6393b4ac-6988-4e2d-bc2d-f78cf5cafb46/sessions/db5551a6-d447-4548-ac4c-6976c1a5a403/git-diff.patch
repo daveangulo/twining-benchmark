@@ -1,0 +1,571 @@
+diff --git a/src/index.ts b/src/index.ts
+index 8e5200f..89bce52 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -55,6 +55,17 @@ export type {
+   NotificationResult,
+ } from './models/notification.js';
+ 
++// User Preferences
++export type {
++  UserNotificationPreferences,
++  EmailPreferences,
++  EmailFrequency,
++  UpdateEmailPreferencesInput,
++} from './models/user-preferences.js';
++export { defaultEmailPreferences } from './models/user-preferences.js';
++export { PreferencesRepository } from './repositories/preferences.repository.js';
++export { PreferencesService } from './services/preferences.service.js';
++
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter, InMemoryTransport, FailingTransport } from './adapters/email.adapter.js';
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+new file mode 100644
+index 0000000..f54b16c
+--- /dev/null
++++ b/src/models/user-preferences.ts
+@@ -0,0 +1,62 @@
++/**
++ * User notification preferences model.
++ *
++ * Controls how and when a user receives notifications.
++ * Currently focused on email settings; designed to accommodate
++ * additional channels in the future.
++ */
++
++import type { NotificationType } from './notification.js';
++
++/**
++ * How frequently email notifications are delivered.
++ * - 'immediate': sent as events occur
++ * - 'daily-digest': batched into a daily summary
++ * - 'weekly-digest': batched into a weekly summary
++ */
++export type EmailFrequency = 'immediate' | 'daily-digest' | 'weekly-digest';
++
++/**
++ * Email-specific notification preferences.
++ */
++export interface EmailPreferences {
++  enabled: boolean;
++  frequency: EmailFrequency;
++  categorySubscriptions: Record<NotificationType, boolean>;
++}
++
++/**
++ * Full user notification preferences.
++ */
++export interface UserNotificationPreferences {
++  id: string;
++  userId: string;
++  email: EmailPreferences;
++  createdAt: Date;
++  updatedAt: Date;
++}
++
++/**
++ * Input for updating email preferences. All fields optional.
++ */
++export interface UpdateEmailPreferencesInput {
++  enabled?: boolean;
++  frequency?: EmailFrequency;
++  categorySubscriptions?: Partial<Record<NotificationType, boolean>>;
++}
++
++/**
++ * Returns default email preferences with all categories enabled and immediate delivery.
++ */
++export function defaultEmailPreferences(): EmailPreferences {
++  return {
++    enabled: true,
++    frequency: 'immediate',
++    categorySubscriptions: {
++      'order:confirmation': true,
++      'order:status-update': true,
++      'user:welcome': true,
++      'user:profile-updated': true,
++    },
++  };
++}
+diff --git a/src/repositories/preferences.repository.ts b/src/repositories/preferences.repository.ts
+new file mode 100644
+index 0000000..fd83e86
+--- /dev/null
++++ b/src/repositories/preferences.repository.ts
+@@ -0,0 +1,44 @@
++/**
++ * Repository for user notification preferences.
++ *
++ * Extends BaseRepository with user-lookup capability.
++ */
++
++import type { DatabaseRecord } from '../utils/database.js';
++import type { Database } from '../utils/database.js';
++import type { UserNotificationPreferences } from '../models/user-preferences.js';
++import { BaseRepository } from './base.repository.js';
++
++export class PreferencesRepository extends BaseRepository<UserNotificationPreferences> {
++  constructor(db: Database) {
++    super(db, 'user_preferences');
++  }
++
++  protected toDomain(record: DatabaseRecord): UserNotificationPreferences {
++    return {
++      id: record['id'] as string,
++      userId: record['userId'] as string,
++      email: JSON.parse(record['email'] as string),
++      createdAt: new Date(record['createdAt'] as string),
++      updatedAt: new Date(record['updatedAt'] as string),
++    };
++  }
++
++  protected toRecord(entity: UserNotificationPreferences): DatabaseRecord {
++    return {
++      id: entity.id,
++      userId: entity.userId,
++      email: JSON.stringify(entity.email),
++      createdAt: entity.createdAt.toISOString(),
++      updatedAt: entity.updatedAt.toISOString(),
++    };
++  }
++
++  /**
++   * Find preferences by user ID.
++   */
++  findByUserId(userId: string): UserNotificationPreferences | undefined {
++    const results = this.findAll((prefs) => prefs.userId === userId);
++    return results[0];
++  }
++}
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 31f4160..0d7232f 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -26,6 +26,7 @@ import type {
+   NotificationPayload,
+   NotificationResult,
+ } from '../models/notification.js';
++import type { PreferencesService } from './preferences.service.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ let nextId = 1;
+@@ -43,11 +44,21 @@ export class NotificationService {
+   private logger = new Logger('NotificationService');
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
++  private preferencesService: PreferencesService | undefined;
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+   }
+ 
++  /**
++   * Set the preferences service for checking user notification preferences.
++   * When set, notifications are only sent if the user's preferences allow it.
++   * When not set, all notifications are sent (backwards-compatible default).
++   */
++  setPreferencesService(preferencesService: PreferencesService): void {
++    this.preferencesService = preferencesService;
++  }
++
+   /**
+    * Register a notification adapter for a given channel.
+    * Only one adapter per channel is supported; registering a second replaces the first.
+@@ -115,6 +126,16 @@ export class NotificationService {
+    * Creates a Notification record, dispatches to the adapter, and emits a notification:sent event.
+    */
+   async send(payload: NotificationPayload): Promise<NotificationResult> {
++    // Check user preferences before sending
++    if (this.preferencesService && payload.channel === 'email') {
++      const shouldSend = this.preferencesService.shouldSendEmail(payload.recipient, payload.type);
++      if (!shouldSend) {
++        this.logger.info(`Notification suppressed by user preferences: ${payload.type} for ${payload.recipient}`);
++        const suppressedId = generateNotificationId();
++        return { success: false, notificationId: suppressedId, channel: payload.channel, error: 'Suppressed by user preferences' };
++      }
++    }
++
+     const id = generateNotificationId();
+     const notification: Notification = {
+       id,
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+new file mode 100644
+index 0000000..78d8110
+--- /dev/null
++++ b/src/services/preferences.service.ts
+@@ -0,0 +1,119 @@
++/**
++ * Service for managing user notification preferences.
++ *
++ * Provides CRUD operations and preference lookups.
++ * Creates default preferences (all enabled, immediate frequency)
++ * when none exist for a user.
++ */
++
++import type { PreferencesRepository } from '../repositories/preferences.repository.js';
++import type {
++  UserNotificationPreferences,
++  UpdateEmailPreferencesInput,
++} from '../models/user-preferences.js';
++import { defaultEmailPreferences } from '../models/user-preferences.js';
++import type { NotificationType } from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++let nextId = 1;
++
++function generatePreferencesId(): string {
++  return `pref-${String(nextId++).padStart(4, '0')}`;
++}
++
++/** Reset the ID counter. Useful for testing. */
++export function resetPreferencesIdCounter(): void {
++  nextId = 1;
++}
++
++export class PreferencesService {
++  private logger = new Logger('PreferencesService');
++
++  constructor(private preferencesRepository: PreferencesRepository) {}
++
++  /**
++   * Get preferences for a user, creating defaults if none exist.
++   */
++  getOrCreatePreferences(userId: string): UserNotificationPreferences {
++    const existing = this.preferencesRepository.findByUserId(userId);
++    if (existing) {
++      return existing;
++    }
++
++    this.logger.info(`Creating default preferences for user ${userId}`);
++    const now = new Date();
++    const prefs: UserNotificationPreferences = {
++      id: generatePreferencesId(),
++      userId,
++      email: defaultEmailPreferences(),
++      createdAt: now,
++      updatedAt: now,
++    };
++    return this.preferencesRepository.save(prefs);
++  }
++
++  /**
++   * Get preferences for a user. Returns undefined if none exist.
++   */
++  getPreferences(userId: string): UserNotificationPreferences | undefined {
++    return this.preferencesRepository.findByUserId(userId);
++  }
++
++  /**
++   * Update email preferences for a user. Creates defaults first if none exist.
++   */
++  updateEmailPreferences(
++    userId: string,
++    input: UpdateEmailPreferencesInput,
++  ): UserNotificationPreferences {
++    const prefs = this.getOrCreatePreferences(userId);
++
++    const updatedEmail = { ...prefs.email };
++
++    if (input.enabled !== undefined) {
++      updatedEmail.enabled = input.enabled;
++    }
++    if (input.frequency !== undefined) {
++      updatedEmail.frequency = input.frequency;
++    }
++    if (input.categorySubscriptions) {
++      updatedEmail.categorySubscriptions = {
++        ...updatedEmail.categorySubscriptions,
++        ...input.categorySubscriptions,
++      };
++    }
++
++    this.logger.info(`Updating email preferences for user ${userId}`);
++    return this.preferencesRepository.update(prefs.id, {
++      email: updatedEmail,
++      updatedAt: new Date(),
++    });
++  }
++
++  /**
++   * Check if a user should receive a notification of the given type via email.
++   * Returns true if: email is enabled AND the specific category is subscribed.
++   * If no preferences exist, defaults to true (opt-out model).
++   */
++  shouldSendEmail(userId: string, notificationType: NotificationType): boolean {
++    const prefs = this.preferencesRepository.findByUserId(userId);
++    if (!prefs) {
++      return true;
++    }
++    if (!prefs.email.enabled) {
++      return false;
++    }
++    return prefs.email.categorySubscriptions[notificationType] !== false;
++  }
++
++  /**
++   * Delete preferences for a user.
++   */
++  deletePreferences(userId: string): boolean {
++    const prefs = this.preferencesRepository.findByUserId(userId);
++    if (!prefs) {
++      return false;
++    }
++    return this.preferencesRepository.delete(prefs.id);
++  }
++}
+diff --git a/tests/services/preferences.service.test.ts b/tests/services/preferences.service.test.ts
+new file mode 100644
+index 0000000..3b4cfc1
+--- /dev/null
++++ b/tests/services/preferences.service.test.ts
+@@ -0,0 +1,249 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database } from '../../src/utils/database.js';
++import { PreferencesRepository } from '../../src/repositories/preferences.repository.js';
++import {
++  PreferencesService,
++  resetPreferencesIdCounter,
++} from '../../src/services/preferences.service.js';
++import { EventBus } from '../../src/events/event-bus.js';
++import {
++  NotificationService,
++  resetNotificationIdCounter,
++} from '../../src/services/notification.service.js';
++import type { OrderCreatedEvent } from '../../src/events/event-types.js';
++
++describe('PreferencesService', () => {
++  let db: Database;
++  let repo: PreferencesRepository;
++  let service: PreferencesService;
++
++  beforeEach(() => {
++    db = new Database();
++    repo = new PreferencesRepository(db);
++    service = new PreferencesService(repo);
++    resetPreferencesIdCounter();
++  });
++
++  describe('getOrCreatePreferences', () => {
++    it('should create default preferences for a new user', () => {
++      const prefs = service.getOrCreatePreferences('user-1');
++
++      expect(prefs.id).toBe('pref-0001');
++      expect(prefs.userId).toBe('user-1');
++      expect(prefs.email.enabled).toBe(true);
++      expect(prefs.email.frequency).toBe('immediate');
++      expect(prefs.email.categorySubscriptions['order:confirmation']).toBe(true);
++      expect(prefs.email.categorySubscriptions['order:status-update']).toBe(true);
++      expect(prefs.email.categorySubscriptions['user:welcome']).toBe(true);
++      expect(prefs.email.categorySubscriptions['user:profile-updated']).toBe(true);
++    });
++
++    it('should return existing preferences without creating duplicates', () => {
++      const first = service.getOrCreatePreferences('user-1');
++      const second = service.getOrCreatePreferences('user-1');
++
++      expect(first.id).toBe(second.id);
++      expect(repo.count()).toBe(1);
++    });
++
++    it('should create separate preferences per user', () => {
++      service.getOrCreatePreferences('user-1');
++      service.getOrCreatePreferences('user-2');
++
++      expect(repo.count()).toBe(2);
++    });
++  });
++
++  describe('getPreferences', () => {
++    it('should return undefined for a user without preferences', () => {
++      expect(service.getPreferences('user-1')).toBeUndefined();
++    });
++
++    it('should return preferences after they are created', () => {
++      service.getOrCreatePreferences('user-1');
++      const prefs = service.getPreferences('user-1');
++
++      expect(prefs).toBeDefined();
++      expect(prefs!.userId).toBe('user-1');
++    });
++  });
++
++  describe('updateEmailPreferences', () => {
++    it('should disable email notifications', () => {
++      service.getOrCreatePreferences('user-1');
++      const updated = service.updateEmailPreferences('user-1', { enabled: false });
++
++      expect(updated.email.enabled).toBe(false);
++      expect(updated.email.frequency).toBe('immediate');
++    });
++
++    it('should update frequency', () => {
++      service.getOrCreatePreferences('user-1');
++      const updated = service.updateEmailPreferences('user-1', { frequency: 'daily-digest' });
++
++      expect(updated.email.frequency).toBe('daily-digest');
++      expect(updated.email.enabled).toBe(true);
++    });
++
++    it('should update individual category subscriptions', () => {
++      service.getOrCreatePreferences('user-1');
++      const updated = service.updateEmailPreferences('user-1', {
++        categorySubscriptions: { 'order:status-update': false },
++      });
++
++      expect(updated.email.categorySubscriptions['order:status-update']).toBe(false);
++      expect(updated.email.categorySubscriptions['order:confirmation']).toBe(true);
++    });
++
++    it('should create defaults first if no preferences exist', () => {
++      const updated = service.updateEmailPreferences('user-1', { enabled: false });
++
++      expect(updated.userId).toBe('user-1');
++      expect(updated.email.enabled).toBe(false);
++    });
++
++    it('should update the updatedAt timestamp', () => {
++      const created = service.getOrCreatePreferences('user-1');
++      const updated = service.updateEmailPreferences('user-1', { frequency: 'weekly-digest' });
++
++      expect(updated.updatedAt.getTime()).toBeGreaterThanOrEqual(created.updatedAt.getTime());
++    });
++  });
++
++  describe('shouldSendEmail', () => {
++    it('should return true when no preferences exist (opt-out model)', () => {
++      expect(service.shouldSendEmail('user-1', 'order:confirmation')).toBe(true);
++    });
++
++    it('should return true with default preferences', () => {
++      service.getOrCreatePreferences('user-1');
++      expect(service.shouldSendEmail('user-1', 'order:confirmation')).toBe(true);
++    });
++
++    it('should return false when email is disabled', () => {
++      service.getOrCreatePreferences('user-1');
++      service.updateEmailPreferences('user-1', { enabled: false });
++
++      expect(service.shouldSendEmail('user-1', 'order:confirmation')).toBe(false);
++    });
++
++    it('should return false when specific category is unsubscribed', () => {
++      service.getOrCreatePreferences('user-1');
++      service.updateEmailPreferences('user-1', {
++        categorySubscriptions: { 'order:status-update': false },
++      });
++
++      expect(service.shouldSendEmail('user-1', 'order:status-update')).toBe(false);
++      expect(service.shouldSendEmail('user-1', 'order:confirmation')).toBe(true);
++    });
++
++    it('should return false when email disabled even if category is subscribed', () => {
++      service.getOrCreatePreferences('user-1');
++      service.updateEmailPreferences('user-1', { enabled: false });
++
++      expect(service.shouldSendEmail('user-1', 'order:confirmation')).toBe(false);
++    });
++  });
++
++  describe('deletePreferences', () => {
++    it('should delete existing preferences', () => {
++      service.getOrCreatePreferences('user-1');
++      expect(service.deletePreferences('user-1')).toBe(true);
++      expect(service.getPreferences('user-1')).toBeUndefined();
++    });
++
++    it('should return false when no preferences exist', () => {
++      expect(service.deletePreferences('user-1')).toBe(false);
++    });
++  });
++});
++
++describe('NotificationService with preferences', () => {
++  let db: Database;
++  let eventBus: EventBus;
++  let notificationService: NotificationService;
++  let preferencesService: PreferencesService;
++
++  beforeEach(() => {
++    db = new Database();
++    eventBus = new EventBus();
++    notificationService = new NotificationService(eventBus);
++    const repo = new PreferencesRepository(db);
++    preferencesService = new PreferencesService(repo);
++    notificationService.setPreferencesService(preferencesService);
++    resetNotificationIdCounter();
++    resetPreferencesIdCounter();
++  });
++
++  const orderCreatedEvent: OrderCreatedEvent = {
++    type: 'order:created',
++    order: {
++      id: 'order-1',
++      userId: 'user-1',
++      items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++      total: 10,
++      status: 'pending',
++      createdAt: new Date(),
++      updatedAt: new Date(),
++    },
++    user: {
++      id: 'user-1',
++      name: 'Alice',
++      email: 'alice@example.com',
++      role: 'member',
++      createdAt: new Date(),
++      updatedAt: new Date(),
++    },
++    timestamp: new Date(),
++  };
++
++  it('should send notification when no preferences exist (opt-out model)', async () => {
++    await eventBus.emit(orderCreatedEvent);
++
++    const notifications = notificationService.getNotifications();
++    expect(notifications).toHaveLength(1);
++  });
++
++  it('should suppress notification when email is disabled', async () => {
++    preferencesService.getOrCreatePreferences('alice@example.com');
++    preferencesService.updateEmailPreferences('alice@example.com', { enabled: false });
++
++    await eventBus.emit(orderCreatedEvent);
++
++    const notifications = notificationService.getNotifications();
++    expect(notifications).toHaveLength(0);
++  });
++
++  it('should suppress notification when category is unsubscribed', async () => {
++    preferencesService.getOrCreatePreferences('alice@example.com');
++    preferencesService.updateEmailPreferences('alice@example.com', {
++      categorySubscriptions: { 'order:confirmation': false },
++    });
++
++    await eventBus.emit(orderCreatedEvent);
++
++    const notifications = notificationService.getNotifications();
++    expect(notifications).toHaveLength(0);
++  });
++
++  it('should send notification when category is subscribed', async () => {
++    preferencesService.getOrCreatePreferences('alice@example.com');
++
++    await eventBus.emit(orderCreatedEvent);
++
++    const notifications = notificationService.getNotifications();
++    expect(notifications).toHaveLength(1);
++  });
++
++  it('should work without preferences service set (backwards compatible)', async () => {
++    const standaloneService = new NotificationService(eventBus);
++    // No preferences service set
++    const standaloneBus = new EventBus();
++    const standaloneNotif = new NotificationService(standaloneBus);
++
++    await standaloneBus.emit(orderCreatedEvent);
++
++    const notifications = standaloneNotif.getNotifications();
++    expect(notifications).toHaveLength(1);
++  });
++});

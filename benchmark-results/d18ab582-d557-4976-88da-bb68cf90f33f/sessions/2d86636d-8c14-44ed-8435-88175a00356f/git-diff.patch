@@ -1,0 +1,175 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index db90913..2089ee2 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -46,6 +46,7 @@ export class NotificationService {
+   private logger = new Logger('NotificationService');
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
++  private recipientQueues: Map<string, Promise<void>> = new Map();
+   private preferencesService: PreferencesService | null = null;
+   private historyService: NotificationHistoryService | null = null;
+ 
+@@ -152,9 +153,21 @@ export class NotificationService {
+ 
+   /**
+    * Send a notification through the appropriate adapter.
++   * Notifications for the same recipient are queued to ensure delivery order.
+    * Falls back to in-memory storage if no adapter is registered for the channel.
+    */
+   async sendNotification(payload: NotificationPayload): Promise<void> {
++    const recipient = payload.recipient;
++    const previous = this.recipientQueues.get(recipient) ?? Promise.resolve();
++    const current = previous.then(() => this.deliverNotification(payload));
++    this.recipientQueues.set(recipient, current.catch(() => {}));
++    return current;
++  }
++
++  /**
++   * Internal: perform the actual notification delivery.
++   */
++  private async deliverNotification(payload: NotificationPayload): Promise<void> {
+     if (this.preferencesService) {
+       const userId = payload.metadata?.userId as string | undefined ?? payload.recipient;
+       if (!this.preferencesService.shouldSendNotification(userId, payload.type, payload.channel)) {
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 770263e..9f1f40e 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -6,6 +6,8 @@ import {
+ } from '../../src/services/notification.service.js';
+ import { EmailAdapter, resetEmailIdCounter } from '../../src/adapters/email.adapter.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationChannel, NotificationPayload, NotificationResult } from '../../src/models/notification.js';
+ 
+ describe('NotificationService', () => {
+   let eventBus: EventBus;
+@@ -269,4 +271,127 @@ describe('NotificationService', () => {
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in order when events fire concurrently for the same recipient', async () => {
++      // Create a slow adapter that delays the first send to simulate a race condition.
++      // Without per-recipient queuing, the second notification would arrive before the first.
++      let sendCount = 0;
++      const deliveryOrder: string[] = [];
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          sendCount++;
++          const currentSend = sendCount;
++          // First send is slow, second is fast — without queuing this would reorder
++          if (currentSend === 1) {
++            await new Promise((resolve) => setTimeout(resolve, 50));
++          }
++          deliveryOrder.push(payload.type);
++          return { success: true, notificationId: `test-${currentSend}`, channel: 'email' };
++        },
++      };
++
++      // Create a fresh service with the slow adapter
++      const testBus = new EventBus();
++      const testService = new NotificationService(testBus);
++      testService.registerAdapter(slowAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'alice@example.com',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently — don't await the first before emitting the second
++      const p1 = testBus.emit(orderCreatedEvent);
++      const p2 = testBus.emit(statusChangedEvent);
++      await Promise.all([p1, p2]);
++
++      // Notifications must arrive in the order they were dispatched
++      const notifications = testService.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++
++      // Adapter delivery order must also be preserved
++      expect(deliveryOrder).toEqual(['order_confirmation', 'order_status_update']);
++    });
++
++    it('should not queue notifications for different recipients', async () => {
++      let sendCount = 0;
++      const deliveryOrder: string[] = [];
++
++      const trackingAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          sendCount++;
++          const currentSend = sendCount;
++          // First send (alice) is slow, second (bob) is fast
++          if (currentSend === 1) {
++            await new Promise((resolve) => setTimeout(resolve, 50));
++          }
++          deliveryOrder.push(payload.recipient);
++          return { success: true, notificationId: `test-${currentSend}`, channel: 'email' };
++        },
++      };
++
++      const testBus = new EventBus();
++      const testService = new NotificationService(testBus);
++      testService.registerAdapter(trackingAdapter);
++
++      // Send to two different recipients concurrently
++      const p1 = testService.sendNotification({
++        type: 'welcome',
++        recipient: 'alice@example.com',
++        subject: 'Welcome Alice',
++        body: 'Hello Alice',
++        channel: 'email',
++      });
++      const p2 = testService.sendNotification({
++        type: 'welcome',
++        recipient: 'bob@example.com',
++        subject: 'Welcome Bob',
++        body: 'Hello Bob',
++        channel: 'email',
++      });
++      await Promise.all([p1, p2]);
++
++      // Bob should arrive before Alice since they are different recipients (no queuing)
++      expect(deliveryOrder).toEqual(['bob@example.com', 'alice@example.com']);
++    });
++  });
+ });

@@ -1,0 +1,650 @@
+diff --git a/src/services/order.service.ts b/src/services/order.service.ts
+index bd67dd5..5928517 100644
+--- a/src/services/order.service.ts
++++ b/src/services/order.service.ts
+@@ -17,6 +17,12 @@ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
++import {
++  validateOrderUserExists,
++  validateOrderHasItems,
++  validateOrderExists,
++  validateStatusTransition,
++} from '../validators/order.validator.js';
+ 
+ let nextId = 1;
+ 
+@@ -45,14 +51,10 @@ export class OrderService {
+ 
+     // Validate user exists
+     const user = this.userRepository.findById(input.userId);
+-    if (!user) {
+-      throw new Error(`User not found: ${input.userId}`);
+-    }
++    validateOrderUserExists(user, input.userId);
+ 
+     // Validate order has items
+-    if (input.items.length === 0) {
+-      throw new Error('Order must have at least one item');
+-    }
++    validateOrderHasItems(input.items);
+ 
+     const now = new Date();
+     const order: Order = {
+@@ -92,18 +94,12 @@ export class OrderService {
+     this.logger.info(`Updating order ${id} status to: ${newStatus}`);
+ 
+     const order = this.orderRepository.findById(id);
+-    if (!order) {
+-      throw new Error(`Order not found: ${id}`);
+-    }
++    validateOrderExists(order, id);
+ 
+     const previousStatus = order.status;
+ 
+     // Validate status transition
+-    if (!this.isValidStatusTransition(previousStatus, newStatus)) {
+-      throw new Error(
+-        `Invalid status transition: ${previousStatus} -> ${newStatus}`,
+-      );
+-    }
++    validateStatusTransition(previousStatus, newStatus);
+ 
+     const updated = this.orderRepository.update(id, {
+       status: newStatus,
+@@ -137,20 +133,4 @@ export class OrderService {
+     return this.orderRepository.findByStatus(status);
+   }
+ 
+-  /**
+-   * Validate that a status transition is allowed.
+-   */
+-  private isValidStatusTransition(
+-    from: OrderStatus,
+-    to: OrderStatus,
+-  ): boolean {
+-    const transitions: Record<OrderStatus, OrderStatus[]> = {
+-      pending: ['confirmed', 'cancelled'],
+-      confirmed: ['shipped', 'cancelled'],
+-      shipped: ['delivered'],
+-      delivered: [],
+-      cancelled: [],
+-    };
+-    return transitions[from].includes(to);
+-  }
+ }
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+index 8e12880..b362d43 100644
+--- a/src/services/preferences.service.ts
++++ b/src/services/preferences.service.ts
+@@ -19,9 +19,9 @@ import type {
+ import type { NotificationType } from '../models/notification.js';
+ import {
+   DEFAULT_EMAIL_PREFERENCES,
+-  NOTIFICATION_TYPE_TO_CATEGORY,
+ } from '../models/user-preferences.js';
+ import { Logger } from '../utils/logger.js';
++import { shouldSendEmailForPreferences } from '../validators/preferences.validator.js';
+ 
+ let nextId = 1;
+ 
+@@ -123,27 +123,6 @@ export class PreferencesService {
+    */
+   shouldSendEmail(userId: string, notificationType: NotificationType): boolean {
+     const preferences = this.preferencesRepository.findByUserId(userId);
+-
+-    // No preferences set — default is to send all notifications
+-    if (!preferences) {
+-      return true;
+-    }
+-
+-    // Master switch
+-    if (!preferences.email.enabled) {
+-      this.logger.debug(`Email disabled for user ${userId}`);
+-      return false;
+-    }
+-
+-    // Category check
+-    const categoryKey = NOTIFICATION_TYPE_TO_CATEGORY[notificationType];
+-    if (!preferences.email.categories[categoryKey]) {
+-      this.logger.debug(
+-        `Category ${categoryKey} disabled for user ${userId}`,
+-      );
+-      return false;
+-    }
+-
+-    return true;
++    return shouldSendEmailForPreferences(preferences, notificationType);
+   }
+ }
+diff --git a/src/services/user.service.ts b/src/services/user.service.ts
+index 5b51890..cabaa1f 100644
+--- a/src/services/user.service.ts
++++ b/src/services/user.service.ts
+@@ -13,6 +13,11 @@ import type { User, CreateUserInput, UpdateUserInput } from '../models/user.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
++import {
++  validateUserExists,
++  validateEmailNotTaken,
++  validateEmailNotTakenForUpdate,
++} from '../validators/user.validator.js';
+ 
+ let nextId = 1;
+ 
+@@ -40,9 +45,7 @@ export class UserService {
+ 
+     // Validate email uniqueness
+     const existing = this.userRepository.findByEmail(input.email);
+-    if (existing) {
+-      throw new Error(`User with email ${input.email} already exists`);
+-    }
++    validateEmailNotTaken(input.email, existing);
+ 
+     const now = new Date();
+     const user: User = {
+@@ -79,16 +82,12 @@ export class UserService {
+     this.logger.info(`Updating user: ${id}`);
+ 
+     const existing = this.userRepository.findById(id);
+-    if (!existing) {
+-      throw new Error(`User not found: ${id}`);
+-    }
++    validateUserExists(existing, id);
+ 
+     // If changing email, check uniqueness
+-    if (input.email && input.email !== existing.email) {
+-      const emailTaken = this.userRepository.findByEmail(input.email);
+-      if (emailTaken) {
+-        throw new Error(`Email ${input.email} is already in use`);
+-      }
++    if (input.email) {
++      const emailOwner = this.userRepository.findByEmail(input.email);
++      validateEmailNotTakenForUpdate(input.email, existing.email, emailOwner);
+     }
+ 
+     const changes: string[] = [];
+diff --git a/src/validators/order.validator.ts b/src/validators/order.validator.ts
+new file mode 100644
+index 0000000..7c51eb1
+--- /dev/null
++++ b/src/validators/order.validator.ts
+@@ -0,0 +1,75 @@
++/**
++ * Pure validation functions for order operations.
++ *
++ * These functions contain no side effects and no database calls.
++ * They accept pre-fetched data and validate business rules.
++ */
++
++import type { Order, OrderItem, OrderStatus } from '../models/order.js';
++import type { User } from '../models/user.js';
++
++/**
++ * Validate that a user exists (for order creation).
++ */
++export function validateOrderUserExists(
++  user: User | undefined,
++  userId: string,
++): asserts user is User {
++  if (!user) {
++    throw new Error(`User not found: ${userId}`);
++  }
++}
++
++/**
++ * Validate that an order has at least one item.
++ */
++export function validateOrderHasItems(items: OrderItem[]): void {
++  if (items.length === 0) {
++    throw new Error('Order must have at least one item');
++  }
++}
++
++/**
++ * Validate that an order exists.
++ */
++export function validateOrderExists(
++  order: Order | undefined,
++  id: string,
++): asserts order is Order {
++  if (!order) {
++    throw new Error(`Order not found: ${id}`);
++  }
++}
++
++/**
++ * Allowed status transitions for orders.
++ */
++const STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
++  pending: ['confirmed', 'cancelled'],
++  confirmed: ['shipped', 'cancelled'],
++  shipped: ['delivered'],
++  delivered: [],
++  cancelled: [],
++};
++
++/**
++ * Check whether a status transition is allowed.
++ */
++export function isValidStatusTransition(
++  from: OrderStatus,
++  to: OrderStatus,
++): boolean {
++  return STATUS_TRANSITIONS[from].includes(to);
++}
++
++/**
++ * Validate that a status transition is allowed, throwing if not.
++ */
++export function validateStatusTransition(
++  from: OrderStatus,
++  to: OrderStatus,
++): void {
++  if (!isValidStatusTransition(from, to)) {
++    throw new Error(`Invalid status transition: ${from} -> ${to}`);
++  }
++}
+diff --git a/src/validators/preferences.validator.ts b/src/validators/preferences.validator.ts
+new file mode 100644
+index 0000000..a08e710
+--- /dev/null
++++ b/src/validators/preferences.validator.ts
+@@ -0,0 +1,44 @@
++/**
++ * Pure validation functions for notification preferences.
++ *
++ * These functions contain no side effects and no database calls.
++ * They accept pre-fetched data and validate business rules.
++ */
++
++import type { UserPreferences } from '../models/user-preferences.js';
++import type { NotificationType } from '../models/notification.js';
++import { NOTIFICATION_TYPE_TO_CATEGORY } from '../models/user-preferences.js';
++
++/**
++ * Determine whether an email notification should be sent based on user preferences.
++ *
++ * Returns true if:
++ * - Preferences are undefined (defaults allow all notifications)
++ * - Email is enabled AND the category for the notification type is enabled
++ *
++ * Returns false if:
++ * - Email is globally disabled
++ * - The specific category is disabled
++ */
++export function shouldSendEmailForPreferences(
++  preferences: UserPreferences | undefined,
++  notificationType: NotificationType,
++): boolean {
++  // No preferences set — default is to send all notifications
++  if (!preferences) {
++    return true;
++  }
++
++  // Master switch
++  if (!preferences.email.enabled) {
++    return false;
++  }
++
++  // Category check
++  const categoryKey = NOTIFICATION_TYPE_TO_CATEGORY[notificationType];
++  if (!preferences.email.categories[categoryKey]) {
++    return false;
++  }
++
++  return true;
++}
+diff --git a/src/validators/user.validator.ts b/src/validators/user.validator.ts
+new file mode 100644
+index 0000000..707b4e0
+--- /dev/null
++++ b/src/validators/user.validator.ts
+@@ -0,0 +1,46 @@
++/**
++ * Pure validation functions for user operations.
++ *
++ * These functions contain no side effects and no database calls.
++ * They accept pre-fetched data and validate business rules.
++ */
++
++import type { User } from '../models/user.js';
++
++/**
++ * Validate that a user exists, throwing if not.
++ */
++export function validateUserExists(
++  user: User | undefined,
++  id: string,
++): asserts user is User {
++  if (!user) {
++    throw new Error(`User not found: ${id}`);
++  }
++}
++
++/**
++ * Validate that an email is not already taken when creating a user.
++ */
++export function validateEmailNotTaken(
++  email: string,
++  existingUser: User | undefined,
++): void {
++  if (existingUser) {
++    throw new Error(`User with email ${email} already exists`);
++  }
++}
++
++/**
++ * Validate that an email is not already in use when updating a user.
++ * Only checks if the email is actually changing.
++ */
++export function validateEmailNotTakenForUpdate(
++  newEmail: string,
++  currentEmail: string,
++  existingUser: User | undefined,
++): void {
++  if (newEmail !== currentEmail && existingUser) {
++    throw new Error(`Email ${newEmail} is already in use`);
++  }
++}
+diff --git a/tests/validators/order.validator.test.ts b/tests/validators/order.validator.test.ts
+new file mode 100644
+index 0000000..d5c45c4
+--- /dev/null
++++ b/tests/validators/order.validator.test.ts
+@@ -0,0 +1,120 @@
++import { describe, it, expect } from 'vitest';
++import {
++  validateOrderUserExists,
++  validateOrderHasItems,
++  validateOrderExists,
++  isValidStatusTransition,
++  validateStatusTransition,
++} from '../../src/validators/order.validator.js';
++import type { Order } from '../../src/models/order.js';
++import type { User } from '../../src/models/user.js';
++
++const makeUser = (): User => ({
++  id: 'user-0001',
++  name: 'Alice',
++  email: 'alice@example.com',
++  role: 'member',
++  createdAt: new Date(),
++  updatedAt: new Date(),
++});
++
++const makeOrder = (overrides: Partial<Order> = {}): Order => ({
++  id: 'order-0001',
++  userId: 'user-0001',
++  items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++  total: 10,
++  status: 'pending',
++  createdAt: new Date(),
++  updatedAt: new Date(),
++  ...overrides,
++});
++
++describe('order.validator', () => {
++  describe('validateOrderUserExists', () => {
++    it('should not throw when user exists', () => {
++      expect(() => validateOrderUserExists(makeUser(), 'user-0001')).not.toThrow();
++    });
++
++    it('should throw when user is undefined', () => {
++      expect(() => validateOrderUserExists(undefined, 'user-0001')).toThrow(
++        'User not found: user-0001',
++      );
++    });
++  });
++
++  describe('validateOrderHasItems', () => {
++    it('should not throw when items are present', () => {
++      expect(() =>
++        validateOrderHasItems([
++          { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++        ]),
++      ).not.toThrow();
++    });
++
++    it('should throw when items array is empty', () => {
++      expect(() => validateOrderHasItems([])).toThrow(
++        'Order must have at least one item',
++      );
++    });
++  });
++
++  describe('validateOrderExists', () => {
++    it('should not throw when order exists', () => {
++      expect(() => validateOrderExists(makeOrder(), 'order-0001')).not.toThrow();
++    });
++
++    it('should throw when order is undefined', () => {
++      expect(() => validateOrderExists(undefined, 'order-0001')).toThrow(
++        'Order not found: order-0001',
++      );
++    });
++  });
++
++  describe('isValidStatusTransition', () => {
++    it('should allow pending -> confirmed', () => {
++      expect(isValidStatusTransition('pending', 'confirmed')).toBe(true);
++    });
++
++    it('should allow pending -> cancelled', () => {
++      expect(isValidStatusTransition('pending', 'cancelled')).toBe(true);
++    });
++
++    it('should allow confirmed -> shipped', () => {
++      expect(isValidStatusTransition('confirmed', 'shipped')).toBe(true);
++    });
++
++    it('should allow confirmed -> cancelled', () => {
++      expect(isValidStatusTransition('confirmed', 'cancelled')).toBe(true);
++    });
++
++    it('should allow shipped -> delivered', () => {
++      expect(isValidStatusTransition('shipped', 'delivered')).toBe(true);
++    });
++
++    it('should reject pending -> delivered', () => {
++      expect(isValidStatusTransition('pending', 'delivered')).toBe(false);
++    });
++
++    it('should reject delivered -> any', () => {
++      expect(isValidStatusTransition('delivered', 'pending')).toBe(false);
++      expect(isValidStatusTransition('delivered', 'cancelled')).toBe(false);
++    });
++
++    it('should reject cancelled -> any', () => {
++      expect(isValidStatusTransition('cancelled', 'pending')).toBe(false);
++      expect(isValidStatusTransition('cancelled', 'confirmed')).toBe(false);
++    });
++  });
++
++  describe('validateStatusTransition', () => {
++    it('should not throw for valid transitions', () => {
++      expect(() => validateStatusTransition('pending', 'confirmed')).not.toThrow();
++    });
++
++    it('should throw for invalid transitions', () => {
++      expect(() => validateStatusTransition('pending', 'delivered')).toThrow(
++        'Invalid status transition: pending -> delivered',
++      );
++    });
++  });
++});
+diff --git a/tests/validators/preferences.validator.test.ts b/tests/validators/preferences.validator.test.ts
+new file mode 100644
+index 0000000..75ea025
+--- /dev/null
++++ b/tests/validators/preferences.validator.test.ts
+@@ -0,0 +1,84 @@
++import { describe, it, expect } from 'vitest';
++import { shouldSendEmailForPreferences } from '../../src/validators/preferences.validator.js';
++import type { UserPreferences } from '../../src/models/user-preferences.js';
++import { DEFAULT_EMAIL_PREFERENCES } from '../../src/models/user-preferences.js';
++
++const makePreferences = (
++  overrides: Partial<UserPreferences> = {},
++): UserPreferences => ({
++  id: 'pref-0001',
++  userId: 'user-0001',
++  email: { ...DEFAULT_EMAIL_PREFERENCES, categories: { ...DEFAULT_EMAIL_PREFERENCES.categories } },
++  createdAt: new Date(),
++  updatedAt: new Date(),
++  ...overrides,
++});
++
++describe('preferences.validator', () => {
++  describe('shouldSendEmailForPreferences', () => {
++    it('should return true when preferences are undefined', () => {
++      expect(shouldSendEmailForPreferences(undefined, 'order:confirmation')).toBe(true);
++    });
++
++    it('should return true when email is enabled and category is enabled', () => {
++      const prefs = makePreferences();
++      expect(shouldSendEmailForPreferences(prefs, 'order:confirmation')).toBe(true);
++    });
++
++    it('should return false when email is globally disabled', () => {
++      const prefs = makePreferences({
++        email: {
++          ...DEFAULT_EMAIL_PREFERENCES,
++          categories: { ...DEFAULT_EMAIL_PREFERENCES.categories },
++          enabled: false,
++        },
++      });
++      expect(shouldSendEmailForPreferences(prefs, 'order:confirmation')).toBe(false);
++    });
++
++    it('should return false when specific category is disabled', () => {
++      const prefs = makePreferences({
++        email: {
++          ...DEFAULT_EMAIL_PREFERENCES,
++          categories: {
++            ...DEFAULT_EMAIL_PREFERENCES.categories,
++            orderConfirmations: false,
++          },
++        },
++      });
++      expect(shouldSendEmailForPreferences(prefs, 'order:confirmation')).toBe(false);
++    });
++
++    it('should return true for enabled category even if another is disabled', () => {
++      const prefs = makePreferences({
++        email: {
++          ...DEFAULT_EMAIL_PREFERENCES,
++          categories: {
++            ...DEFAULT_EMAIL_PREFERENCES.categories,
++            orderConfirmations: false,
++          },
++        },
++      });
++      expect(shouldSendEmailForPreferences(prefs, 'order:status-update')).toBe(true);
++    });
++
++    it('should check each notification type against its category', () => {
++      const prefs = makePreferences({
++        email: {
++          ...DEFAULT_EMAIL_PREFERENCES,
++          categories: {
++            orderConfirmations: true,
++            orderStatusUpdates: false,
++            welcomeMessages: true,
++            profileUpdates: false,
++          },
++        },
++      });
++
++      expect(shouldSendEmailForPreferences(prefs, 'order:confirmation')).toBe(true);
++      expect(shouldSendEmailForPreferences(prefs, 'order:status-update')).toBe(false);
++      expect(shouldSendEmailForPreferences(prefs, 'user:welcome')).toBe(true);
++      expect(shouldSendEmailForPreferences(prefs, 'user:profile-updated')).toBe(false);
++    });
++  });
++});
+diff --git a/tests/validators/user.validator.test.ts b/tests/validators/user.validator.test.ts
+new file mode 100644
+index 0000000..4e39182
+--- /dev/null
++++ b/tests/validators/user.validator.test.ts
+@@ -0,0 +1,77 @@
++import { describe, it, expect } from 'vitest';
++import {
++  validateUserExists,
++  validateEmailNotTaken,
++  validateEmailNotTakenForUpdate,
++} from '../../src/validators/user.validator.js';
++import type { User } from '../../src/models/user.js';
++
++const makeUser = (overrides: Partial<User> = {}): User => ({
++  id: 'user-0001',
++  name: 'Alice',
++  email: 'alice@example.com',
++  role: 'member',
++  createdAt: new Date(),
++  updatedAt: new Date(),
++  ...overrides,
++});
++
++describe('user.validator', () => {
++  describe('validateUserExists', () => {
++    it('should not throw when user exists', () => {
++      expect(() => validateUserExists(makeUser(), 'user-0001')).not.toThrow();
++    });
++
++    it('should throw when user is undefined', () => {
++      expect(() => validateUserExists(undefined, 'user-0001')).toThrow(
++        'User not found: user-0001',
++      );
++    });
++  });
++
++  describe('validateEmailNotTaken', () => {
++    it('should not throw when no existing user with that email', () => {
++      expect(() =>
++        validateEmailNotTaken('new@example.com', undefined),
++      ).not.toThrow();
++    });
++
++    it('should throw when a user with that email exists', () => {
++      expect(() =>
++        validateEmailNotTaken('alice@example.com', makeUser()),
++      ).toThrow('User with email alice@example.com already exists');
++    });
++  });
++
++  describe('validateEmailNotTakenForUpdate', () => {
++    it('should not throw when email is unchanged', () => {
++      expect(() =>
++        validateEmailNotTakenForUpdate(
++          'alice@example.com',
++          'alice@example.com',
++          makeUser(),
++        ),
++      ).not.toThrow();
++    });
++
++    it('should not throw when new email is not taken', () => {
++      expect(() =>
++        validateEmailNotTakenForUpdate(
++          'new@example.com',
++          'alice@example.com',
++          undefined,
++        ),
++      ).not.toThrow();
++    });
++
++    it('should throw when new email is taken by another user', () => {
++      expect(() =>
++        validateEmailNotTakenForUpdate(
++          'bob@example.com',
++          'alice@example.com',
++          makeUser({ email: 'bob@example.com' }),
++        ),
++      ).toThrow('Email bob@example.com is already in use');
++    });
++  });
++});

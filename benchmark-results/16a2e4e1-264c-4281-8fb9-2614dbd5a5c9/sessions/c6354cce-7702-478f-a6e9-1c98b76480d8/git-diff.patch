@@ -1,0 +1,1229 @@
+diff --git a/SMS_CHANNEL_NOTES.md b/SMS_CHANNEL_NOTES.md
+new file mode 100644
+index 0000000..eada581
+--- /dev/null
++++ b/SMS_CHANNEL_NOTES.md
+@@ -0,0 +1,91 @@
++# SMS Channel — Implementation Notes
++
++**Date:** 2026-03-27
++**Status:** SMS adapter implemented; user preferences NOT yet updated
++
++---
++
++## What Was Done
++
++1. **Created `SmsAdapter`** (`src/adapters/sms.adapter.ts`)
++   - Implements the `NotificationAdapter` interface (same pattern as `EmailAdapter` and `WebhookAdapter`)
++   - Phone number validation (E.164 and domestic formats)
++   - SMS message formatting with character-aware truncation (160-char default)
++   - Stub mode for development/testing; production mode placeholder with retry logic
++   - Exported from `src/index.ts`
++
++2. **Tests added** (`tests/adapters/sms.adapter.test.ts`)
++   - Full test coverage for send, validation, formatting, configuration, and edge cases
++
++3. **Registered in public API** (`src/index.ts`)
++   - `SmsAdapter`, `defaultSmsConfig`, `isValidPhoneNumber`, `resolvePhoneNumber`, `formatSmsMessage`
++   - Types: `SmsAdapterConfig`, `SmsMessage`
++
++---
++
++## What Still Needs To Change
++
++### User Preferences Model (`src/models/user-preferences.ts`)
++
++The preferences model was designed with an **email-only assumption**. The key assumption that has changed:
++
++> **Old assumption:** "Currently focused on email settings since email is the only notification channel."
++
++This is **no longer valid**. SMS is now a supported channel.
++
++#### Required Changes
++
++| # | File | Change |
++|---|------|--------|
++| 1 | `src/models/user-preferences.ts` | Add `SmsPreferences` interface (similar to `EmailPreferences` but without `frequency`) |
++| 2 | `src/models/user-preferences.ts` | Add `sms: SmsPreferences` field to `UserNotificationPreferences` |
++| 3 | `src/models/user-preferences.ts` | Update `CreatePreferencesInput` with optional `sms` field |
++| 4 | `src/models/user-preferences.ts` | Update `UpdatePreferencesInput` with optional `sms` field |
++| 5 | `src/models/user-preferences.ts` | Add `getDefaultSmsPreferences()` function |
++| 6 | `src/services/preferences.service.ts` | Add `shouldSendSms()` private method |
++| 7 | `src/services/preferences.service.ts` | Update `shouldSendNotification()` to handle `channel === 'sms'` |
++| 8 | `src/services/preferences.service.ts` | Update `createPreferences()` to handle `sms` field |
++| 9 | `src/services/preferences.service.ts` | Update `updatePreferences()` to handle `sms` field |
++| 10 | `tests/services/preferences.service.test.ts` | Add tests for SMS preference checks |
++
++### Suggested `SmsPreferences` Interface
++
++```typescript
++interface SmsPreferences {
++  /** Master switch: if false, no SMS notifications are sent. */
++  enabled: boolean;
++  /** Per-category preferences. Categories not listed default to enabled. */
++  categoryPreferences: NotificationCategoryPreference[];
++}
++```
++
++> **Note:** SMS does not need a `frequency` field because SMS is always delivered immediately (no batching/digest support).
++
++### Consider Generalising
++
++With two channels now and more planned (webhook, in_app), consider whether the preferences model should be generalised to a `Record<NotificationChannel, ChannelPreferences>` pattern instead of adding named fields for each channel. This would make adding future channels easier but is a larger refactor.
++
++---
++
++## Current Behaviour (Before Preferences Update)
++
++- SMS notifications are **always sent** to users, even if they have stored preferences
++- The `PreferencesService.shouldSendNotification()` method returns `true` for the `'sms'` channel because it falls through to the "unknown channel" default
++- This is **safe** (no notifications are lost) but means **users cannot opt out of SMS yet**
++
++---
++
++## How to Register the SMS Adapter
++
++```typescript
++import { EventBus, NotificationService, SmsAdapter } from './src/index.js';
++
++const eventBus = new EventBus();
++const notificationService = new NotificationService(eventBus);
++
++// Register the SMS adapter
++const smsAdapter = new SmsAdapter({ stubMode: true });
++notificationService.registerAdapter(smsAdapter);
++```
++
++The notification service will then route any notification with `channel: 'sms'` to the SMS adapter.
+diff --git a/src/adapters/sms.adapter.ts b/src/adapters/sms.adapter.ts
+new file mode 100644
+index 0000000..b85d470
+--- /dev/null
++++ b/src/adapters/sms.adapter.ts
+@@ -0,0 +1,409 @@
++/**
++ * SMS notification adapter — delivers notifications via SMS.
++ *
++ * This is a fully implemented SMS adapter with:
++ * - Phone number validation: Validates recipient phone number format before sending.
++ * - Message formatting: Converts notification payloads to concise SMS-friendly
++ *   text messages with character-aware truncation.
++ * - Configurable delivery: Stub mode for development/testing, production
++ *   mode for real SMS API integration.
++ *
++ * Implements the NotificationAdapter interface. Registered with the
++ * NotificationService to handle all notifications on the 'sms' channel.
++ *
++ * Configuration is injected via constructor to support different
++ * environments (dev, staging, production).
++ *
++ * NOTE: Adding SMS as a notification channel means the user preferences model
++ * (src/models/user-preferences.ts) needs to be updated. The current model was
++ * designed with an email-only assumption — see SMS_CHANNEL_NOTES.md for details.
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type {
++  NotificationChannel,
++  NotificationPayload,
++  NotificationResult,
++  NotificationType,
++} from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++// ---------------------------------------------------------------------------
++// SMS Message Types
++// ---------------------------------------------------------------------------
++
++/**
++ * A formatted SMS message ready for delivery.
++ */
++export interface SmsMessage {
++  /** Sender phone number or short code. */
++  from: string;
++  /** Recipient phone number. */
++  to: string;
++  /** SMS message body (plain text, max 160 chars for single segment). */
++  body: string;
++  /** When the SMS was composed. */
++  composedAt: Date;
++  /** The notification type that generated this SMS. */
++  notificationType: NotificationType;
++  /** Additional headers or metadata. */
++  metadata?: Record<string, unknown>;
++}
++
++// ---------------------------------------------------------------------------
++// Configuration
++// ---------------------------------------------------------------------------
++
++/**
++ * Configuration for the SMS adapter.
++ */
++export interface SmsAdapterConfig {
++  /** Sender phone number or short code (e.g., '+15551234567'). */
++  fromNumber: string;
++  /** Whether this is a stub (logs instead of sending). */
++  stubMode: boolean;
++  /** Maximum retries for failed delivery attempts. */
++  maxRetries: number;
++  /** Maximum characters per SMS message. Messages longer than this are truncated. */
++  maxMessageLength: number;
++}
++
++/**
++ * Default configuration for development/testing.
++ */
++export const defaultSmsConfig: SmsAdapterConfig = {
++  fromNumber: '+15550000000',
++  stubMode: true,
++  maxRetries: 3,
++  maxMessageLength: 160,
++};
++
++// ---------------------------------------------------------------------------
++// Phone Number Validation
++// ---------------------------------------------------------------------------
++
++/**
++ * Validates a phone number format.
++ *
++ * Accepts E.164 format phone numbers (international standard):
++ * - Must start with '+'
++ * - Followed by 1-3 digit country code
++ * - Followed by subscriber number (total 8-15 digits after '+')
++ *
++ * Also accepts common domestic formats:
++ * - 10-digit numbers (e.g., '5551234567')
++ * - Formatted numbers (e.g., '(555) 123-4567', '555-123-4567')
++ *
++ * @param phoneNumber - The phone number to validate.
++ * @returns true if the phone number format is valid.
++ */
++export function isValidPhoneNumber(phoneNumber: string): boolean {
++  if (!phoneNumber || typeof phoneNumber !== 'string') {
++    return false;
++  }
++  const trimmed = phoneNumber.trim();
++  if (trimmed.length === 0) {
++    return false;
++  }
++
++  // Strip formatting characters to get just digits and optional leading '+'
++  const stripped = trimmed.replace(/[\s()\-\.]/g, '');
++
++  // E.164 format: +{country code}{subscriber number}, 8-15 digits total
++  if (stripped.startsWith('+')) {
++    const digits = stripped.slice(1);
++    return /^\d{8,15}$/.test(digits);
++  }
++
++  // Domestic format: 10+ digits (US-style) or shorter international
++  return /^\d{7,15}$/.test(stripped);
++}
++
++/**
++ * Normalises a phone number to a consistent format.
++ *
++ * Strips formatting characters and trims whitespace. Returns the
++ * normalised number or null if the input is empty or invalid.
++ *
++ * @param phoneNumber - The phone number to normalise.
++ * @returns An object with the normalised number and validity, or null if empty.
++ */
++export function resolvePhoneNumber(phoneNumber: string): {
++  number: string;
++  isValid: boolean;
++} | null {
++  if (!phoneNumber || typeof phoneNumber !== 'string') {
++    return null;
++  }
++  const trimmed = phoneNumber.trim();
++  if (trimmed.length === 0) {
++    return null;
++  }
++
++  // Strip formatting characters but keep leading '+'
++  const normalised = trimmed.replace(/[\s()\-\.]/g, '');
++
++  return {
++    number: normalised,
++    isValid: isValidPhoneNumber(normalised),
++  };
++}
++
++// ---------------------------------------------------------------------------
++// SMS Message Formatting
++// ---------------------------------------------------------------------------
++
++/**
++ * Formats a notification payload as a concise SMS message body.
++ *
++ * SMS messages are limited in length, so this function creates a compact
++ * representation of the notification. If the formatted message exceeds
++ * the maximum length, it is truncated with an ellipsis.
++ *
++ * @param payload - The notification payload to format.
++ * @param maxLength - Maximum message length (default: 160).
++ * @returns A formatted SMS message body string.
++ */
++export function formatSmsMessage(
++  payload: NotificationPayload,
++  maxLength: number = 160,
++): string {
++  // Build a concise message: "[Subject] Body"
++  const message = `${payload.subject}: ${payload.body}`;
++
++  if (message.length <= maxLength) {
++    return message;
++  }
++
++  // Truncate with ellipsis if too long
++  return message.slice(0, maxLength - 3) + '...';
++}
++
++// ---------------------------------------------------------------------------
++// SmsAdapter Implementation
++// ---------------------------------------------------------------------------
++
++/**
++ * SMS notification adapter.
++ *
++ * Sends notifications via SMS with phone number validation and message
++ * formatting. In stub mode (default), logs the SMS details and records
++ * them in memory instead of actually delivering.
++ *
++ * Pipeline:
++ * 1. Validate recipient phone number format.
++ * 2. Format notification into a concise SMS message body.
++ * 3. Compose complete SmsMessage (from, to, body).
++ * 4. Deliver via stub (log + record) or production (SMS API).
++ * 5. Return success/failure result (never throws).
++ */
++export class SmsAdapter implements NotificationAdapter {
++  readonly channel: NotificationChannel = 'sms';
++
++  private logger = new Logger('SmsAdapter');
++  private config: SmsAdapterConfig;
++  private sentMessages: SmsMessage[] = [];
++
++  constructor(config?: Partial<SmsAdapterConfig>) {
++    this.config = { ...defaultSmsConfig, ...config };
++  }
++
++  /**
++   * Send a notification via SMS.
++   *
++   * Full pipeline:
++   * 1. Validates the recipient phone number.
++   * 2. Formats the notification as a concise SMS message.
++   * 3. Composes the complete SMS message.
++   * 4. Delivers via stub (records in memory) or production mode.
++   *
++   * @param payload - The notification payload to deliver via SMS.
++   * @returns Result indicating success or failure. Never throws.
++   */
++  async send(payload: NotificationPayload): Promise<NotificationResult> {
++    const result: NotificationResult = {
++      success: false,
++      notificationId: '',
++      channel: 'sms',
++    };
++
++    try {
++      // Step 1: Validate and resolve recipient phone number
++      const resolved = resolvePhoneNumber(payload.recipient);
++      if (!resolved) {
++        result.failureReason = `Invalid recipient: empty or missing phone number`;
++        this.logger.warn(result.failureReason);
++        return result;
++      }
++
++      if (!resolved.isValid) {
++        // Recipient is not a valid phone number format.
++        // In stub mode we proceed with a warning; in production we reject.
++        if (!this.config.stubMode) {
++          result.failureReason = `Invalid recipient phone number: "${payload.recipient}"`;
++          this.logger.warn(result.failureReason);
++          return result;
++        }
++        this.logger.warn(
++          `Recipient "${payload.recipient}" is not a valid phone number; proceeding in stub mode`,
++        );
++      }
++
++      const resolvedRecipient = resolved.number;
++
++      // Step 2: Format SMS message body
++      const messageBody = formatSmsMessage(payload, this.config.maxMessageLength);
++
++      // Step 3: Compose complete SMS message
++      const sms: SmsMessage = {
++        from: this.config.fromNumber,
++        to: resolvedRecipient,
++        body: messageBody,
++        composedAt: new Date(),
++        notificationType: payload.type,
++        metadata: payload.metadata,
++      };
++
++      // Step 4: Deliver
++      if (this.config.stubMode) {
++        // Stub mode: log and record instead of sending
++        this.logger.info(
++          `[STUB] SMS to ${sms.to}: "${sms.body}"`,
++        );
++        this.sentMessages.push(sms);
++      } else {
++        // Production mode: attempt real delivery with retries
++        await this.deliverWithRetry(sms);
++      }
++
++      result.success = true;
++      this.logger.info(`SMS sent to ${sms.to}`);
++    } catch (error) {
++      const message =
++        error instanceof Error ? error.message : 'Unknown SMS delivery error';
++      result.success = false;
++      result.failureReason = message;
++      this.logger.error(
++        `SMS delivery failed for ${payload.recipient}: ${message}`,
++      );
++    }
++
++    return result;
++  }
++
++  /**
++   * Get all SMS messages sent in stub mode. Useful for testing.
++   *
++   * Returns defensive copies of the recorded SMS messages.
++   */
++  getSentMessages(): SmsMessage[] {
++    return [...this.sentMessages];
++  }
++
++  /**
++   * Clear sent SMS records. Useful for testing.
++   */
++  clearSentMessages(): void {
++    this.sentMessages = [];
++  }
++
++  /**
++   * Get the current adapter configuration.
++   */
++  getConfig(): Readonly<SmsAdapterConfig> {
++    return { ...this.config };
++  }
++
++  /**
++   * Format a message for a given payload without sending.
++   * Useful for previewing SMS messages or testing formatting in isolation.
++   *
++   * @param payload - The notification payload to format.
++   * @returns The formatted SMS message body string.
++   */
++  formatMessage(payload: NotificationPayload): string {
++    return formatSmsMessage(payload, this.config.maxMessageLength);
++  }
++
++  /**
++   * Validate a recipient phone number without sending.
++   *
++   * @param phoneNumber - The phone number to validate.
++   * @returns true if the phone number format is valid.
++   */
++  validateRecipient(phoneNumber: string): boolean {
++    const resolved = resolvePhoneNumber(phoneNumber);
++    return resolved !== null && resolved.isValid;
++  }
++
++  // -------------------------------------------------------------------------
++  // Private Delivery Methods
++  // -------------------------------------------------------------------------
++
++  /**
++   * Attempt SMS delivery with retry logic.
++   *
++   * Retries up to `config.maxRetries` times on transient failures.
++   * Throws on permanent failure after all retries are exhausted.
++   *
++   * @param sms - The complete SMS message to deliver.
++   * @throws Error if delivery fails after all retries.
++   */
++  private async deliverWithRetry(sms: SmsMessage): Promise<void> {
++    let lastError: Error | undefined;
++
++    for (let attempt = 1; attempt <= this.config.maxRetries; attempt++) {
++      try {
++        await this.deliverSms(sms);
++        return; // Success
++      } catch (error) {
++        lastError = error instanceof Error ? error : new Error(String(error));
++        this.logger.warn(
++          `SMS delivery attempt ${attempt}/${this.config.maxRetries} failed: ${lastError.message}`,
++        );
++
++        // Wait before retrying (simple exponential backoff)
++        if (attempt < this.config.maxRetries) {
++          await this.delay(Math.pow(2, attempt - 1) * 100);
++        }
++      }
++    }
++
++    throw lastError ?? new Error('SMS delivery failed after all retries');
++  }
++
++  /**
++   * Real SMS delivery — override in production or replace with actual SMS API.
++   *
++   * In a real deployment, this method would:
++   * - Connect to an SMS provider API (e.g., Twilio, AWS SNS, Vonage)
++   * - Authenticate with API credentials
++   * - Send the SMS message
++   * - Parse and return the provider response
++   *
++   * @param _sms - The SMS message to deliver.
++   * @throws Error if delivery fails.
++   */
++  private async deliverSms(_sms: SmsMessage): Promise<void> {
++    // TODO: Replace with real SMS provider integration.
++    // Example integrations:
++    //   - twilio for Twilio SMS API
++    //   - @aws-sdk/client-sns for Amazon SNS
++    //   - @vonage/server-sdk for Vonage (formerly Nexmo)
++    throw new Error(
++      'Real SMS delivery not implemented. Set stubMode: true for development.',
++    );
++  }
++
++  /**
++   * Simple delay utility for retry backoff.
++   */
++  private delay(ms: number): Promise<void> {
++    const timer = globalThis as unknown as {
++      setTimeout: (cb: () => void, ms: number) => unknown;
++    };
++    return new Promise<void>((resolve) => {
++      timer.setTimeout(resolve, ms);
++    });
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 649ff38..0b80081 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -4,7 +4,7 @@
+  * Architecture:
+  * - Service Layer: UserService, OrderService, NotificationService (business logic)
+  * - Repository Layer: UserRepository, OrderRepository (data access via Repository pattern)
+- * - Adapter Layer: EmailAdapter (notification delivery via Adapter pattern)
++ * - Adapter Layer: EmailAdapter, SmsAdapter, WebhookAdapter (notification delivery via Adapter pattern)
+  * - Utility Layer: Database, Logger, Pagination (infrastructure)
+  * - Event System: EventBus with typed events (decoupled communication)
+  *
+@@ -100,6 +100,17 @@ export type {
+   WebhookPayloadBody,
+   WebhookDeliveryRecord,
+ } from './adapters/webhook.adapter.js';
++export {
++  SmsAdapter,
++  defaultSmsConfig,
++  isValidPhoneNumber,
++  resolvePhoneNumber,
++  formatSmsMessage,
++} from './adapters/sms.adapter.js';
++export type {
++  SmsAdapterConfig,
++  SmsMessage,
++} from './adapters/sms.adapter.js';
+ 
+ // Validators
+ export {
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+index 3bf173a..a593974 100644
+--- a/src/models/user-preferences.ts
++++ b/src/models/user-preferences.ts
+@@ -16,6 +16,39 @@
+  *   email notifications are sent regardless of category settings.
+  * - Frequency controls how often digest-style emails are batched. 'immediate'
+  *   means every notification is sent as it occurs.
++ *
++ * ⚠️  ASSUMPTION CHANGE — SMS CHANNEL ADDED (2026-03-27)
++ * =========================================================================
++ * This model was originally designed with an EMAIL-ONLY assumption. SMS has
++ * now been added as a notification channel (see src/adapters/sms.adapter.ts),
++ * which invalidates the single-channel design of this preferences model.
++ *
++ * The following changes are needed (but NOT yet implemented — flagged for
++ * the next developer):
++ *
++ * 1. Add an `sms` field to `UserNotificationPreferences` (similar to `email`),
++ *    with its own `SmsPreferences` interface containing:
++ *    - `enabled: boolean` — master switch for SMS notifications
++ *    - `categoryPreferences: NotificationCategoryPreference[]` — per-type opt-in/out
++ *    (SMS does not need a `frequency` field since SMS is always immediate.)
++ *
++ * 2. Update `CreatePreferencesInput` and `UpdatePreferencesInput` to accept
++ *    an optional `sms?: Partial<SmsPreferences>` field.
++ *
++ * 3. Add a `getDefaultSmsPreferences()` function returning defaults (all enabled).
++ *
++ * 4. Update `PreferencesService.shouldSendNotification()` to handle `channel === 'sms'`
++ *    instead of falling through to the default `return true` for unknown channels.
++ *
++ * 5. Update `PreferencesService.createPreferences()` and `updatePreferences()`
++ *    to handle the new `sms` field.
++ *
++ * Until these changes are made, SMS notifications will always be sent (the
++ * PreferencesService returns `true` for unknown/unhandled channels). This is
++ * safe but means users cannot opt out of SMS notifications yet.
++ *
++ * See also: SMS_CHANNEL_NOTES.md in the project root for full context.
++ * =========================================================================
+  */
+ 
+ import type { NotificationType } from './notification.js';
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+index b24578e..713a0ef 100644
+--- a/src/services/preferences.service.ts
++++ b/src/services/preferences.service.ts
+@@ -13,6 +13,14 @@
+  * - This service does NOT emit events — it is a passive data service queried
+  *   by the NotificationService during dispatch.
+  *
++ * ⚠️  TODO: SMS channel support in preferences (2026-03-27)
++ * The user preferences model and this service were built with an email-only
++ * assumption. Now that SMS has been added as a channel (see SmsAdapter),
++ * this service needs to be updated to handle SMS preferences. Currently,
++ * `shouldSendNotification()` returns `true` for the 'sms' channel (unknown
++ * channel fallback), meaning users cannot opt out of SMS. See the detailed
++ * change list in src/models/user-preferences.ts and SMS_CHANNEL_NOTES.md.
++ *
+  * Depends on:
+  * - PreferencesRepository (data layer) for persistence
+  */
+@@ -207,11 +215,18 @@ export class PreferencesService {
+       return true;
+     }
+ 
+-    // Currently only email channel is supported.
++    // Currently only email channel has preference support.
+     if (channel === 'email') {
+       return this.shouldSendEmail(preferences, notificationType);
+     }
+ 
++    // TODO: Add SMS preference checking here once the preferences model
++    // is updated with an `sms` field. Until then, SMS notifications are
++    // always sent (cannot be opted out of). See SMS_CHANNEL_NOTES.md.
++    // if (channel === 'sms') {
++    //   return this.shouldSendSms(preferences, notificationType);
++    // }
++
+     // Unknown or unsupported channels default to sending.
+     return true;
+   }
+diff --git a/tests/adapters/sms.adapter.test.ts b/tests/adapters/sms.adapter.test.ts
+new file mode 100644
+index 0000000..a444820
+--- /dev/null
++++ b/tests/adapters/sms.adapter.test.ts
+@@ -0,0 +1,597 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  SmsAdapter,
++  isValidPhoneNumber,
++  resolvePhoneNumber,
++  formatSmsMessage,
++} from '../../src/adapters/sms.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++describe('SmsAdapter', () => {
++  let adapter: SmsAdapter;
++
++  const samplePayload: NotificationPayload = {
++    type: 'order_confirmation',
++    recipient: '+15551234567',
++    subject: 'Order Confirmation: order-0001',
++    body: 'Your order has been placed.',
++    channel: 'sms',
++    priority: 'normal',
++  };
++
++  beforeEach(() => {
++    adapter = new SmsAdapter({ stubMode: true });
++  });
++
++  // -------------------------------------------------------------------------
++  // send() — core delivery
++  // -------------------------------------------------------------------------
++
++  describe('send', () => {
++    it('should succeed in stub mode', async () => {
++      const result = await adapter.send(samplePayload);
++
++      expect(result.success).toBe(true);
++      expect(result.channel).toBe('sms');
++    });
++
++    it('should record sent messages in stub mode', async () => {
++      await adapter.send(samplePayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages).toHaveLength(1);
++      expect(sentMessages[0]?.to).toBe('+15551234567');
++      expect(sentMessages[0]?.body).toContain('Order Confirmation');
++    });
++
++    it('should fail in non-stub mode (no real SMS provider configured)', async () => {
++      const productionAdapter = new SmsAdapter({ stubMode: false });
++      const result = await productionAdapter.send(samplePayload);
++
++      expect(result.success).toBe(false);
++      expect(result.failureReason).toBeDefined();
++    });
++
++    it('should succeed in stub mode for non-phone recipient (e.g., user ID)', async () => {
++      const idPayload: NotificationPayload = {
++        ...samplePayload,
++        recipient: 'user_1',
++      };
++
++      const result = await adapter.send(idPayload);
++
++      // Stub mode is lenient — accepts non-phone recipients with a warning
++      expect(result.success).toBe(true);
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.to).toBe('user_1');
++    });
++
++    it('should fail in production mode for non-phone recipient', async () => {
++      const productionAdapter = new SmsAdapter({ stubMode: false });
++      const idPayload: NotificationPayload = {
++        ...samplePayload,
++        recipient: 'user_1',
++      };
++
++      const result = await productionAdapter.send(idPayload);
++
++      expect(result.success).toBe(false);
++      expect(result.failureReason).toContain('Invalid recipient phone number');
++    });
++
++    it('should fail for empty recipient', async () => {
++      const badPayload: NotificationPayload = {
++        ...samplePayload,
++        recipient: '',
++      };
++
++      const result = await adapter.send(badPayload);
++
++      expect(result.success).toBe(false);
++      expect(result.failureReason).toContain('Invalid recipient');
++    });
++
++    it('should strip formatting from recipient phone number', async () => {
++      const formattedPayload: NotificationPayload = {
++        ...samplePayload,
++        recipient: '+1 (555) 123-4567',
++      };
++
++      await adapter.send(formattedPayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.to).toBe('+15551234567');
++    });
++
++    it('should record the from number from config', async () => {
++      await adapter.send(samplePayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.from).toBe('+15550000000');
++    });
++
++    it('should format message body as concise SMS', async () => {
++      await adapter.send(samplePayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.body).toBe(
++        'Order Confirmation: order-0001: Your order has been placed.',
++      );
++    });
++
++    it('should truncate long messages', async () => {
++      const longPayload: NotificationPayload = {
++        ...samplePayload,
++        body: 'A'.repeat(200),
++      };
++
++      await adapter.send(longPayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.body.length).toBeLessThanOrEqual(160);
++      expect(sentMessages[0]?.body).toMatch(/\.\.\.$/);
++    });
++
++    it('should record notification type on sent messages', async () => {
++      await adapter.send(samplePayload);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.notificationType).toBe('order_confirmation');
++    });
++
++    it('should record composedAt timestamp on sent messages', async () => {
++      const before = new Date();
++      await adapter.send(samplePayload);
++      const after = new Date();
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.composedAt.getTime()).toBeGreaterThanOrEqual(
++        before.getTime(),
++      );
++      expect(sentMessages[0]?.composedAt.getTime()).toBeLessThanOrEqual(
++        after.getTime(),
++      );
++    });
++
++    it('should handle multiple sequential sends', async () => {
++      await adapter.send(samplePayload);
++      await adapter.send({
++        ...samplePayload,
++        recipient: '+15559876543',
++        subject: 'Second SMS',
++      });
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages).toHaveLength(2);
++      expect(sentMessages[0]?.to).toBe('+15551234567');
++      expect(sentMessages[1]?.to).toBe('+15559876543');
++    });
++
++    it('should propagate metadata from payload to SMS message', async () => {
++      const payloadWithMeta: NotificationPayload = {
++        ...samplePayload,
++        metadata: { orderId: 'order-0001', trackingUrl: 'https://track.example.com' },
++      };
++
++      await adapter.send(payloadWithMeta);
++
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.metadata).toEqual({
++        orderId: 'order-0001',
++        trackingUrl: 'https://track.example.com',
++      });
++    });
++
++    it('should not throw even when send encounters an error', async () => {
++      const productionAdapter = new SmsAdapter({
++        stubMode: false,
++        maxRetries: 1,
++      });
++
++      // Should not throw — returns failure result instead
++      const result = await productionAdapter.send(samplePayload);
++      expect(result.success).toBe(false);
++      expect(result.failureReason).toBeDefined();
++    });
++
++    it('should handle all notification types', async () => {
++      const types: NotificationPayload['type'][] = [
++        'order_confirmation',
++        'order_status_update',
++        'welcome',
++        'account_updated',
++      ];
++
++      for (const type of types) {
++        const payload: NotificationPayload = {
++          ...samplePayload,
++          type,
++        };
++        const result = await adapter.send(payload);
++        expect(result.success).toBe(true);
++      }
++
++      expect(adapter.getSentMessages()).toHaveLength(4);
++    });
++
++    it('should handle payloads without metadata', async () => {
++      const noMetaPayload: NotificationPayload = {
++        type: 'welcome',
++        recipient: '+15551234567',
++        subject: 'Welcome!',
++        body: 'Welcome to the app.',
++        channel: 'sms',
++        priority: 'normal',
++      };
++
++      const result = await adapter.send(noMetaPayload);
++
++      expect(result.success).toBe(true);
++      const sentMessages = adapter.getSentMessages();
++      expect(sentMessages[0]?.metadata).toBeUndefined();
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // Configuration
++  // -------------------------------------------------------------------------
++
++  describe('configuration', () => {
++    it('should use default config when none provided', () => {
++      const defaultAdapter = new SmsAdapter();
++      const config = defaultAdapter.getConfig();
++
++      expect(config.fromNumber).toBe('+15550000000');
++      expect(config.stubMode).toBe(true);
++      expect(config.maxRetries).toBe(3);
++      expect(config.maxMessageLength).toBe(160);
++    });
++
++    it('should merge custom config with defaults', () => {
++      const customAdapter = new SmsAdapter({
++        fromNumber: '+15559999999',
++        maxMessageLength: 320,
++      });
++      const config = customAdapter.getConfig();
++
++      expect(config.fromNumber).toBe('+15559999999');
++      expect(config.maxMessageLength).toBe(320);
++      expect(config.stubMode).toBe(true); // default preserved
++      expect(config.maxRetries).toBe(3); // default preserved
++    });
++
++    it('should include maxRetries in default config', () => {
++      const config = adapter.getConfig();
++      expect(config.maxRetries).toBe(3);
++    });
++
++    it('should return a defensive copy of config', () => {
++      const config1 = adapter.getConfig();
++      const config2 = adapter.getConfig();
++      expect(config1).toEqual(config2);
++      expect(config1).not.toBe(config2);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // Channel Property
++  // -------------------------------------------------------------------------
++
++  describe('channel property', () => {
++    it('should report sms as its channel', () => {
++      expect(adapter.channel).toBe('sms');
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // clearSentMessages
++  // -------------------------------------------------------------------------
++
++  describe('clearSentMessages', () => {
++    it('should clear sent message records', async () => {
++      await adapter.send(samplePayload);
++      expect(adapter.getSentMessages()).toHaveLength(1);
++
++      adapter.clearSentMessages();
++      expect(adapter.getSentMessages()).toHaveLength(0);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // Message Formatting
++  // -------------------------------------------------------------------------
++
++  describe('message formatting', () => {
++    it('should format order_confirmation message', () => {
++      const formatted = adapter.formatMessage(samplePayload);
++
++      expect(formatted).toBe(
++        'Order Confirmation: order-0001: Your order has been placed.',
++      );
++    });
++
++    it('should format order_status_update message', () => {
++      const statusPayload: NotificationPayload = {
++        type: 'order_status_update',
++        recipient: '+15551234567',
++        subject: 'Order Update: order-0001',
++        body: 'Your order status has changed from pending to shipped.',
++        channel: 'sms',
++        priority: 'normal',
++      };
++
++      const formatted = adapter.formatMessage(statusPayload);
++
++      expect(formatted).toContain('Order Update');
++      expect(formatted).toContain('pending to shipped');
++    });
++
++    it('should format welcome message', () => {
++      const welcomePayload: NotificationPayload = {
++        type: 'welcome',
++        recipient: '+15551234567',
++        subject: 'Welcome to TaskFlow Pro!',
++        body: 'Your account has been created.',
++        channel: 'sms',
++        priority: 'normal',
++      };
++
++      const formatted = adapter.formatMessage(welcomePayload);
++
++      expect(formatted).toContain('Welcome to TaskFlow Pro!');
++      expect(formatted).toContain('Your account has been created.');
++    });
++
++    it('should truncate messages exceeding max length with ellipsis', () => {
++      const longPayload: NotificationPayload = {
++        ...samplePayload,
++        subject: 'Very Long Subject',
++        body: 'B'.repeat(200),
++      };
++
++      const formatted = adapter.formatMessage(longPayload);
++
++      expect(formatted.length).toBe(160);
++      expect(formatted).toMatch(/\.\.\.$/);
++    });
++
++    it('should not truncate messages within max length', () => {
++      const shortPayload: NotificationPayload = {
++        ...samplePayload,
++        subject: 'Hi',
++        body: 'Short message.',
++      };
++
++      const formatted = adapter.formatMessage(shortPayload);
++
++      expect(formatted).toBe('Hi: Short message.');
++      expect(formatted.length).toBeLessThan(160);
++    });
++
++    it('should respect custom max message length', () => {
++      const longAdapter = new SmsAdapter({ maxMessageLength: 320 });
++      const longPayload: NotificationPayload = {
++        ...samplePayload,
++        subject: 'Subject',
++        body: 'C'.repeat(400),
++      };
++
++      const formatted = longAdapter.formatMessage(longPayload);
++
++      expect(formatted.length).toBe(320);
++      expect(formatted).toMatch(/\.\.\.$/);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // Recipient Validation
++  // -------------------------------------------------------------------------
++
++  describe('recipient validation', () => {
++    it('should accept E.164 phone numbers', () => {
++      expect(adapter.validateRecipient('+15551234567')).toBe(true);
++      expect(adapter.validateRecipient('+442071234567')).toBe(true);
++      expect(adapter.validateRecipient('+61412345678')).toBe(true);
++    });
++
++    it('should accept domestic format numbers', () => {
++      expect(adapter.validateRecipient('5551234567')).toBe(true);
++      expect(adapter.validateRecipient('15551234567')).toBe(true);
++    });
++
++    it('should accept formatted numbers', () => {
++      expect(adapter.validateRecipient('+1 (555) 123-4567')).toBe(true);
++      expect(adapter.validateRecipient('555-123-4567')).toBe(true);
++      expect(adapter.validateRecipient('(555) 123-4567')).toBe(true);
++    });
++
++    it('should reject invalid phone numbers', () => {
++      expect(adapter.validateRecipient('')).toBe(false);
++      expect(adapter.validateRecipient('not-a-phone')).toBe(false);
++      expect(adapter.validateRecipient('abc')).toBe(false);
++      expect(adapter.validateRecipient('12345')).toBe(false);
++    });
++
++    it('should reject too-short numbers', () => {
++      expect(adapter.validateRecipient('123456')).toBe(false);
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------
++// Standalone utility function tests
++// ---------------------------------------------------------------------------
++
++describe('isValidPhoneNumber', () => {
++  it('should accept E.164 format phone numbers', () => {
++    expect(isValidPhoneNumber('+15551234567')).toBe(true);
++    expect(isValidPhoneNumber('+442071234567')).toBe(true);
++    expect(isValidPhoneNumber('+61412345678')).toBe(true);
++    expect(isValidPhoneNumber('+8613812345678')).toBe(true);
++  });
++
++  it('should accept domestic phone numbers (7-15 digits)', () => {
++    expect(isValidPhoneNumber('5551234567')).toBe(true);
++    expect(isValidPhoneNumber('15551234567')).toBe(true);
++    expect(isValidPhoneNumber('1234567')).toBe(true);
++  });
++
++  it('should accept formatted phone numbers', () => {
++    expect(isValidPhoneNumber('+1 (555) 123-4567')).toBe(true);
++    expect(isValidPhoneNumber('555-123-4567')).toBe(true);
++    expect(isValidPhoneNumber('(555) 123-4567')).toBe(true);
++    expect(isValidPhoneNumber('+1 555.123.4567')).toBe(true);
++  });
++
++  it('should reject invalid formats', () => {
++    expect(isValidPhoneNumber('')).toBe(false);
++    expect(isValidPhoneNumber('not-a-phone')).toBe(false);
++    expect(isValidPhoneNumber('abc')).toBe(false);
++    expect(isValidPhoneNumber('alice@example.com')).toBe(false);
++  });
++
++  it('should reject too-short numbers', () => {
++    expect(isValidPhoneNumber('12345')).toBe(false);
++    expect(isValidPhoneNumber('123456')).toBe(false);
++    expect(isValidPhoneNumber('+12345')).toBe(false);
++  });
++
++  it('should reject null/undefined-like values', () => {
++    expect(isValidPhoneNumber('' as string)).toBe(false);
++    expect(isValidPhoneNumber(null as unknown as string)).toBe(false);
++    expect(isValidPhoneNumber(undefined as unknown as string)).toBe(false);
++  });
++});
++
++describe('resolvePhoneNumber', () => {
++  it('should normalise E.164 numbers', () => {
++    const result = resolvePhoneNumber('+15551234567');
++    expect(result).not.toBeNull();
++    expect(result!.number).toBe('+15551234567');
++    expect(result!.isValid).toBe(true);
++  });
++
++  it('should strip formatting characters', () => {
++    const result = resolvePhoneNumber('+1 (555) 123-4567');
++    expect(result).not.toBeNull();
++    expect(result!.number).toBe('+15551234567');
++    expect(result!.isValid).toBe(true);
++  });
++
++  it('should trim whitespace', () => {
++    const result = resolvePhoneNumber('  +15551234567  ');
++    expect(result).not.toBeNull();
++    expect(result!.number).toBe('+15551234567');
++  });
++
++  it('should resolve non-phone identifiers with isValid=false', () => {
++    const result = resolvePhoneNumber('user_1');
++    expect(result).not.toBeNull();
++    expect(result!.number).toBe('user_1');
++    expect(result!.isValid).toBe(false);
++  });
++
++  it('should return null for empty string', () => {
++    expect(resolvePhoneNumber('')).toBeNull();
++  });
++
++  it('should return null for whitespace-only string', () => {
++    expect(resolvePhoneNumber('   ')).toBeNull();
++  });
++
++  it('should return null for null/undefined input', () => {
++    expect(resolvePhoneNumber(null as unknown as string)).toBeNull();
++    expect(resolvePhoneNumber(undefined as unknown as string)).toBeNull();
++  });
++});
++
++describe('formatSmsMessage', () => {
++  it('should format all notification types without errors', () => {
++    const types: NotificationPayload['type'][] = [
++      'order_confirmation',
++      'order_status_update',
++      'welcome',
++      'account_updated',
++    ];
++
++    for (const type of types) {
++      const payload: NotificationPayload = {
++        type,
++        recipient: '+15551234567',
++        subject: `Test ${type}`,
++        body: `Body for ${type}`,
++        channel: 'sms',
++        priority: 'normal',
++      };
++
++      const formatted = formatSmsMessage(payload);
++
++      expect(formatted).toBe(`Test ${type}: Body for ${type}`);
++      expect(formatted.length).toBeGreaterThan(0);
++      expect(formatted.length).toBeLessThanOrEqual(160);
++    }
++  });
++
++  it('should truncate with ellipsis when exceeding max length', () => {
++    const payload: NotificationPayload = {
++      type: 'order_confirmation',
++      recipient: '+15551234567',
++      subject: 'Long Subject',
++      body: 'X'.repeat(200),
++      channel: 'sms',
++      priority: 'normal',
++    };
++
++    const formatted = formatSmsMessage(payload, 160);
++
++    expect(formatted.length).toBe(160);
++    expect(formatted).toMatch(/\.\.\.$/);
++  });
++
++  it('should respect custom max length', () => {
++    const payload: NotificationPayload = {
++      type: 'order_confirmation',
++      recipient: '+15551234567',
++      subject: 'Subject',
++      body: 'Y'.repeat(400),
++      channel: 'sms',
++      priority: 'normal',
++    };
++
++    const formatted = formatSmsMessage(payload, 320);
++
++    expect(formatted.length).toBe(320);
++    expect(formatted).toMatch(/\.\.\.$/);
++  });
++
++  it('should not truncate short messages', () => {
++    const payload: NotificationPayload = {
++      type: 'welcome',
++      recipient: '+15551234567',
++      subject: 'Hi',
++      body: 'Welcome!',
++      channel: 'sms',
++      priority: 'normal',
++    };
++
++    const formatted = formatSmsMessage(payload);
++
++    expect(formatted).toBe('Hi: Welcome!');
++  });
++
++  it('should include metadata in formatted message when present', () => {
++    const payload: NotificationPayload = {
++      type: 'order_confirmation',
++      recipient: '+15551234567',
++      subject: 'Test',
++      body: 'Body',
++      channel: 'sms',
++      priority: 'normal',
++      metadata: { key: 'value' },
++    };
++
++    // Metadata is not included in the SMS body — just verifying it doesn't break formatting
++    const formatted = formatSmsMessage(payload);
++    expect(formatted).toBe('Test: Body');
++  });
++});

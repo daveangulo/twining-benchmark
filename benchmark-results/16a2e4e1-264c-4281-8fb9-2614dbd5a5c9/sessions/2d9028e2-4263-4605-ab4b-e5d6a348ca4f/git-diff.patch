@@ -1,0 +1,1576 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+new file mode 100644
+index 0000000..1aa4586
+--- /dev/null
++++ b/ARCHITECTURE.md
+@@ -0,0 +1,103 @@
++# Notification System Architecture
++
++## Decision: Event-Driven with Adapter Dispatch
++
++**Pattern chosen:** Event-driven (EventBus with subscribers)
++**Pattern rejected:** Direct service calls / CallbackRegistry
++
++### Why Event-Driven?
++
++1. **The codebase already uses EventBus.** The EventBus was the primary inter-service communication mechanism. The prior inconsistency (mixing CallbackRegistry with EventBus) was explicitly flagged as a problem to fix. We unified on EventBus.
++
++2. **Loose coupling.** Domain services (OrderService, UserService) emit events without knowing who listens. Adding a new notification channel (SMS, webhook) requires zero changes to existing services — just register a new adapter.
++
++3. **Extensibility for 11+ developers.** With 11 more developers building on this foundation, a single extension point (implement `NotificationAdapter`, register it) is far easier to coordinate than modifying shared service call chains.
++
++4. **Observability.** EventBus maintains an event log. Every domain event and every notification lifecycle event (sent, failed) is recorded, enabling audit trails, debugging, and testing.
++
++5. **Async-first.** EventBus handlers are async, which matches the reality of notification delivery (network I/O to SMTP, SMS gateways, webhooks).
++
++### Architecture Overview
++
++```
++┌─────────────────┐     emit()      ┌──────────┐     on()     ┌─────────────────────┐
++│  OrderService    │ ──────────────► │          │ ────────────► │                     │
++│  UserService     │   domain events │ EventBus │              │ NotificationService │
++│  (any service)   │                 │          │ ◄──────────── │                     │
++└─────────────────┘                  └──────────┘   emit()     └──────────┬──────────┘
++                                                  lifecycle events        │
++                                                                         │ dispatch by channel
++                                                                         ▼
++                                                              ┌─────────────────────┐
++                                                              │  Adapter Registry    │
++                                                              │                     │
++                                                              │  email → EmailAdapter│
++                                                              │  sms   → SmsAdapter │
++                                                              │  ...   → ...        │
++                                                              └─────────────────────┘
++```
++
++### Flow
++
++1. A domain service performs a business action and calls `eventBus.emit({ type: 'order:created', ... })`.
++2. `NotificationService` has subscribed to `'order:created'` via `eventBus.on()`.
++3. The handler maps the domain event to a `CreateNotificationInput` (choosing type, recipient, subject, body, channel, priority).
++4. `NotificationService.send()` looks up the registered `NotificationAdapter` for the specified channel.
++5. The adapter's `send()` method attempts delivery and returns a `NotificationResult`.
++6. A `NotificationRecord` is stored with the delivery status.
++7. A lifecycle event (`notification:sent` or `notification:failed`) is emitted back to EventBus.
++
++### Constraints (MUST follow)
++
++1. **All cross-service communication MUST go through EventBus.** Do NOT use `CallbackRegistry`, direct function calls between services, or shared mutable state. The `CallbackRegistry` still exists in `/src/utils/` for backward compatibility but MUST NOT be used for new features.
++
++2. **All notification delivery adapters MUST implement `NotificationAdapter`.** This interface is defined in `/src/adapters/notification.adapter.ts`. It requires:
++   - A `readonly channel` property matching a `NotificationChannel` value.
++   - An async `send(payload)` method returning a `NotificationResult`.
++
++3. **Adapters MUST NOT throw from `send()`.** Return `{ success: false, failureReason: '...' }` instead. The `NotificationService` has a safety catch, but adapters should handle their own errors.
++
++4. **One adapter per channel.** Registering a second adapter for the same channel replaces the first. If you need multiple providers for the same channel (e.g., failover), implement that inside a single adapter.
++
++5. **All notifications go through `NotificationService.send()`.** Do not bypass it to call adapters directly. The service handles record-keeping and lifecycle events.
++
++6. **Notification types must be declared.** Add new values to the `NotificationType` union in `/src/models/notification.ts` when adding new notification-worthy events.
++
++### Type Reference
++
++| Type | Location | Purpose |
++|------|----------|---------|
++| `NotificationType` | `src/models/notification.ts` | What happened (e.g., `'order_confirmation'`) |
++| `NotificationChannel` | `src/models/notification.ts` | How to deliver (e.g., `'email'`, `'sms'`) |
++| `NotificationPriority` | `src/models/notification.ts` | Urgency level (`'low'` to `'urgent'`) |
++| `NotificationStatus` | `src/models/notification.ts` | Delivery state (`'pending'`, `'sent'`, `'failed'`) |
++| `NotificationPayload` | `src/models/notification.ts` | What's passed to adapters |
++| `NotificationRecord` | `src/models/notification.ts` | What's stored (includes status) |
++| `NotificationResult` | `src/models/notification.ts` | What adapters return |
++| `CreateNotificationInput` | `src/models/notification.ts` | Convenience input for `send()` |
++| `NotificationAdapter` | `src/adapters/notification.adapter.ts` | Interface for all adapters |
++| `NotificationSentEvent` | `src/events/event-types.ts` | Lifecycle event on success |
++| `NotificationFailedEvent` | `src/events/event-types.ts` | Lifecycle event on failure |
++
++### How to Add a New Notification Channel
++
++1. Create `src/adapters/<channel>.adapter.ts` implementing `NotificationAdapter`.
++2. Add any channel-specific config interface.
++3. Register the adapter: `notificationService.registerAdapter(new MyAdapter(config))`.
++4. Export from `src/index.ts`.
++5. Add tests in `tests/adapters/<channel>.adapter.test.ts`.
++
++### How to Add a New Notification-Worthy Event
++
++1. Define the event interface in `src/events/event-types.ts`.
++2. Add it to the `AppEvent` union type.
++3. Add a corresponding `NotificationType` value in `src/models/notification.ts`.
++4. Add an event handler in `NotificationService.registerEventHandlers()`.
++5. Emit the event from the relevant domain service via `eventBus.emit()`.
++
++### What Changed from the Previous Architecture
++
++- **Unified on EventBus.** Previously, `OrderService.updateOrderStatus()` used `CallbackRegistry` (direct callbacks) while `OrderService.createOrder()` used `EventBus`. Now both use `EventBus`.
++- **Adapter pattern for delivery.** Previously, `NotificationService` stored notifications in-memory directly. Now it dispatches to registered adapters, with `EmailAdapter` as the first implementation.
++- **Richer notification model.** The old `Notification` interface had 5 fields. The new `NotificationRecord` has 12 fields including type, channel, status, priority, and metadata.
++- **Lifecycle events.** `notification:sent` and `notification:failed` events are now emitted, enabling observability and downstream reactions.
+diff --git a/CLAUDE.md b/CLAUDE.md
+new file mode 100644
+index 0000000..1ec5eb7
+--- /dev/null
++++ b/CLAUDE.md
+@@ -0,0 +1,34 @@
++# Project Guidelines
++
++## Architecture
++- This project follows the repository pattern for data access
++- Services depend on repositories, never on each other directly
++- Events are preferred over direct cross-service calls for decoupling
++- All business logic lives in the service layer
++
++## Coding Conventions
++- Use TypeScript strict mode — no `any` types
++- All public methods must have JSDoc comments
++- Use dependency injection via constructor parameters
++- Error handling: throw typed errors, never return null for errors
++- Prefer async/await over raw Promises
++
++## Testing
++- Tests use vitest
++- Each module has a corresponding test file in tests/
++- Mock external dependencies, test business logic directly
++- Minimum: test the happy path and one error path per public method
++
++## File Organization
++- src/models/ — Data models and interfaces
++- src/repositories/ — Data access layer (implements repository interfaces)
++- src/services/ — Business logic layer
++- src/events/ — Event definitions and event bus
++- src/utils/ — Shared utilities (database, logger, pagination)
++- src/config/ — Configuration files
++- tests/ — Test files mirroring src/ structure
++
++## Git Practices
++- Commit atomically per logical change
++- Write descriptive commit messages explaining the "why"
++- Run tests before committing
+diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts
+new file mode 100644
+index 0000000..0f3ecf3
+--- /dev/null
++++ b/src/adapters/email.adapter.ts
+@@ -0,0 +1,159 @@
++/**
++ * Email notification adapter — delivers notifications via email.
++ *
++ * This is a stub implementation that logs email delivery instead of
++ * actually sending. In production, replace the `deliverEmail` method
++ * with a real SMTP client or email API integration (e.g., SendGrid, SES).
++ *
++ * Implements the NotificationAdapter interface. Registered with the
++ * NotificationService to handle all notifications on the 'email' channel.
++ *
++ * Configuration is injected via constructor to support different
++ * environments (dev, staging, production).
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type {
++  NotificationChannel,
++  NotificationPayload,
++  NotificationResult,
++} from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++/**
++ * Configuration for the email adapter.
++ */
++export interface EmailAdapterConfig {
++  /** SMTP host or email API endpoint. */
++  host: string;
++  /** SMTP port (e.g., 587 for TLS). */
++  port: number;
++  /** Sender email address for the "From" field. */
++  fromAddress: string;
++  /** Whether this is a stub (logs instead of sending). */
++  stubMode: boolean;
++}
++
++/**
++ * Default configuration for development/testing.
++ */
++export const defaultEmailConfig: EmailAdapterConfig = {
++  host: 'localhost',
++  port: 587,
++  fromAddress: 'noreply@taskflow.dev',
++  stubMode: true,
++};
++
++/**
++ * Email notification adapter.
++ *
++ * Sends notifications via email. In stub mode (default), logs the
++ * email details instead of actually delivering.
++ */
++export class EmailAdapter implements NotificationAdapter {
++  readonly channel: NotificationChannel = 'email';
++
++  private logger = new Logger('EmailAdapter');
++  private config: EmailAdapterConfig;
++  private sentEmails: Array<{
++    to: string;
++    from: string;
++    subject: string;
++    body: string;
++    sentAt: Date;
++  }> = [];
++
++  constructor(config?: Partial<EmailAdapterConfig>) {
++    this.config = { ...defaultEmailConfig, ...config };
++  }
++
++  /**
++   * Send a notification via email.
++   *
++   * In stub mode, logs the email and records it in memory.
++   * In production mode, would delegate to an SMTP client.
++   *
++   * @param payload - The notification payload to deliver via email.
++   * @returns Result indicating success or failure. Never throws.
++   */
++  async send(payload: NotificationPayload): Promise<NotificationResult> {
++    const result: NotificationResult = {
++      success: false,
++      notificationId: '',
++      channel: 'email',
++    };
++
++    try {
++      if (this.config.stubMode) {
++        // Stub mode: log instead of sending
++        this.logger.info(
++          `[STUB] Email to ${payload.recipient}: "${payload.subject}"`,
++        );
++        this.sentEmails.push({
++          to: payload.recipient,
++          from: this.config.fromAddress,
++          subject: payload.subject,
++          body: payload.body,
++          sentAt: new Date(),
++        });
++      } else {
++        // Production mode: delegate to real email delivery
++        await this.deliverEmail(payload);
++      }
++
++      result.success = true;
++      this.logger.info(`Email sent to ${payload.recipient}`);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : 'Unknown email delivery error';
++      result.success = false;
++      result.failureReason = message;
++      this.logger.error(`Email delivery failed for ${payload.recipient}: ${message}`);
++    }
++
++    return result;
++  }
++
++  /**
++   * Get all emails sent in stub mode. Useful for testing.
++   */
++  getSentEmails(): Array<{
++    to: string;
++    from: string;
++    subject: string;
++    body: string;
++    sentAt: Date;
++  }> {
++    return [...this.sentEmails];
++  }
++
++  /**
++   * Clear sent email records. Useful for testing.
++   */
++  clearSentEmails(): void {
++    this.sentEmails = [];
++  }
++
++  /**
++   * Get the current adapter configuration.
++   */
++  getConfig(): Readonly<EmailAdapterConfig> {
++    return { ...this.config };
++  }
++
++  /**
++   * Real email delivery — override in production or replace with actual SMTP/API.
++   *
++   * @param _payload - The notification payload (unused in stub).
++   * @throws Error if delivery fails.
++   */
++  private async deliverEmail(_payload: NotificationPayload): Promise<void> {
++    // TODO: Replace with real SMTP client or email API integration.
++    // Example integrations:
++    //   - nodemailer for SMTP
++    //   - @sendgrid/mail for SendGrid
++    //   - @aws-sdk/client-ses for Amazon SES
++    throw new Error(
++      'Real email delivery not implemented. Set stubMode: true for development.',
++    );
++  }
++}
+diff --git a/src/adapters/notification.adapter.ts b/src/adapters/notification.adapter.ts
+new file mode 100644
+index 0000000..2ff9a89
+--- /dev/null
++++ b/src/adapters/notification.adapter.ts
+@@ -0,0 +1,47 @@
++/**
++ * Base interface for all notification adapters.
++ *
++ * CONSTRAINT: Every notification delivery channel (email, SMS, webhook, in-app)
++ * MUST implement this interface. The NotificationService dispatches payloads
++ * to adapters based on the `channel` property.
++ *
++ * Adapter contract:
++ * 1. `channel` must match exactly one NotificationChannel value.
++ * 2. `send()` must be async and return a NotificationResult.
++ * 3. `send()` must NOT throw — return { success: false, failureReason } instead.
++ * 4. Adapters are stateless; they do not store notifications.
++ * 5. Adapters receive their configuration via constructor injection.
++ *
++ * Example implementation:
++ * ```typescript
++ * class EmailAdapter implements NotificationAdapter {
++ *   readonly channel: NotificationChannel = 'email';
++ *   async send(payload: NotificationPayload): Promise<NotificationResult> {
++ *     // ... send email ...
++ *     return { success: true, notificationId: payload.subject, channel: 'email' };
++ *   }
++ * }
++ * ```
++ */
++
++import type {
++  NotificationChannel,
++  NotificationPayload,
++  NotificationResult,
++} from '../models/notification.js';
++
++/**
++ * Interface that all notification delivery adapters must implement.
++ */
++export interface NotificationAdapter {
++  /** The delivery channel this adapter handles. Must be unique per adapter. */
++  readonly channel: NotificationChannel;
++
++  /**
++   * Attempt to deliver a notification.
++   *
++   * @param payload - The notification payload to deliver.
++   * @returns A result indicating success or failure. Must not throw.
++   */
++  send(payload: NotificationPayload): Promise<NotificationResult>;
++}
+diff --git a/src/events/event-types.ts b/src/events/event-types.ts
+index a05083e..da17759 100644
+--- a/src/events/event-types.ts
++++ b/src/events/event-types.ts
+@@ -4,10 +4,21 @@
+  * This application uses an event bus for decoupled communication between
+  * modules. Services emit events when significant actions occur, and
+  * interested listeners handle them independently.
++ *
++ * Event categories:
++ * - order:*  — Order lifecycle events (emitted by OrderService)
++ * - user:*   — User lifecycle events (emitted by UserService)
++ * - notification:* — Notification delivery events (emitted by NotificationService)
++ *
++ * ALL cross-service communication MUST go through the EventBus.
++ * Do not use direct callbacks or shared mutable state between services.
+  */
+ 
+ import type { Order } from '../models/order.js';
+ import type { User } from '../models/user.js';
++import type { NotificationRecord } from '../models/notification.js';
++
++// --- Order Events ---
+ 
+ export interface OrderCreatedEvent {
+   type: 'order:created';
+@@ -24,6 +35,8 @@ export interface OrderStatusChangedEvent {
+   timestamp: Date;
+ }
+ 
++// --- User Events ---
++
+ export interface UserCreatedEvent {
+   type: 'user:created';
+   user: User;
+@@ -37,10 +50,29 @@ export interface UserUpdatedEvent {
+   timestamp: Date;
+ }
+ 
++// --- Notification Lifecycle Events ---
++
++export interface NotificationSentEvent {
++  type: 'notification:sent';
++  notification: NotificationRecord;
++  timestamp: Date;
++}
++
++export interface NotificationFailedEvent {
++  type: 'notification:failed';
++  notification: NotificationRecord;
++  reason: string;
++  timestamp: Date;
++}
++
++// --- Union Types ---
++
+ export type AppEvent =
+   | OrderCreatedEvent
+   | OrderStatusChangedEvent
+   | UserCreatedEvent
+-  | UserUpdatedEvent;
++  | UserUpdatedEvent
++  | NotificationSentEvent
++  | NotificationFailedEvent;
+ 
+ export type EventType = AppEvent['type'];
+diff --git a/src/index.ts b/src/index.ts
+index c41a761..e00d646 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -2,14 +2,17 @@
+  * TaskFlow Pro — A task and order management system.
+  *
+  * Architecture:
+- * - Service Layer: UserService, OrderService (business logic)
++ * - Service Layer: UserService, OrderService, NotificationService (business logic)
+  * - Repository Layer: UserRepository, OrderRepository (data access via Repository pattern)
++ * - Adapter Layer: EmailAdapter (notification delivery via Adapter pattern)
+  * - Utility Layer: Database, Logger, Pagination (infrastructure)
+  * - Event System: EventBus with typed events (decoupled communication)
+  *
+  * Key architectural decisions:
+  * 1. Repository pattern for all data access (no direct DB calls from services)
+- * 2. Event-driven notifications (services emit events, listeners handle side effects)
++ * 2. Event-driven notifications: ALL cross-service communication flows through EventBus
++ * 3. Adapter pattern for notification delivery: each channel has an adapter
++ * 4. Services emit events; NotificationService listens and dispatches to adapters
+  */
+ 
+ // Models
+@@ -21,6 +24,16 @@ export type {
+   CreateOrderInput,
+ } from './models/order.js';
+ export { calculateOrderTotal } from './models/order.js';
++export type {
++  NotificationType,
++  NotificationChannel,
++  NotificationPriority,
++  NotificationStatus,
++  NotificationPayload,
++  NotificationRecord,
++  NotificationResult,
++  CreateNotificationInput,
++} from './models/notification.js';
+ 
+ // Utilities
+ export { Database, getDatabase, resetDatabase } from './utils/database.js';
+@@ -42,8 +55,15 @@ export type {
+   OrderStatusChangedEvent,
+   UserCreatedEvent,
+   UserUpdatedEvent,
++  NotificationSentEvent,
++  NotificationFailedEvent,
+ } from './events/event-types.js';
+ 
++// Adapters
++export type { NotificationAdapter } from './adapters/notification.adapter.js';
++export { EmailAdapter, defaultEmailConfig } from './adapters/email.adapter.js';
++export type { EmailAdapterConfig } from './adapters/email.adapter.js';
++
+ // Services
+ export { UserService } from './services/user.service.js';
+ export { OrderService } from './services/order.service.js';
+diff --git a/src/models/notification.ts b/src/models/notification.ts
+new file mode 100644
+index 0000000..59a6ac8
+--- /dev/null
++++ b/src/models/notification.ts
+@@ -0,0 +1,123 @@
++/**
++ * Notification model — core types for the notification system.
++ *
++ * Architecture: All notifications flow through the EventBus. When a domain
++ * event occurs (e.g., order:created), the NotificationService listens for it,
++ * constructs a NotificationPayload, and dispatches it to the appropriate
++ * NotificationAdapter(s) based on channel.
++ *
++ * Type hierarchy:
++ * - NotificationType: What happened (e.g., order_confirmation)
++ * - NotificationChannel: How to deliver (e.g., email, sms)
++ * - NotificationPayload: What to send (constructed by NotificationService)
++ * - NotificationRecord: What's stored (includes delivery status)
++ * - NotificationResult: What adapters return (success/failure)
++ */
++
++/**
++ * The kind of notification being sent. Maps to a domain event.
++ * Extend this union as new notification-worthy events are added.
++ */
++export type NotificationType =
++  | 'order_confirmation'
++  | 'order_status_update'
++  | 'welcome'
++  | 'account_updated';
++
++/**
++ * Delivery channel for a notification.
++ * Each channel has a corresponding adapter that implements NotificationAdapter.
++ */
++export type NotificationChannel = 'email' | 'sms' | 'webhook' | 'in_app';
++
++/**
++ * Priority level for notification delivery.
++ * Adapters may use this to determine delivery urgency.
++ */
++export type NotificationPriority = 'low' | 'normal' | 'high' | 'urgent';
++
++/**
++ * Delivery status of a notification.
++ */
++export type NotificationStatus = 'pending' | 'sent' | 'failed';
++
++/**
++ * Payload describing a notification to be sent.
++ * Constructed by the NotificationService from domain events,
++ * then passed to adapters for delivery.
++ */
++export interface NotificationPayload {
++  /** What kind of notification this is. */
++  type: NotificationType;
++  /** Who receives the notification (email, phone, user ID, etc.). */
++  recipient: string;
++  /** Subject line or title. */
++  subject: string;
++  /** Notification body content. */
++  body: string;
++  /** Which channel to deliver through. */
++  channel: NotificationChannel;
++  /** Delivery priority. Defaults to 'normal' if omitted. */
++  priority: NotificationPriority;
++  /** Optional key-value metadata for adapter-specific data. */
++  metadata?: Record<string, unknown>;
++}
++
++/**
++ * A stored notification record with delivery status tracking.
++ * Created by NotificationService after dispatching to an adapter.
++ */
++export interface NotificationRecord {
++  /** Unique notification ID (e.g., notif-0001). */
++  id: string;
++  /** The notification type. */
++  type: NotificationType;
++  /** The delivery channel used. */
++  channel: NotificationChannel;
++  /** Recipient identifier. */
++  recipient: string;
++  /** Subject line. */
++  subject: string;
++  /** Body content. */
++  body: string;
++  /** Current delivery status. */
++  status: NotificationStatus;
++  /** Delivery priority. */
++  priority: NotificationPriority;
++  /** Optional metadata carried from the payload. */
++  metadata?: Record<string, unknown>;
++  /** When the notification record was created. */
++  createdAt: Date;
++  /** When the notification was successfully sent (if status is 'sent'). */
++  sentAt?: Date;
++  /** Reason for failure (if status is 'failed'). */
++  failureReason?: string;
++}
++
++/**
++ * Result returned by a NotificationAdapter after attempting delivery.
++ */
++export interface NotificationResult {
++  /** Whether delivery succeeded. */
++  success: boolean;
++  /** The notification ID this result pertains to. */
++  notificationId: string;
++  /** The channel that attempted delivery. */
++  channel: NotificationChannel;
++  /** Reason for failure, if success is false. */
++  failureReason?: string;
++}
++
++/**
++ * Input for creating a notification payload.
++ * Used by event handlers to build payloads without specifying all fields.
++ */
++export interface CreateNotificationInput {
++  type: NotificationType;
++  recipient: string;
++  subject: string;
++  body: string;
++  channel?: NotificationChannel;
++  priority?: NotificationPriority;
++  metadata?: Record<string, unknown>;
++}
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 836fb4e..eabe836 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -1,143 +1,352 @@
+ /**
+- * Notification service — handles sending notifications in response to events.
++ * Notification service — orchestrates notification delivery in response to domain events.
+  *
+- * NOTE: This service currently uses TWO different patterns for receiving
+- * notifications, which is inconsistent and should be unified:
++ * ARCHITECTURE DECISION: Event-Driven with Adapter Dispatch
++ * =========================================================
++ * This service uses the EventBus exclusively for receiving domain events.
++ * ALL cross-service communication flows through EventBus — no direct callbacks,
++ * no shared mutable state, no CallbackRegistry.
+  *
+- * 1. EventBus subscriptions (event-driven) — used for order:created events
+- * 2. CallbackRegistry (direct callbacks) — used for order:status-changed events
++ * Flow:
++ * 1. A domain service (OrderService, UserService) emits an event via EventBus.
++ * 2. NotificationService listens for relevant events.
++ * 3. Event handlers map domain events → NotificationPayload(s).
++ * 4. Payloads are dispatched to the appropriate NotificationAdapter by channel.
++ * 5. Delivery results are recorded as NotificationRecords.
++ * 6. notification:sent / notification:failed events are emitted for observability.
+  *
+- * Both approaches work but the mixed usage makes the codebase harder to
+- * maintain. A future refactor should pick ONE approach and use it consistently.
++ * CONSTRAINTS:
++ * - All adapters MUST implement the NotificationAdapter interface.
++ * - All domain events MUST flow through EventBus.emit().
++ * - Adapters MUST NOT throw from send() — return { success: false } instead.
++ * - This service owns the notification lifecycle; adapters own delivery mechanics.
+  *
+  * Depends on:
+- * - EventBus (event system) for receiving some events
+- * - CallbackRegistry (direct callbacks) for other events
++ * - EventBus (event system) for receiving ALL domain events
++ * - NotificationAdapter implementations for delivery
+  */
+ 
+ import type { EventBus } from '../events/event-bus.js';
+-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
+-import { statusChangeCallbacks } from '../utils/callback-registry.js';
++import type {
++  OrderCreatedEvent,
++  OrderStatusChangedEvent,
++  UserCreatedEvent,
++  UserUpdatedEvent,
++} from '../events/event-types.js';
++import type { NotificationAdapter } from '../adapters/notification.adapter.js';
++import type {
++  NotificationChannel,
++  NotificationPayload,
++  NotificationRecord,
++  NotificationResult,
++  CreateNotificationInput,
++} from '../models/notification.js';
+ import { Logger } from '../utils/logger.js';
+ 
+-export interface Notification {
+-  id: string;
+-  recipient: string;
+-  subject: string;
+-  body: string;
+-  sentAt: Date;
+-}
+-
+ let nextId = 1;
+ 
+ function generateNotificationId(): string {
+   return `notif-${String(nextId++).padStart(4, '0')}`;
+ }
+ 
++/** Reset the ID counter. Used in tests. */
+ export function resetNotificationIdCounter(): void {
+   nextId = 1;
+ }
+ 
+ export class NotificationService {
+   private logger = new Logger('NotificationService');
+-  private notifications: Notification[] = [];
++  private notifications: NotificationRecord[] = [];
++  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+-    this.registerHandlers();
++    this.registerEventHandlers();
++  }
++
++  // ---------------------------------------------------------------------------
++  // Adapter Registration
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register a notification adapter for a delivery channel.
++   *
++   * Only one adapter per channel is allowed. Registering a second adapter
++   * for the same channel replaces the previous one.
++   *
++   * @param adapter - The adapter to register. Must implement NotificationAdapter.
++   */
++  registerAdapter(adapter: NotificationAdapter): void {
++    this.logger.info(`Registering adapter for channel: ${adapter.channel}`);
++    this.adapters.set(adapter.channel, adapter);
++  }
++
++  /**
++   * Unregister the adapter for a delivery channel.
++   *
++   * @param channel - The channel whose adapter to remove.
++   * @returns true if an adapter was removed, false if none was registered.
++   */
++  unregisterAdapter(channel: NotificationChannel): boolean {
++    this.logger.info(`Unregistering adapter for channel: ${channel}`);
++    return this.adapters.delete(channel);
++  }
++
++  /**
++   * Get all registered adapter channels.
++   */
++  getRegisteredChannels(): NotificationChannel[] {
++    return Array.from(this.adapters.keys());
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // Notification Dispatch
++  // ---------------------------------------------------------------------------
++
+   /**
+-   * Register event handlers for notification triggers.
++   * Send a notification through the appropriate adapter.
++   *
++   * This is the core dispatch method. It:
++   * 1. Builds a NotificationRecord from the input.
++   * 2. Looks up the adapter for the specified channel.
++   * 3. Calls adapter.send() and records the result.
++   * 4. Emits notification:sent or notification:failed events.
+    *
+-   * Uses EventBus for order creation (event-driven pattern)
+-   * and CallbackRegistry for status changes (direct callback pattern).
++   * @param input - Notification details. Channel defaults to 'email'.
++   * @returns The created NotificationRecord with delivery status.
+    */
+-  private registerHandlers(): void {
+-    // Pattern 1: EventBus subscription for order creation
++  async send(input: CreateNotificationInput): Promise<NotificationRecord> {
++    const channel = input.channel ?? 'email';
++    const priority = input.priority ?? 'normal';
++
++    const payload: NotificationPayload = {
++      type: input.type,
++      recipient: input.recipient,
++      subject: input.subject,
++      body: input.body,
++      channel,
++      priority,
++      metadata: input.metadata,
++    };
++
++    const record: NotificationRecord = {
++      id: generateNotificationId(),
++      type: input.type,
++      channel,
++      recipient: input.recipient,
++      subject: input.subject,
++      body: input.body,
++      status: 'pending',
++      priority,
++      metadata: input.metadata,
++      createdAt: new Date(),
++    };
++
++    const adapter = this.adapters.get(channel);
++    if (!adapter) {
++      record.status = 'failed';
++      record.failureReason = `No adapter registered for channel: ${channel}`;
++      this.logger.warn(record.failureReason);
++      this.notifications.push(record);
++
++      await this.eventBus.emit({
++        type: 'notification:failed',
++        notification: record,
++        reason: record.failureReason,
++        timestamp: new Date(),
++      });
++
++      return record;
++    }
++
++    // Dispatch to the adapter
++    let result: NotificationResult;
++    try {
++      result = await adapter.send(payload);
++    } catch (error) {
++      // Adapters should not throw, but handle it gracefully if they do
++      const reason = error instanceof Error ? error.message : 'Unknown adapter error';
++      result = {
++        success: false,
++        notificationId: record.id,
++        channel,
++        failureReason: reason,
++      };
++    }
++
++    // Update record based on result
++    result.notificationId = record.id;
++    if (result.success) {
++      record.status = 'sent';
++      record.sentAt = new Date();
++    } else {
++      record.status = 'failed';
++      record.failureReason = result.failureReason;
++    }
++
++    this.notifications.push(record);
++
++    // Emit lifecycle event
++    if (record.status === 'sent') {
++      await this.eventBus.emit({
++        type: 'notification:sent',
++        notification: record,
++        timestamp: new Date(),
++      });
++    } else {
++      await this.eventBus.emit({
++        type: 'notification:failed',
++        notification: record,
++        reason: record.failureReason ?? 'Unknown error',
++        timestamp: new Date(),
++      });
++    }
++
++    this.logger.info(
++      `Notification ${record.id} ${record.status} via ${channel} to ${record.recipient}`,
++    );
++
++    return record;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Event Handlers — Map domain events to notifications
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register event handlers for all notification-worthy domain events.
++   *
++   * IMPORTANT: ALL event subscriptions go through EventBus.on().
++   * Do NOT use CallbackRegistry or direct callbacks.
++   */
++  private registerEventHandlers(): void {
+     this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
+-      this.handleOrderCreated(event);
++      return this.handleOrderCreated(event);
+     });
+ 
+-    // Pattern 2: CallbackRegistry for status changes
+-    statusChangeCallbacks.register((event) => {
+-      this.handleOrderStatusChanged(event);
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
++      return this.handleOrderStatusChanged(event);
++    });
++
++    this.eventBus.on<UserCreatedEvent>('user:created', (event) => {
++      return this.handleUserCreated(event);
++    });
++
++    this.eventBus.on<UserUpdatedEvent>('user:updated', (event) => {
++      return this.handleUserUpdated(event);
+     });
+   }
+ 
+   /**
+-   * Handle order created event — send confirmation to user.
++   * Handle order created — send confirmation email to the ordering user.
+    */
+-  private handleOrderCreated(event: OrderCreatedEvent): void {
+-    this.logger.info(`Sending order confirmation for order ${event.order.id}`);
++  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
++    this.logger.info(`Handling order:created for order ${event.order.id}`);
+ 
+     const itemSummary = event.order.items
+       .map((item) => `${item.name} x${item.quantity}`)
+       .join(', ');
+ 
+-    this.sendNotification({
++    await this.send({
++      type: 'order_confirmation',
+       recipient: event.user.email,
+       subject: `Order Confirmation: ${event.order.id}`,
+       body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,
++      channel: 'email',
++      priority: 'normal',
+     });
+   }
+ 
+   /**
+-   * Handle order status change — notify user of update.
++   * Handle order status change — notify user of the update.
+    */
+-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {
++  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {
+     this.logger.info(
+-      `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,
++      `Handling order:status-changed for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,
+     );
+ 
+-    this.sendNotification({
++    await this.send({
++      type: 'order_status_update',
+       recipient: event.order.userId,
+       subject: `Order Update: ${event.order.id}`,
+       body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,
++      channel: 'email',
++      priority: event.newStatus === 'cancelled' ? 'high' : 'normal',
+     });
+   }
+ 
+   /**
+-   * Send a notification (in-memory for this demo).
++   * Handle user created — send welcome notification.
+    */
+-  private sendNotification(params: {
+-    recipient: string;
+-    subject: string;
+-    body: string;
+-  }): void {
+-    const notification: Notification = {
+-      id: generateNotificationId(),
+-      recipient: params.recipient,
+-      subject: params.subject,
+-      body: params.body,
+-      sentAt: new Date(),
+-    };
+-    this.notifications.push(notification);
+-    this.logger.info(`Notification sent: ${notification.id} to ${params.recipient}`);
++  private async handleUserCreated(event: UserCreatedEvent): Promise<void> {
++    this.logger.info(`Handling user:created for user ${event.user.id}`);
++
++    await this.send({
++      type: 'welcome',
++      recipient: event.user.email,
++      subject: 'Welcome to TaskFlow Pro!',
++      body: `Hi ${event.user.name}, welcome to TaskFlow Pro. Your account has been created.`,
++      channel: 'email',
++      priority: 'normal',
++    });
+   }
+ 
+   /**
+-   * Get all sent notifications.
++   * Handle user updated — notify user of account changes.
+    */
+-  getNotifications(): Notification[] {
++  private async handleUserUpdated(event: UserUpdatedEvent): Promise<void> {
++    this.logger.info(`Handling user:updated for user ${event.user.id}`);
++
++    await this.send({
++      type: 'account_updated',
++      recipient: event.user.email,
++      subject: 'Account Updated',
++      body: `Your account has been updated. Changed fields: ${event.changes.join(', ')}.`,
++      channel: 'email',
++      priority: 'low',
++    });
++  }
++
++  // ---------------------------------------------------------------------------
++  // Notification Queries
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Get all notification records.
++   */
++  getNotifications(): NotificationRecord[] {
+     return [...this.notifications];
+   }
+ 
+   /**
+    * Get notifications for a specific recipient.
+    */
+-  getNotificationsForRecipient(recipient: string): Notification[] {
++  getNotificationsForRecipient(recipient: string): NotificationRecord[] {
+     return this.notifications.filter((n) => n.recipient === recipient);
+   }
+ 
+   /**
+-   * Get the count of sent notifications.
++   * Get notifications filtered by status.
++   */
++  getNotificationsByStatus(status: NotificationRecord['status']): NotificationRecord[] {
++    return this.notifications.filter((n) => n.status === status);
++  }
++
++  /**
++   * Get notifications filtered by type.
++   */
++  getNotificationsByType(type: NotificationRecord['type']): NotificationRecord[] {
++    return this.notifications.filter((n) => n.type === type);
++  }
++
++  /**
++   * Get the total count of notification records.
+    */
+   getNotificationCount(): number {
+     return this.notifications.length;
+   }
+ 
+   /**
+-   * Clear all notifications (useful for testing).
++   * Clear all notification records. Useful for testing.
+    */
+   clearNotifications(): void {
+     this.notifications = [];
+diff --git a/src/services/order.service.ts b/src/services/order.service.ts
+index 4ff339f..ff03f4f 100644
+--- a/src/services/order.service.ts
++++ b/src/services/order.service.ts
+@@ -6,10 +6,10 @@
+  * - UserRepository (data layer) for user validation
+  * - EventBus (event system) for publishing order lifecycle events
+  *
+- * Architecture note: Order events are used to trigger side effects
+- * (notifications, analytics, etc.) without direct coupling.
+- * The OrderService emits events; it does not directly call
+- * the NotificationService.
++ * Architecture note: ALL order events are emitted via EventBus for
++ * decoupled communication. This includes both order creation and
++ * status changes. The OrderService emits events; it does not directly
++ * call the NotificationService or use CallbackRegistry.
+  */
+ 
+ import type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';
+@@ -17,7 +17,6 @@ import { calculateOrderTotal } from '../models/order.js';
+ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type { EventBus } from '../events/event-bus.js';
+-import { statusChangeCallbacks } from '../utils/callback-registry.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ let nextId = 1;
+@@ -112,10 +111,8 @@ export class OrderService {
+       updatedAt: new Date(),
+     });
+ 
+-    // NOTE: Status changes use CallbackRegistry (direct callbacks) rather than
+-    // EventBus. This is inconsistent with order creation which uses EventBus.
+-    // See notification.service.ts for the mixed pattern discussion.
+-    statusChangeCallbacks.notify({
++    // Emit status change via EventBus — consistent with all other events
++    await this.eventBus.emit({
+       type: 'order:status-changed',
+       order: updated,
+       previousStatus,
+diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts
+new file mode 100644
+index 0000000..c37b991
+--- /dev/null
++++ b/tests/adapters/email.adapter.test.ts
+@@ -0,0 +1,86 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++describe('EmailAdapter', () => {
++  let adapter: EmailAdapter;
++
++  const samplePayload: NotificationPayload = {
++    type: 'order_confirmation',
++    recipient: 'alice@example.com',
++    subject: 'Order Confirmation: order-0001',
++    body: 'Your order has been placed.',
++    channel: 'email',
++    priority: 'normal',
++  };
++
++  beforeEach(() => {
++    adapter = new EmailAdapter({ stubMode: true });
++  });
++
++  describe('send', () => {
++    it('should succeed in stub mode', async () => {
++      const result = await adapter.send(samplePayload);
++
++      expect(result.success).toBe(true);
++      expect(result.channel).toBe('email');
++    });
++
++    it('should record sent emails in stub mode', async () => {
++      await adapter.send(samplePayload);
++
++      const sentEmails = adapter.getSentEmails();
++      expect(sentEmails).toHaveLength(1);
++      expect(sentEmails[0]?.to).toBe('alice@example.com');
++      expect(sentEmails[0]?.subject).toBe('Order Confirmation: order-0001');
++    });
++
++    it('should fail in non-stub mode (no real SMTP configured)', async () => {
++      const productionAdapter = new EmailAdapter({ stubMode: false });
++      const result = await productionAdapter.send(samplePayload);
++
++      expect(result.success).toBe(false);
++      expect(result.failureReason).toBeDefined();
++    });
++  });
++
++  describe('configuration', () => {
++    it('should use default config when none provided', () => {
++      const defaultAdapter = new EmailAdapter();
++      const config = defaultAdapter.getConfig();
++
++      expect(config.host).toBe('localhost');
++      expect(config.port).toBe(587);
++      expect(config.fromAddress).toBe('noreply@taskflow.dev');
++      expect(config.stubMode).toBe(true);
++    });
++
++    it('should merge custom config with defaults', () => {
++      const customAdapter = new EmailAdapter({
++        host: 'smtp.example.com',
++        fromAddress: 'app@example.com',
++      });
++      const config = customAdapter.getConfig();
++
++      expect(config.host).toBe('smtp.example.com');
++      expect(config.fromAddress).toBe('app@example.com');
++      expect(config.port).toBe(587); // default preserved
++    });
++  });
++
++  describe('channel property', () => {
++    it('should report email as its channel', () => {
++      expect(adapter.channel).toBe('email');
++    });
++  });
++
++  describe('clearSentEmails', () => {
++    it('should clear sent email records', async () => {
++      await adapter.send(samplePayload);
++      expect(adapter.getSentEmails()).toHaveLength(1);
++
++      adapter.clearSentEmails();
++      expect(adapter.getSentEmails()).toHaveLength(0);
++    });
++  });
++});
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index ad0020f..e0b939b 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -4,17 +4,26 @@ import {
+   NotificationService,
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+-import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
+-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type {
++  OrderCreatedEvent,
++  OrderStatusChangedEvent,
++  UserCreatedEvent,
++  UserUpdatedEvent,
++} from '../../src/events/event-types.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload, NotificationResult } from '../../src/models/notification.js';
+ 
+ describe('NotificationService', () => {
+   let eventBus: EventBus;
+   let service: NotificationService;
++  let emailAdapter: EmailAdapter;
+ 
+   beforeEach(() => {
+     eventBus = new EventBus();
+-    statusChangeCallbacks.clear();
+     service = new NotificationService(eventBus);
++    emailAdapter = new EmailAdapter({ stubMode: true });
++    service.registerAdapter(emailAdapter);
+     resetNotificationIdCounter();
+   });
+ 
+@@ -52,6 +61,9 @@ describe('NotificationService', () => {
+       expect(notifications[0]?.subject).toContain('Order Confirmation');
+       expect(notifications[0]?.body).toContain('Widget x2');
+       expect(notifications[0]?.body).toContain('$20.00');
++      expect(notifications[0]?.status).toBe('sent');
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[0]?.channel).toBe('email');
+     });
+ 
+     it('should include all items in notification body', async () => {
+@@ -88,8 +100,8 @@ describe('NotificationService', () => {
+     });
+   });
+ 
+-  describe('order:status-changed handler', () => {
+-    it('should send notification on status change', () => {
++  describe('order:status-changed handler (via EventBus)', () => {
++    it('should send notification on status change via EventBus', async () => {
+       const event: OrderStatusChangedEvent = {
+         type: 'order:status-changed',
+         order: {
+@@ -106,21 +118,172 @@ describe('NotificationService', () => {
+         timestamp: new Date(),
+       };
+ 
+-      statusChangeCallbacks.notify(event);
++      await eventBus.emit(event);
+ 
+       const notifications = service.getNotifications();
+       expect(notifications).toHaveLength(1);
+       expect(notifications[0]?.subject).toContain('Order Update');
+       expect(notifications[0]?.body).toContain('pending');
+       expect(notifications[0]?.body).toContain('confirmed');
++      expect(notifications[0]?.type).toBe('order_status_update');
++      expect(notifications[0]?.status).toBe('sent');
++    });
++
++    it('should set high priority for cancelled orders', async () => {
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'cancelled',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'cancelled',
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications[0]?.priority).toBe('high');
++    });
++  });
++
++  describe('user event handlers', () => {
++    it('should send welcome notification on user:created', async () => {
++      const event: UserCreatedEvent = {
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Bob',
++          email: 'bob@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]?.recipient).toBe('bob@example.com');
++      expect(notifications[0]?.subject).toContain('Welcome');
++      expect(notifications[0]?.type).toBe('welcome');
++    });
++
++    it('should send update notification on user:updated', async () => {
++      const event: UserUpdatedEvent = {
++        type: 'user:updated',
++        user: {
++          id: 'user-1',
++          name: 'Bob Updated',
++          email: 'bob@example.com',
++          role: 'admin',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        changes: ['name', 'role'],
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]?.body).toContain('name');
++      expect(notifications[0]?.body).toContain('role');
++      expect(notifications[0]?.type).toBe('account_updated');
++    });
++  });
++
++  describe('adapter management', () => {
++    it('should register and list adapters', () => {
++      const channels = service.getRegisteredChannels();
++      expect(channels).toContain('email');
++    });
++
++    it('should unregister adapters', () => {
++      const removed = service.unregisterAdapter('email');
++      expect(removed).toBe(true);
++      expect(service.getRegisteredChannels()).not.toContain('email');
++    });
++
++    it('should record failure when no adapter registered', async () => {
++      service.unregisterAdapter('email');
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]?.status).toBe('failed');
++      expect(notifications[0]?.failureReason).toContain('No adapter registered');
++    });
++
++    it('should handle adapter send failure gracefully', async () => {
++      const failingAdapter: NotificationAdapter = {
++        channel: 'email',
++        async send(_payload: NotificationPayload): Promise<NotificationResult> {
++          return {
++            success: false,
++            notificationId: '',
++            channel: 'email',
++            failureReason: 'SMTP connection refused',
++          };
++        },
++      };
++      service.registerAdapter(failingAdapter);
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications[0]?.status).toBe('failed');
++      expect(notifications[0]?.failureReason).toBe('SMTP connection refused');
+     });
+   });
+ 
+   describe('notification management', () => {
+-    it('should count notifications', () => {
++    it('should count notifications', async () => {
+       expect(service.getNotificationCount()).toBe(0);
+ 
+-      statusChangeCallbacks.notify({
++      await eventBus.emit({
+         type: 'order:status-changed',
+         order: {
+           id: 'order-1',
+@@ -134,7 +297,7 @@ describe('NotificationService', () => {
+         previousStatus: 'pending',
+         newStatus: 'confirmed',
+         timestamp: new Date(),
+-      });
++      } satisfies OrderStatusChangedEvent);
+ 
+       expect(service.getNotificationCount()).toBe(1);
+     });
+@@ -170,8 +333,50 @@ describe('NotificationService', () => {
+       expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);
+     });
+ 
+-    it('should clear notifications', () => {
+-      statusChangeCallbacks.notify({
++    it('should filter by status', async () => {
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      } satisfies OrderStatusChangedEvent);
++
++      expect(service.getNotificationsByStatus('sent')).toHaveLength(1);
++      expect(service.getNotificationsByStatus('failed')).toHaveLength(0);
++    });
++
++    it('should filter by type', async () => {
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      } satisfies OrderStatusChangedEvent);
++
++      expect(service.getNotificationsByType('order_status_update')).toHaveLength(1);
++      expect(service.getNotificationsByType('order_confirmation')).toHaveLength(0);
++    });
++
++    it('should clear notifications', async () => {
++      await eventBus.emit({
+         type: 'order:status-changed',
+         order: {
+           id: 'order-1',
+@@ -185,14 +390,14 @@ describe('NotificationService', () => {
+         previousStatus: 'pending',
+         newStatus: 'confirmed',
+         timestamp: new Date(),
+-      });
++      } satisfies OrderStatusChangedEvent);
+ 
+       service.clearNotifications();
+       expect(service.getNotificationCount()).toBe(0);
+     });
+ 
+-    it('should generate sequential notification IDs', () => {
+-      statusChangeCallbacks.notify({
++    it('should generate sequential notification IDs', async () => {
++      await eventBus.emit({
+         type: 'order:status-changed',
+         order: {
+           id: 'order-1',
+@@ -206,8 +411,8 @@ describe('NotificationService', () => {
+         previousStatus: 'pending',
+         newStatus: 'confirmed',
+         timestamp: new Date(),
+-      });
+-      statusChangeCallbacks.notify({
++      } satisfies OrderStatusChangedEvent);
++      await eventBus.emit({
+         type: 'order:status-changed',
+         order: {
+           id: 'order-2',
+@@ -221,11 +426,59 @@ describe('NotificationService', () => {
+         previousStatus: 'confirmed',
+         newStatus: 'shipped',
+         timestamp: new Date(),
+-      });
++      } satisfies OrderStatusChangedEvent);
+ 
+       const notifications = service.getNotifications();
+       expect(notifications[0]?.id).toBe('notif-0001');
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification lifecycle events', () => {
++    it('should emit notification:sent event on successful delivery', async () => {
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      } satisfies OrderStatusChangedEvent);
++
++      const events = eventBus.getEventLog();
++      const sentEvents = events.filter((e) => e.type === 'notification:sent');
++      expect(sentEvents).toHaveLength(1);
++    });
++
++    it('should emit notification:failed event when no adapter registered', async () => {
++      service.unregisterAdapter('email');
++
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      } satisfies OrderStatusChangedEvent);
++
++      const events = eventBus.getEventLog();
++      const failedEvents = events.filter((e) => e.type === 'notification:failed');
++      expect(failedEvents).toHaveLength(1);
++    });
++  });
+ });
+diff --git a/tests/services/order.service.test.ts b/tests/services/order.service.test.ts
+index 87149ce..1d420b2 100644
+--- a/tests/services/order.service.test.ts
++++ b/tests/services/order.service.test.ts
+@@ -95,7 +95,7 @@ describe('OrderService', () => {
+   });
+ 
+   describe('updateOrderStatus', () => {
+-    it('should update status and emit event', async () => {
++    it('should update status and emit event via EventBus', async () => {
+       const order = await service.createOrder({
+         userId: 'user-1',
+         items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
+@@ -104,10 +104,11 @@ describe('OrderService', () => {
+       const updated = await service.updateOrderStatus(order.id, 'confirmed');
+       expect(updated.status).toBe('confirmed');
+ 
+-      // order:created goes through EventBus, status-changed goes through CallbackRegistry
++      // Both order:created and order:status-changed go through EventBus
+       const events = eventBus.getEventLog();
+-      expect(events).toHaveLength(1); // only created
++      expect(events).toHaveLength(2);
+       expect(events[0]?.type).toBe('order:created');
++      expect(events[1]?.type).toBe('order:status-changed');
+     });
+ 
+     it('should reject invalid status transition', async () => {

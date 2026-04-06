@@ -1,0 +1,348 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index c4528a2..099d6c5 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -5,6 +5,30 @@ Write your updates below. There is no enforced format — use whatever structure
+ 
+ ---
+ 
++## Agent 2 — Data Aggregation Service Implementation (Complete)
++
++### What I did
++- Implemented `computeSummary()` with real aggregation: queries orders/users by date range, computes current value, computes previous-period value via `previousPeriod()`, calculates `changePercent` and `trend`
++- Implemented `buildTimeSeries()` with bucket generation: resolves granularity (auto-defaults based on range duration), generates bucket boundaries via `generateBuckets()`, aggregates per-bucket values
++- Implemented `computeTopProducts()`: fetches orders in range, flattens items, groups by productId, sums quantity/revenue, counts distinct orders, sorts by revenue descending, slices to limit
++- Added `findByDateRange(start, end)` to both `OrderRepository` and `UserRepository`
++- Added helper functions: `previousPeriod()`, `defaultGranularity()`, `generateBuckets()`
++
++### Key decisions
++1. **Metric value dispatch via switch**: `computeMetricValue()` and `computeBucketValue()` both switch on metric type to query the right repo and compute the right aggregate (count vs sum)
++2. **Default granularity heuristic**: ≤2 days → hour, ≤31 days → day, ≤90 days → week, >90 days → month
++3. **Revenue rounding**: `totalRevenue` in `TopProduct` is rounded to 2 decimal places to avoid floating-point noise
++4. **Change percent edge case**: When previous value is 0 but current is positive, `changePercent` = 100 (not Infinity)
++5. **Preserved all existing public API and type contracts** — no interface changes
++
++### For the next agent
++- All 83 tests pass, TypeScript compiles cleanly
++- `computeTopProducts` is fully implemented (ahead of the Session 3 schedule in DESIGN.md)
++- The `findByDateRange` methods are already added to both repositories
++- Session 3 tasks from DESIGN.md (top products + repo filtering) are done — next agent can focus on Session 4 (event-driven cache invalidation) or Session 5 (integration tests with seeded data)
++
++---
++
+ ## Agent 1 — Analytics API Design & Scaffolding (Complete)
+ 
+ ### What I did
+diff --git a/src/repositories/order.repository.ts b/src/repositories/order.repository.ts
+index 932fa9d..95543fd 100644
+--- a/src/repositories/order.repository.ts
++++ b/src/repositories/order.repository.ts
+@@ -52,4 +52,13 @@ export class OrderRepository extends BaseRepository<Order> {
+   findByStatus(status: OrderStatus): Order[] {
+     return this.findAll((order) => order.status === status);
+   }
++
++  /**
++   * Find all orders created within a date range (inclusive).
++   */
++  findByDateRange(start: Date, end: Date): Order[] {
++    return this.findAll(
++      (order) => order.createdAt >= start && order.createdAt <= end,
++    );
++  }
+ }
+diff --git a/src/repositories/user.repository.ts b/src/repositories/user.repository.ts
+index e2c533d..55e96e6 100644
+--- a/src/repositories/user.repository.ts
++++ b/src/repositories/user.repository.ts
+@@ -51,4 +51,13 @@ export class UserRepository extends BaseRepository<User> {
+   findByRole(role: User['role']): User[] {
+     return this.findAll((user) => user.role === role);
+   }
++
++  /**
++   * Find all users created within a date range (inclusive).
++   */
++  findByDateRange(start: Date, end: Date): User[] {
++    return this.findAll(
++      (user) => user.createdAt >= start && user.createdAt <= end,
++    );
++  }
+ }
+diff --git a/src/services/analytics.service.ts b/src/services/analytics.service.ts
+index d052f48..788f676 100644
+--- a/src/services/analytics.service.ts
++++ b/src/services/analytics.service.ts
+@@ -7,7 +7,9 @@ import type {
+   MetricDetail,
+   MetricSummary,
+   MetricType,
++  TimeGranularity,
+   TimeSeries,
++  TimeSeriesPoint,
+   TopProduct,
+ } from '../models/analytics.js';
+ 
+@@ -110,15 +112,11 @@ export class AnalyticsService {
+   }
+ 
+   // -------------------------------------------------------------------------
+-  // Private helpers — TODO: implement in Session 2/3
++  // Private helpers
+   // -------------------------------------------------------------------------
+ 
+   /**
+    * Compute KPI summaries for every metric type.
+-   *
+-   * Implementation guide:
+-   * - Iterate over all MetricType values.
+-   * - For each, call `computeSummary()`.
+    */
+   private async computeAllSummaries(start: Date, end: Date): Promise<MetricSummary[]> {
+     const types: MetricType[] = ['orders', 'revenue', 'users', 'products'];
+@@ -127,60 +125,160 @@ export class AnalyticsService {
+ 
+   /**
+    * Compute a single KPI summary with period-over-period comparison.
+-   *
+-   * Implementation guide:
+-   * - Query the repository for entities within [start, end].
+-   * - Compute the current-period value (count, sum, etc.).
+-   * - Compute the previous-period value using `previousPeriod(start, end)`.
+-   * - Calculate changePercent and trend.
+    */
+-  private computeSummary(metricType: MetricType, _start: Date, _end: Date): MetricSummary {
+-    // TODO: replace with real aggregation in Session 2
++  private computeSummary(metricType: MetricType, start: Date, end: Date): MetricSummary {
++    const currentValue = this.computeMetricValue(metricType, start, end);
++
++    const { start: prevStart, end: prevEnd } = previousPeriod(start, end);
++    const previousValue = this.computeMetricValue(metricType, prevStart, prevEnd);
++
++    let changePercent = 0;
++    if (previousValue !== 0) {
++      changePercent = ((currentValue - previousValue) / previousValue) * 100;
++    } else if (currentValue > 0) {
++      changePercent = 100;
++    }
++
++    let trend: 'up' | 'down' | 'flat' = 'flat';
++    if (changePercent > 0) trend = 'up';
++    else if (changePercent < 0) trend = 'down';
++
+     return {
+       metric: metricType,
+       label: metricTypeLabel(metricType),
+-      currentValue: 0,
+-      previousValue: 0,
+-      changePercent: 0,
+-      trend: 'flat',
++      currentValue,
++      previousValue,
++      changePercent: Math.round(changePercent * 100) / 100,
++      trend,
+     };
+   }
+ 
++  /**
++   * Compute the raw numeric value for a given metric type within a date range.
++   */
++  private computeMetricValue(metricType: MetricType, start: Date, end: Date): number {
++    switch (metricType) {
++      case 'orders': {
++        const orders = this.orderRepository.findByDateRange(start, end);
++        return orders.length;
++      }
++      case 'revenue': {
++        const orders = this.orderRepository.findByDateRange(start, end);
++        return orders.reduce((sum, order) => sum + order.total, 0);
++      }
++      case 'users': {
++        const users = this.userRepository.findByDateRange(start, end);
++        return users.length;
++      }
++      case 'products': {
++        const orders = this.orderRepository.findByDateRange(start, end);
++        return orders.reduce(
++          (sum, order) => sum + order.items.reduce((s, item) => s + item.quantity, 0),
++          0,
++        );
++      }
++    }
++  }
++
+   /**
+    * Build a time series for a given metric over [start, end].
+-   *
+-   * Implementation guide:
+-   * - Determine bucket boundaries from granularity (or default based on range).
+-   * - For each bucket, query and aggregate the relevant value.
+-   * - Return a `TimeSeries` with one `TimeSeriesPoint` per bucket.
+    */
+   private buildTimeSeries(
+     metric: string,
+     label: string,
+-    _start: Date,
+-    _end: Date,
+-    _query: AnalyticsQuery,
++    start: Date,
++    end: Date,
++    query: AnalyticsQuery,
+   ): TimeSeries {
+-    // TODO: replace with real bucketing in Session 2
++    const granularity = query.granularity ?? defaultGranularity(start, end);
++    const buckets = generateBuckets(start, end, granularity);
++
++    const points: TimeSeriesPoint[] = buckets.map((bucketStart, i) => {
++      const bucketEnd = i < buckets.length - 1 ? buckets[i + 1] : end;
++      const value = this.computeBucketValue(metric, bucketStart, bucketEnd);
++      return {
++        timestamp: bucketStart.toISOString(),
++        value,
++      };
++    });
++
+     return {
+       metric,
+       label,
+-      points: [],
++      points,
+     };
+   }
+ 
++  /**
++   * Compute the aggregate value for a single time-series bucket.
++   */
++  private computeBucketValue(metric: string, start: Date, end: Date): number {
++    switch (metric) {
++      case 'revenue': {
++        const orders = this.orderRepository.findByDateRange(start, end);
++        return orders.reduce((sum, order) => sum + order.total, 0);
++      }
++      case 'order_count':
++      case 'orders': {
++        return this.orderRepository.findByDateRange(start, end).length;
++      }
++      case 'users': {
++        return this.userRepository.findByDateRange(start, end).length;
++      }
++      case 'products': {
++        const orders = this.orderRepository.findByDateRange(start, end);
++        return orders.reduce(
++          (sum, order) => sum + order.items.reduce((s, item) => s + item.quantity, 0),
++          0,
++        );
++      }
++      default:
++        return 0;
++    }
++  }
++
+   /**
+    * Compute the top N products by revenue within [start, end].
+-   *
+-   * Implementation guide:
+-   * - Fetch all orders in the date range.
+-   * - Flatten order items.
+-   * - Group by productId, sum quantity and revenue, count distinct orders.
+-   * - Sort descending by totalRevenue, take the top `limit`.
+    */
+-  private computeTopProducts(_start: Date, _end: Date, _limit: number): TopProduct[] {
+-    // TODO: replace with real aggregation in Session 3
+-    return [];
++  private computeTopProducts(start: Date, end: Date, limit: number): TopProduct[] {
++    const orders = this.orderRepository.findByDateRange(start, end);
++
++    const productMap = new Map<
++      string,
++      { name: string; totalQuantity: number; totalRevenue: number; orderIds: Set<string> }
++    >();
++
++    for (const order of orders) {
++      for (const item of order.items) {
++        const existing = productMap.get(item.productId);
++        if (existing) {
++          existing.totalQuantity += item.quantity;
++          existing.totalRevenue += item.quantity * item.unitPrice;
++          existing.orderIds.add(order.id);
++        } else {
++          productMap.set(item.productId, {
++            name: item.name,
++            totalQuantity: item.quantity,
++            totalRevenue: item.quantity * item.unitPrice,
++            orderIds: new Set([order.id]),
++          });
++        }
++      }
++    }
++
++    const products: TopProduct[] = [];
++    for (const [productId, data] of productMap) {
++      products.push({
++        productId,
++        name: data.name,
++        totalQuantity: data.totalQuantity,
++        totalRevenue: Math.round(data.totalRevenue * 100) / 100,
++        orderCount: data.orderIds.size,
++      });
++    }
++
++    products.sort((a, b) => b.totalRevenue - a.totalRevenue);
++    return products.slice(0, limit);
+   }
+ }
+ 
+@@ -211,6 +309,53 @@ export function resolveTimeRange(query: AnalyticsQuery): { start: Date; end: Dat
+   }
+ }
+ 
++/** Compute the previous period of the same duration, ending where the current period starts. */
++function previousPeriod(start: Date, end: Date): { start: Date; end: Date } {
++  const durationMs = end.getTime() - start.getTime();
++  return {
++    start: new Date(start.getTime() - durationMs),
++    end: new Date(start.getTime()),
++  };
++}
++
++/** Pick a default granularity based on the range duration. */
++function defaultGranularity(start: Date, end: Date): TimeGranularity {
++  const durationMs = end.getTime() - start.getTime();
++  const days = durationMs / (24 * 60 * 60 * 1000);
++
++  if (days <= 2) return 'hour';
++  if (days <= 31) return 'day';
++  if (days <= 90) return 'week';
++  return 'month';
++}
++
++/** Generate bucket start timestamps for the given range and granularity. */
++function generateBuckets(start: Date, end: Date, granularity: TimeGranularity): Date[] {
++  const buckets: Date[] = [];
++  const current = new Date(start);
++
++  while (current < end) {
++    buckets.push(new Date(current));
++
++    switch (granularity) {
++      case 'hour':
++        current.setTime(current.getTime() + 60 * 60 * 1000);
++        break;
++      case 'day':
++        current.setDate(current.getDate() + 1);
++        break;
++      case 'week':
++        current.setDate(current.getDate() + 7);
++        break;
++      case 'month':
++        current.setMonth(current.getMonth() + 1);
++        break;
++    }
++  }
++
++  return buckets;
++}
++
+ /** Map MetricType to a human-readable label. */
+ function metricTypeLabel(type: MetricType): string {
+   const labels: Record<MetricType, string> = {

@@ -1,0 +1,173 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 3a76c79..db7e215 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -317,3 +317,22 @@ The current `UserPreferences` model (`src/models/user-preferences.ts`) was desig
+ ### Files modified
+ - **Modified**: `src/models/user-preferences.ts`, `src/repositories/preferences.repository.ts`, `src/services/preferences.service.ts`, `src/services/notification.service.ts`, `src/index.ts`, `tests/services/preferences.service.test.ts`, `tests/services/notification.service.test.ts`
+ 
++---
++
++## Agent 10 — Notification Delivery Ordering Fix (completed)
++
++### What I did
++1. **Diagnosed the ordering bug**: When multiple events fire concurrently (e.g., `order:created` then `order:status-changed` without awaiting), the `NotificationService.createAndSend` calls could interleave — a slow adapter for the first notification allowed the second to overtake it. This caused "payment confirmed" arriving before "order placed".
++2. **Added per-recipient promise chain** in `NotificationService`: a `recipientQueues` map that serializes delivery per recipient. Each `createAndSend` call chains onto the previous delivery promise for the same recipient, ensuring notifications are delivered in the order they were created.
++3. **Extracted `deliverNotification` private method** — the actual adapter call + event emission logic, called within the queue chain. No behavioral change to delivery itself.
++4. **Added ordering test** that fires `order:created` and `order:status-changed` concurrently with a 50ms delay on the first adapter call, verifying that "Order Confirmation" is always delivered before "Order Update".
++5. **All 202 tests pass** (201 existing + 1 new).
++
++### Architecture decisions
++- **Per-recipient queuing, not global**: Notifications for different recipients can still be delivered concurrently. Only same-recipient notifications are serialized. This avoids unnecessary head-of-line blocking.
++- **Queue errors don't block subsequent notifications**: The queue promise always resolves (via `.then(() => {}, () => {})`), so a failed delivery doesn't prevent future notifications for that recipient.
++- **Minimal change**: No new files, no new dependencies, no architecture changes. Just a `Map<string, Promise<void>>` and a chaining pattern in `createAndSend`.
++
++### Files modified
++- **Modified**: `src/services/notification.service.ts` (per-recipient queue + deliverNotification method), `tests/services/notification.service.test.ts` (ordering test)
++
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index e753b8a..5089f31 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -53,6 +53,8 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | null = null;
++  /** Per-recipient promise chains to ensure delivery ordering. */
++  private recipientQueues: Map<string, Promise<void>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+@@ -199,6 +201,10 @@ export class NotificationService {
+ 
+   /**
+    * Create a notification record and attempt delivery via the appropriate adapter.
++   * Delivery is serialized per recipient to guarantee ordering — a notification
++   * for a given recipient will not be sent until all prior notifications for
++   * that recipient have completed delivery.
++   *
+    * If no adapter is registered for the channel, the notification is stored
+    * with 'pending' status (for later delivery or manual inspection).
+    */
+@@ -228,6 +234,24 @@ export class NotificationService {
+       return notification;
+     }
+ 
++    // Serialize delivery per recipient to preserve notification ordering.
++    const previous = this.recipientQueues.get(input.recipient) ?? Promise.resolve();
++    const delivery = previous.then(() => this.deliverNotification(notification, adapter));
++    this.recipientQueues.set(input.recipient, delivery.then(() => {}, () => {}));
++
++    await delivery;
++
++    return notification;
++  }
++
++  /**
++   * Perform the actual delivery of a notification through an adapter.
++   * This is called within the per-recipient queue to ensure ordering.
++   */
++  private async deliverNotification(
++    notification: Notification,
++    adapter: NotificationAdapter,
++  ): Promise<void> {
+     try {
+       const result = await adapter.send(notification);
+       if (result.success) {
+@@ -265,8 +289,6 @@ export class NotificationService {
+         timestamp: new Date(),
+       });
+     }
+-
+-    return notification;
+   }
+ 
+   /**
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index c879fda..c3748d5 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -323,6 +323,83 @@ describe('NotificationService', () => {
+     });
+   });
+ 
++  describe('notification ordering', () => {
++    it('should deliver notifications in order even when events fire concurrently', async () => {
++      // Create an adapter with artificial delay on the first call to simulate
++      // a slow delivery that could cause reordering without a queue.
++      let callCount = 0;
++      const deliveryOrder: string[] = [];
++      const slowEmailAdapter = new EmailAdapter({
++        transport: async (email) => {
++          callCount++;
++          if (callCount === 1) {
++            // First notification is slow — without ordering, the second could overtake it.
++            await new Promise((resolve) => setTimeout(resolve, 50));
++          }
++          deliveryOrder.push(email.subject);
++          return 'msg-' + callCount;
++        },
++      });
++
++      const orderedService = new NotificationService(eventBus);
++      orderedService.registerAdapter(slowEmailAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'alice@example.com',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently — the order:created handler is slow,
++      // but the queue should ensure it completes before the status change.
++      await Promise.all([
++        eventBus.emit(orderCreatedEvent),
++        eventBus.emit(statusChangedEvent),
++      ]);
++
++      // The "Order Confirmation" must be delivered before "Order Update"
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++
++      const notifications = orderedService.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++  });
++
+   describe('multi-channel routing', () => {
+     let db: Database;
+     let preferencesRepo: PreferencesRepository;

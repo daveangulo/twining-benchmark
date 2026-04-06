@@ -1,0 +1,278 @@
+{
+  "compactionCount": 0,
+  "condition": "shared-markdown",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/COORDINATION.md b/COORDINATION.md\nindex b118a4c..230bd0d 100644\n--- a/COORDINATION.md\n+++ b/COORDINATION.md\n@@ -590,3 +590,38 @@ Domain Event (e.g. order:created)\n \n ---\n \n+## Agent 10 — Notification Delivery Ordering Fix\n+\n+### Status: COMPLETE\n+\n+### What I Did\n+\n+1. **Diagnosed the root cause**: `EventBus.emit()` was fire-and-forget for concurrent callers. When two events were emitted without awaiting the first (e.g., `order:created` then `order:status-changed`), their handlers ran concurrently, causing notifications to arrive out of order.\n+\n+2. **Fixed `src/events/event-bus.ts`** — added a serial emit queue:\n+   - Added `private emitQueue: Promise<void>` field that chains emits sequentially\n+   - `emit()` now chains behind any pending emit via `.then()`, ensuring events are processed one at a time in emission order\n+   - Errors in one emit don't block subsequent emits (queue swallows rejections)\n+   - `clear()` resets the queue\n+\n+3. **Added ordering test** in `tests/services/notification.service.test.ts`:\n+   - \"should deliver notifications in event emission order even when emits are not awaited\" — emits `order:created` and `order:status-changed` concurrently (without awaiting the first), then verifies all `order:confirmation` notifications come before any `order:status-update` notifications.\n+\n+4. **All 241 tests pass** (240 existing + 1 new), no regressions.\n+\n+### Key Design Decision\n+\n+- **Queue in EventBus, not NotificationService**: The ordering guarantee is at the event bus level, which is the right place — it ensures ALL event handlers (not just notifications) see events in order. This is a minimal 3-line change to the emit method.\n+\n+### Files Modified\n+- `src/events/event-bus.ts` — added `emitQueue` field, chained emit processing, reset in `clear()`\n+- `tests/services/notification.service.test.ts` — added ordering test\n+\n+### Context for Next Agents\n+\n+1. **EventBus now serializes emits**: Concurrent `emit()` calls are queued and processed in order. This is safe for all existing code since `emit()` was already async.\n+\n+2. **Error isolation**: A failed handler in one emit doesn't prevent subsequent emits from processing (the queue catches and swallows errors in the chain).\n+\n+---\n+\n",
+      "linesAdded": 35,
+      "linesRemoved": 0,
+      "path": "COORDINATION.md"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/events/event-bus.ts b/src/events/event-bus.ts\nindex 417e1cb..13bf835 100644\n--- a/src/events/event-bus.ts\n+++ b/src/events/event-bus.ts\n@@ -16,6 +16,7 @@ export type EventHandler<T extends AppEvent = AppEvent> = (event: T) => void | P\n export class EventBus {\n   private handlers: Map<EventType, EventHandler[]> = new Map();\n   private eventLog: AppEvent[] = [];\n+  private emitQueue: Promise<void> = Promise.resolve();\n \n   /**\n    * Subscribe to events of a given type.\n@@ -40,13 +41,21 @@ export class EventBus {\n \n   /**\n    * Emit an event to all registered handlers.\n+   * Emits are serialized: if a previous emit is still being processed,\n+   * this one queues behind it. This guarantees notification delivery order\n+   * even when multiple events are emitted without awaiting.\n    */\n   async emit<T extends AppEvent>(event: T): Promise<void> {\n-    this.eventLog.push(event);\n-    const handlers = this.handlers.get(event.type) ?? [];\n-    for (const handler of handlers) {\n-      await handler(event);\n-    }\n+    const task = this.emitQueue.then(async () => {\n+      this.eventLog.push(event);\n+      const handlers = this.handlers.get(event.type) ?? [];\n+      for (const handler of handlers) {\n+        await handler(event);\n+      }\n+    });\n+    // Swallow errors in the queue chain so one failed emit doesn't block subsequent ones\n+    this.emitQueue = task.catch(() => {});\n+    return task;\n   }\n \n   /**\n@@ -62,5 +71,6 @@ export class EventBus {\n   clear(): void {\n     this.handlers.clear();\n     this.eventLog = [];\n+    this.emitQueue = Promise.resolve();\n   }\n }\n",
+      "linesAdded": 15,
+      "linesRemoved": 5,
+      "path": "src/events/event-bus.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts\nindex 5476a15..b916acd 100644\n--- a/tests/services/notification.service.test.ts\n+++ b/tests/services/notification.service.test.ts\n@@ -236,6 +236,65 @@ describe('NotificationService', () => {\n     });\n   });\n \n+  describe('notification ordering', () => {\n+    it('should deliver notifications in event emission order even when emits are not awaited', async () => {\n+      const orderCreatedEvent: OrderCreatedEvent = {\n+        type: 'order:created',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [\n+            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },\n+          ],\n+          total: 10,\n+          status: 'pending',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        user: {\n+          id: 'user-1',\n+          name: 'Alice',\n+          email: 'alice@example.com',\n+          role: 'member',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        timestamp: new Date(),\n+      };\n+\n+      const statusChangedEvent: OrderStatusChangedEvent = {\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 10,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      };\n+\n+      // Emit both events WITHOUT awaiting the first — simulates concurrent emission\n+      const p1 = eventBus.emit(orderCreatedEvent);\n+      const p2 = eventBus.emit(statusChangedEvent);\n+      await Promise.all([p1, p2]);\n+\n+      const notifications = service.getNotifications();\n+\n+      // order:created notifications (email + webhook) must come before\n+      // order:status-changed notifications (email + webhook)\n+      const types = notifications.map((n) => n.type);\n+      const firstStatusUpdateIndex = types.indexOf('order:status-update');\n+      const lastConfirmationIndex = types.lastIndexOf('order:confirmation');\n+\n+      expect(lastConfirmationIndex).toBeLessThan(firstStatusUpdateIndex);\n+    });\n+  });\n+\n   describe('notification management', () => {\n     it('should count notifications', async () => {\n       expect(service.getNotificationCount()).toBe(0);\n",
+      "linesAdded": 59,
+      "linesRemoved": 0,
+      "path": "tests/services/notification.service.test.ts"
+    }
+  ],
+  "numTurns": 19,
+  "prompt": "You are Agent 10 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Fix a notification delivery ordering issue.\n\nUsers report that notifications sometimes arrive out of order — e.g., a \"payment confirmed\" notification arrives before the \"order placed\" notification.\n\nSpecifically:\n1. Check for any prior coordination context about the notification architecture.\n2. Investigate the notification service and how it dispatches to adapters.\n3. The issue is likely in how concurrent notifications are handled — check if there's a queue or if notifications fire-and-forget.\n4. Fix the ordering issue while maintaining the existing architecture.\n5. Add a test that verifies notification ordering.\n6. Make sure all tests pass.\n\nImportant:\n- Understand the notification architecture before making changes — check decisions from Session 1.\n- Keep the fix minimal — don't restructure the notification system.",
+  "runId": "16a2e4e1-264c-4281-8fb9-2614dbd5a5c9",
+  "scenario": "sprint-simulation",
+  "sessionId": "273e1dc6-8ca3-456e-92dc-4ad7e2a37c43",
+  "stopReason": "success",
+  "taskIndex": 9,
+  "timing": {
+    "durationMs": 130802,
+    "endTime": "2026-03-28T07:40:07.691Z",
+    "startTime": "2026-03-28T07:37:56.889Z",
+    "timeToFirstActionMs": 61360
+  },
+  "tokenUsage": {
+    "cacheCreation": 58454,
+    "cacheRead": 927330,
+    "costUsd": 0.9789394999999999,
+    "input": 17,
+    "output": 5935,
+    "total": 991736
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/COORDINATION.md"
+      },
+      "timestamp": "2026-03-28T07:38:04.264Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "pattern": "**/*.ts"
+      },
+      "timestamp": "2026-03-28T07:38:04.523Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T07:38:09.703Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-28T07:38:10.634Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T07:38:11.089Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-28T07:38:23.086Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T07:38:23.429Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Adding emit queue to EventBus",
+            "content": "Add emit queue to EventBus for serialized event processing",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Adding notification ordering test",
+            "content": "Add test verifying notification ordering with concurrent emits",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Running all tests",
+            "content": "Run all tests to verify no regressions",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T07:38:52.723Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/events/event-bus.ts",
+        "new_string": "export class EventBus {\n  private handlers: Map<EventType, EventHandler[]> = new Map();\n  private eventLog: AppEvent[] = [];\n  private emitQueue: Promise<void> = Promise.resolve();",
+        "old_string": "export class EventBus {\n  private handlers: Map<EventType, EventHandler[]> = new Map();\n  private eventLog: AppEvent[] = [];",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T07:38:58.249Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/events/event-bus.ts",
+        "new_string": "  /**\n   * Emit an event to all registered handlers.\n   * Emits are serialized: if a previous emit is still being processed,\n   * this one queues behind it. This guarantees notification delivery order\n   * even when multiple events are emitted without awaiting.\n   */\n  async emit<T extends AppEvent>(event: T): Promise<void> {\n    const task = this.emitQueue.then(async () => {\n      this.eventLog.push(event);\n      const handlers = this.handlers.get(event.type) ?? [];\n      for (const handler of handlers) {\n        await handler(event);\n      }\n    });\n    // Swallow errors in the queue chain so one failed emit doesn't block subsequent ones\n    this.emitQueue = task.catch(() => {});\n    return task;\n  }",
+        "old_string": "  /**\n   * Emit an event to all registered handlers.\n   */\n  async emit<T extends AppEvent>(event: T): Promise<void> {\n    this.eventLog.push(event);\n    const handlers = this.handlers.get(event.type) ?? [];\n    for (const handler of handlers) {\n      await handler(event);\n    }\n  }",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T07:39:04.495Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/src/events/event-bus.ts",
+        "new_string": "  clear(): void {\n    this.handlers.clear();\n    this.eventLog = [];\n    this.emitQueue = Promise.resolve();\n  }",
+        "old_string": "  clear(): void {\n    this.handlers.clear();\n    this.eventLog = [];\n  }",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T07:39:08.254Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Adding emit queue to EventBus",
+            "content": "Add emit queue to EventBus for serialized event processing",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification ordering test",
+            "content": "Add test verifying notification ordering with concurrent emits",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Running all tests",
+            "content": "Run all tests to verify no regressions",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T07:39:15.045Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/tests/services/notification.service.test.ts",
+        "new_string": "  describe('notification ordering', () => {\n    it('should deliver notifications in event emission order even when emits are not awaited', async () => {\n      const orderCreatedEvent: OrderCreatedEvent = {\n        type: 'order:created',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [\n            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },\n          ],\n          total: 10,\n          status: 'pending',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        user: {\n          id: 'user-1',\n          name: 'Alice',\n          email: 'alice@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      };\n\n      const statusChangedEvent: OrderStatusChangedEvent = {\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 10,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      };\n\n      // Emit both events WITHOUT awaiting the first — simulates concurrent emission\n      const p1 = eventBus.emit(orderCreatedEvent);\n      const p2 = eventBus.emit(statusChangedEvent);\n      await Promise.all([p1, p2]);\n\n      const notifications = service.getNotifications();\n\n      // order:created notifications (email + webhook) must come before\n      // order:status-changed notifications (email + webhook)\n      const types = notifications.map((n) => n.type);\n      const firstStatusUpdateIndex = types.indexOf('order:status-update');\n      const lastConfirmationIndex = types.lastIndexOf('order:confirmation');\n\n      expect(lastConfirmationIndex).toBeLessThan(firstStatusUpdateIndex);\n    });\n  });\n\n  describe('notification management', () => {",
+        "old_string": "  describe('notification management', () => {",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T07:39:25.148Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Adding emit queue to EventBus",
+            "content": "Add emit queue to EventBus for serialized event processing",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification ordering test",
+            "content": "Add test verifying notification ordering with concurrent emits",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Running all tests",
+            "content": "Run all tests to verify no regressions",
+            "status": "in_progress"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T07:39:34.815Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "npx vitest run 2>&1",
+        "timeout": 60000
+      },
+      "timestamp": "2026-03-28T07:39:37.593Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Adding emit queue to EventBus",
+            "content": "Add emit queue to EventBus for serialized event processing",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification ordering test",
+            "content": "Add test verifying notification ordering with concurrent emits",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Running all tests",
+            "content": "Run all tests to verify no regressions",
+            "status": "completed"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T07:39:42.283Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/COORDINATION.md",
+        "offset": 590
+      },
+      "timestamp": "2026-03-28T07:39:45.466Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-fEtQ4I/COORDINATION.md",
+        "new_string": "5. **Preferences are backward compatible**: Old records without `sms`/`webhook` fields get defaults on deserialization (enabled with all categories on).\n\n---\n\n## Agent 10 — Notification Delivery Ordering Fix\n\n### Status: COMPLETE\n\n### What I Did\n\n1. **Diagnosed the root cause**: `EventBus.emit()` was fire-and-forget for concurrent callers. When two events were emitted without awaiting the first (e.g., `order:created` then `order:status-changed`), their handlers ran concurrently, causing notifications to arrive out of order.\n\n2. **Fixed `src/events/event-bus.ts`** — added a serial emit queue:\n   - Added `private emitQueue: Promise<void>` field that chains emits sequentially\n   - `emit()` now chains behind any pending emit via `.then()`, ensuring events are processed one at a time in emission order\n   - Errors in one emit don't block subsequent emits (queue swallows rejections)\n   - `clear()` resets the queue\n\n3. **Added ordering test** in `tests/services/notification.service.test.ts`:\n   - \"should deliver notifications in event emission order even when emits are not awaited\" — emits `order:created` and `order:status-changed` concurrently (without awaiting the first), then verifies all `order:confirmation` notifications come before any `order:status-update` notifications.\n\n4. **All 241 tests pass** (240 existing + 1 new), no regressions.\n\n### Key Design Decision\n\n- **Queue in EventBus, not NotificationService**: The ordering guarantee is at the event bus level, which is the right place — it ensures ALL event handlers (not just notifications) see events in order. This is a minimal 3-line change to the emit method.\n\n### Files Modified\n- `src/events/event-bus.ts` — added `emitQueue` field, chained emit processing, reset in `clear()`\n- `tests/services/notification.service.test.ts` — added ordering test\n\n### Context for Next Agents\n\n1. **EventBus now serializes emits**: Concurrent `emit()` calls are queued and processed in order. This is safe for all existing code since `emit()` was already async.\n\n2. **Error isolation**: A failed handler in one emit doesn't prevent subsequent emits from processing (the queue catches and swallows errors in the chain).\n\n---\n\n",
+        "old_string": "5. **Preferences are backward compatible**: Old records without `sms`/`webhook` fields get defaults on deserialization (enabled with all categories on).\n\n---\n\n",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T07:40:01.149Z",
+      "toolName": "Edit"
+    }
+  ],
+  "turnUsage": []
+}

@@ -1,0 +1,467 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 5be199a..a98ff0f 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -190,3 +190,49 @@ Two new tests in `tests/utils/pagination.test.ts`:
+ 
+ ### Test results
+ 112 tests pass (2 new + 110 existing). All existing tests continue to pass.
++
++---
++
++## Agent 5 — Extract Validation Logic into Validators (Complete)
++
++### What was done
++Extracted pure validation logic from services into dedicated validator modules in `src/validators/`.
++
++1. **Created `src/validators/order.validator.ts`**:
++   - `validateOrderItems(items)` — throws if items array is empty
++   - `isValidStatusTransition(from, to)` — returns boolean for whether a status transition is allowed
++   - `validateStatusTransition(from, to)` — throws if transition is invalid
++   - Extracted the `STATUS_TRANSITIONS` map (was a private method + inline logic in OrderService)
++
++2. **Created `src/validators/preferences.validator.ts`**:
++   - `isNotificationAllowed(prefs, channel, type)` — pure function that evaluates preference rules (enabled, frequency, category) against in-memory preference data
++   - Extracted from `PreferencesService.shouldSend()` — the service now does repo lookup + calls this validator
++
++3. **Updated `src/services/order.service.ts`**:
++   - Replaced inline `items.length === 0` check with `validateOrderItems()`
++   - Replaced `this.isValidStatusTransition()` private method + inline throw with `validateStatusTransition()`
++   - Removed the now-unused `isValidStatusTransition` private method
++
++4. **Updated `src/services/preferences.service.ts`**:
++   - `shouldSend()` now delegates preference rule evaluation to `isNotificationAllowed()`
++   - Service still handles repo lookup and debug logging
++
++5. **Added tests**:
++   - `tests/validators/order.validator.test.ts` — 15 tests covering items validation, all valid/invalid status transitions, terminal states
++   - `tests/validators/preferences.validator.test.ts` — 8 tests covering null prefs, defaults, disabled email, frequency=none, category disabled, non-email channels
++
++6. **Updated `src/index.ts`** — exported all new validator functions
++
++### Key decisions
++- **Only extracted pure validation**: Repo-dependent checks (user exists, email uniqueness) stay in services since the task requires validators to be pure functions with no side effects or database calls.
++- **UserService has no validator**: Its validation is entirely repo-dependent (existence/uniqueness checks), so no pure logic to extract.
++- **Error messages preserved exactly**: The validators throw identical error messages to maintain behavioral compatibility with existing tests.
++
++### Test results
++135 tests pass (23 new + 112 existing). Clean TypeScript compilation.
++
++### Key files
++- `src/validators/order.validator.ts` — Order validation (items, status transitions)
++- `src/validators/preferences.validator.ts` — Preference rule evaluation
++- `tests/validators/order.validator.test.ts` — 15 tests
++- `tests/validators/preferences.validator.test.ts` — 8 tests
+diff --git a/src/index.ts b/src/index.ts
+index d752934..c40a275 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -80,6 +80,14 @@ export { OrderService } from './services/order.service.js';
+ export { NotificationService } from './services/notification.service.js';
+ export { PreferencesService, resetPreferencesIdCounter } from './services/preferences.service.js';
+ 
++// Validators
++export {
++  validateOrderItems,
++  validateStatusTransition,
++  isValidStatusTransition,
++} from './validators/order.validator.js';
++export { isNotificationAllowed } from './validators/preferences.validator.js';
++
+ // Config
+ export { createConfig, defaultConfig } from './config/app.config.js';
+ export type { AppConfig } from './config/app.config.js';
+diff --git a/src/services/order.service.ts b/src/services/order.service.ts
+index dc8fb12..5786526 100644
+--- a/src/services/order.service.ts
++++ b/src/services/order.service.ts
+@@ -16,6 +16,7 @@ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
++import { validateOrderItems, validateStatusTransition } from '../validators/order.validator.js';
+ 
+ let nextId = 1;
+ 
+@@ -49,9 +50,7 @@ export class OrderService {
+     }
+ 
+     // Validate order has items
+-    if (input.items.length === 0) {
+-      throw new Error('Order must have at least one item');
+-    }
++    validateOrderItems(input.items);
+ 
+     const now = new Date();
+     const order: Order = {
+@@ -98,11 +97,7 @@ export class OrderService {
+     const previousStatus = order.status;
+ 
+     // Validate status transition
+-    if (!this.isValidStatusTransition(previousStatus, newStatus)) {
+-      throw new Error(
+-        `Invalid status transition: ${previousStatus} -> ${newStatus}`,
+-      );
+-    }
++    validateStatusTransition(previousStatus, newStatus);
+ 
+     const updated = this.orderRepository.update(id, {
+       status: newStatus,
+@@ -134,20 +129,4 @@ export class OrderService {
+     return this.orderRepository.findByStatus(status);
+   }
+ 
+-  /**
+-   * Validate that a status transition is allowed.
+-   */
+-  private isValidStatusTransition(
+-    from: OrderStatus,
+-    to: OrderStatus,
+-  ): boolean {
+-    const transitions: Record<OrderStatus, OrderStatus[]> = {
+-      pending: ['confirmed', 'cancelled'],
+-      confirmed: ['shipped', 'cancelled'],
+-      shipped: ['delivered'],
+-      delivered: [],
+-      cancelled: [],
+-    };
+-    return transitions[from].includes(to);
+-  }
+ }
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+index d0a1f1b..21ebb8b 100644
+--- a/src/services/preferences.service.ts
++++ b/src/services/preferences.service.ts
+@@ -18,6 +18,7 @@ import type {
+ import type { NotificationType, NotificationChannel } from '../models/notification.js';
+ import { defaultEmailPreferences } from '../models/user-preferences.js';
+ import { Logger } from '../utils/logger.js';
++import { isNotificationAllowed } from '../validators/preferences.validator.js';
+ 
+ let nextId = 1;
+ 
+@@ -130,32 +131,13 @@ export class PreferencesService {
+     channel: NotificationChannel,
+     type: NotificationType,
+   ): boolean {
+-    // Only email preferences are supported for now
+-    if (channel !== 'email') {
+-      return true;
+-    }
+-
+-    const prefs = this.preferencesRepo.findByUserId(userId);
+-    if (!prefs) {
+-      // No preferences stored — default is to send everything
+-      return true;
+-    }
+-
+-    if (!prefs.email.enabled) {
+-      this.logger.debug(`Email disabled for user ${userId}, suppressing ${type}`);
+-      return false;
+-    }
+-
+-    if (prefs.email.frequency === 'none') {
+-      this.logger.debug(`Email frequency=none for user ${userId}, suppressing ${type}`);
+-      return false;
+-    }
++    const prefs = this.preferencesRepo.findByUserId(userId) ?? null;
++    const allowed = isNotificationAllowed(prefs, channel, type);
+ 
+-    if (prefs.email.categories[type] === false) {
+-      this.logger.debug(`Category ${type} disabled for user ${userId}, suppressing`);
+-      return false;
++    if (!allowed) {
++      this.logger.debug(`Notification ${type} on ${channel} suppressed for user ${userId}`);
+     }
+ 
+-    return true;
++    return allowed;
+   }
+ }
+diff --git a/src/validators/order.validator.ts b/src/validators/order.validator.ts
+new file mode 100644
+index 0000000..f126aba
+--- /dev/null
++++ b/src/validators/order.validator.ts
+@@ -0,0 +1,50 @@
++/**
++ * Order validation — pure validation functions for order operations.
++ *
++ * These validators contain no side effects and no database calls.
++ * They can be reused across any service that needs order-related validation.
++ */
++
++import type { OrderItem, OrderStatus } from '../models/order.js';
++
++/**
++ * Valid status transitions for orders.
++ */
++const STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
++  pending: ['confirmed', 'cancelled'],
++  confirmed: ['shipped', 'cancelled'],
++  shipped: ['delivered'],
++  delivered: [],
++  cancelled: [],
++};
++
++/**
++ * Check whether a status transition is allowed.
++ */
++export function isValidStatusTransition(
++  from: OrderStatus,
++  to: OrderStatus,
++): boolean {
++  return STATUS_TRANSITIONS[from].includes(to);
++}
++
++/**
++ * Validate that a status transition is allowed. Throws if not.
++ */
++export function validateStatusTransition(
++  from: OrderStatus,
++  to: OrderStatus,
++): void {
++  if (!isValidStatusTransition(from, to)) {
++    throw new Error(`Invalid status transition: ${from} -> ${to}`);
++  }
++}
++
++/**
++ * Validate that an order has at least one item. Throws if empty.
++ */
++export function validateOrderItems(items: OrderItem[]): void {
++  if (items.length === 0) {
++    throw new Error('Order must have at least one item');
++  }
++}
+diff --git a/src/validators/preferences.validator.ts b/src/validators/preferences.validator.ts
+new file mode 100644
+index 0000000..72c8495
+--- /dev/null
++++ b/src/validators/preferences.validator.ts
+@@ -0,0 +1,49 @@
++/**
++ * Preferences validation — pure validation functions for notification preferences.
++ *
++ * These validators contain no side effects and no database calls.
++ * They evaluate preference rules against in-memory preference data.
++ */
++
++import type { UserNotificationPreferences } from '../models/user-preferences.js';
++import type { NotificationChannel, NotificationType } from '../models/notification.js';
++
++/**
++ * Check whether a notification is allowed by the user's preferences.
++ *
++ * Rules:
++ * 1. If no preferences exist (null), notifications are allowed (opt-out model).
++ * 2. If the email channel is disabled, all email notifications are suppressed.
++ * 3. If the frequency is 'none', all email notifications are suppressed.
++ * 4. If the specific category is disabled, that notification is suppressed.
++ * 5. Non-email channels are always allowed (only email preferences are supported).
++ */
++export function isNotificationAllowed(
++  prefs: UserNotificationPreferences | null,
++  channel: NotificationChannel,
++  type: NotificationType,
++): boolean {
++  // Only email preferences are supported for now
++  if (channel !== 'email') {
++    return true;
++  }
++
++  // No preferences stored — default is to send everything
++  if (!prefs) {
++    return true;
++  }
++
++  if (!prefs.email.enabled) {
++    return false;
++  }
++
++  if (prefs.email.frequency === 'none') {
++    return false;
++  }
++
++  if (prefs.email.categories[type] === false) {
++    return false;
++  }
++
++  return true;
++}
+diff --git a/tests/validators/order.validator.test.ts b/tests/validators/order.validator.test.ts
+new file mode 100644
+index 0000000..2e96455
+--- /dev/null
++++ b/tests/validators/order.validator.test.ts
+@@ -0,0 +1,92 @@
++import { describe, it, expect } from 'vitest';
++import {
++  isValidStatusTransition,
++  validateStatusTransition,
++  validateOrderItems,
++} from '../../src/validators/order.validator.js';
++import type { OrderItem, OrderStatus } from '../../src/models/order.js';
++
++describe('Order Validators', () => {
++  describe('validateOrderItems', () => {
++    it('should pass for non-empty items', () => {
++      const items: OrderItem[] = [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++      ];
++      expect(() => validateOrderItems(items)).not.toThrow();
++    });
++
++    it('should throw for empty items', () => {
++      expect(() => validateOrderItems([])).toThrow('at least one item');
++    });
++
++    it('should pass for multiple items', () => {
++      const items: OrderItem[] = [
++        { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 25 },
++      ];
++      expect(() => validateOrderItems(items)).not.toThrow();
++    });
++  });
++
++  describe('isValidStatusTransition', () => {
++    it('should allow pending -> confirmed', () => {
++      expect(isValidStatusTransition('pending', 'confirmed')).toBe(true);
++    });
++
++    it('should allow pending -> cancelled', () => {
++      expect(isValidStatusTransition('pending', 'cancelled')).toBe(true);
++    });
++
++    it('should allow confirmed -> shipped', () => {
++      expect(isValidStatusTransition('confirmed', 'shipped')).toBe(true);
++    });
++
++    it('should allow confirmed -> cancelled', () => {
++      expect(isValidStatusTransition('confirmed', 'cancelled')).toBe(true);
++    });
++
++    it('should allow shipped -> delivered', () => {
++      expect(isValidStatusTransition('shipped', 'delivered')).toBe(true);
++    });
++
++    it('should reject pending -> delivered', () => {
++      expect(isValidStatusTransition('pending', 'delivered')).toBe(false);
++    });
++
++    it('should reject pending -> shipped', () => {
++      expect(isValidStatusTransition('pending', 'shipped')).toBe(false);
++    });
++
++    it('should reject delivered -> any', () => {
++      const statuses: OrderStatus[] = ['pending', 'confirmed', 'shipped', 'cancelled'];
++      for (const status of statuses) {
++        expect(isValidStatusTransition('delivered', status)).toBe(false);
++      }
++    });
++
++    it('should reject cancelled -> any', () => {
++      const statuses: OrderStatus[] = ['pending', 'confirmed', 'shipped', 'delivered'];
++      for (const status of statuses) {
++        expect(isValidStatusTransition('cancelled', status)).toBe(false);
++      }
++    });
++  });
++
++  describe('validateStatusTransition', () => {
++    it('should not throw for valid transitions', () => {
++      expect(() => validateStatusTransition('pending', 'confirmed')).not.toThrow();
++    });
++
++    it('should throw for invalid transitions', () => {
++      expect(() => validateStatusTransition('pending', 'delivered')).toThrow(
++        'Invalid status transition: pending -> delivered',
++      );
++    });
++
++    it('should throw for transitions from terminal states', () => {
++      expect(() => validateStatusTransition('cancelled', 'pending')).toThrow(
++        'Invalid status transition',
++      );
++    });
++  });
++});
+diff --git a/tests/validators/preferences.validator.test.ts b/tests/validators/preferences.validator.test.ts
+new file mode 100644
+index 0000000..5b73aa6
+--- /dev/null
++++ b/tests/validators/preferences.validator.test.ts
+@@ -0,0 +1,72 @@
++import { describe, it, expect } from 'vitest';
++import { isNotificationAllowed } from '../../src/validators/preferences.validator.js';
++import { defaultEmailPreferences } from '../../src/models/user-preferences.js';
++import type { UserNotificationPreferences } from '../../src/models/user-preferences.js';
++
++function makePrefs(
++  overrides?: Partial<UserNotificationPreferences['email']>,
++): UserNotificationPreferences {
++  const defaults = defaultEmailPreferences();
++  return {
++    id: 'pref-1',
++    userId: 'user-1',
++    email: { ...defaults, ...overrides },
++    updatedAt: new Date(),
++  };
++}
++
++describe('Preferences Validators', () => {
++  describe('isNotificationAllowed', () => {
++    it('should allow when prefs are null (opt-out model)', () => {
++      expect(isNotificationAllowed(null, 'email', 'order-confirmation')).toBe(true);
++    });
++
++    it('should allow when all defaults are in place', () => {
++      const prefs = makePrefs();
++      expect(isNotificationAllowed(prefs, 'email', 'order-confirmation')).toBe(true);
++    });
++
++    it('should suppress when email is disabled', () => {
++      const prefs = makePrefs({ enabled: false });
++      expect(isNotificationAllowed(prefs, 'email', 'order-confirmation')).toBe(false);
++    });
++
++    it('should suppress when frequency is none', () => {
++      const prefs = makePrefs({ frequency: 'none' });
++      expect(isNotificationAllowed(prefs, 'email', 'order-confirmation')).toBe(false);
++    });
++
++    it('should suppress when specific category is disabled', () => {
++      const defaults = defaultEmailPreferences();
++      const prefs = makePrefs({
++        categories: {
++          ...defaults.categories,
++          'order-confirmation': false,
++        },
++      });
++      expect(isNotificationAllowed(prefs, 'email', 'order-confirmation')).toBe(false);
++    });
++
++    it('should allow other categories when one is disabled', () => {
++      const defaults = defaultEmailPreferences();
++      const prefs = makePrefs({
++        categories: {
++          ...defaults.categories,
++          'order-confirmation': false,
++        },
++      });
++      expect(isNotificationAllowed(prefs, 'email', 'order-status-update')).toBe(true);
++    });
++
++    it('should always allow non-email channels', () => {
++      const prefs = makePrefs({ enabled: false });
++      expect(isNotificationAllowed(prefs, 'webhook', 'order-confirmation')).toBe(true);
++      expect(isNotificationAllowed(prefs, 'in-app', 'order-confirmation')).toBe(true);
++      expect(isNotificationAllowed(prefs, 'sms', 'order-confirmation')).toBe(true);
++    });
++
++    it('should always allow non-email channels when prefs are null', () => {
++      expect(isNotificationAllowed(null, 'webhook', 'system-alert')).toBe(true);
++    });
++  });
++});

@@ -1,0 +1,876 @@
+diff --git a/tests/integration/notification-pipeline.test.ts b/tests/integration/notification-pipeline.test.ts
+new file mode 100644
+index 0000000..0b72a39
+--- /dev/null
++++ b/tests/integration/notification-pipeline.test.ts
+@@ -0,0 +1,870 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import { NotificationService, resetNotificationIdCounter } from '../../src/services/notification.service.js';
++import { NotificationHistoryService, resetLogIdCounter } from '../../src/services/notification-history.service.js';
++import { EmailAdapter, InMemoryEmailTransport } from '../../src/adapters/email.adapter.js';
++import type { RecipientResolver } from '../../src/adapters/email.adapter.js';
++import { SmsAdapter, InMemorySmsTransport } from '../../src/adapters/sms.adapter.js';
++import { WebhookAdapter, InMemoryWebhookTransport } from '../../src/adapters/webhook.adapter.js';
++import { PreferencesRepository } from '../../src/repositories/preferences.repository.js';
++import { NotificationLogRepository } from '../../src/repositories/notification-log.repository.js';
++import { Database } from '../../src/utils/database.js';
++import type { UserNotificationPreferences } from '../../src/models/user-preferences.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent, UserCreatedEvent } from '../../src/events/event-types.js';
++import type { User } from '../../src/models/user.js';
++import type { Order } from '../../src/models/order.js';
++
++// ---------------------------------------------------------------------------
++// RecipientResolver that can resolve user IDs to emails (for integration tests)
++// ---------------------------------------------------------------------------
++
++class TestRecipientResolver implements RecipientResolver {
++  private userEmails = new Map<string, string>();
++
++  registerUser(userId: string, email: string): void {
++    this.userEmails.set(userId, email);
++  }
++
++  async resolve(recipient: string): Promise<string | null> {
++    // If it already looks like an email, return as-is
++    if (recipient.includes('@')) return recipient;
++    // Otherwise try to resolve user ID to email
++    return this.userEmails.get(recipient) ?? null;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Helpers to build test fixtures
++// ---------------------------------------------------------------------------
++
++function makeUser(overrides: Partial<User> = {}): User {
++  return {
++    id: 'user-1',
++    name: 'Alice',
++    email: 'alice@example.com',
++    role: 'member',
++    createdAt: new Date('2026-01-01'),
++    updatedAt: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++function makeOrder(overrides: Partial<Order> = {}): Order {
++  return {
++    id: 'order-1',
++    userId: 'user-1',
++    items: [{ productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 }],
++    total: 20,
++    status: 'pending',
++    createdAt: new Date('2026-01-01'),
++    updatedAt: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++function makePreferences(
++  userId: string,
++  overrides: Partial<UserNotificationPreferences> = {},
++): UserNotificationPreferences {
++  const now = new Date();
++  return {
++    id: `pref-${userId}`,
++    userId,
++    email: {
++      enabled: true,
++      frequency: 'immediate',
++      categories: {
++        'order-confirmation': true,
++        'order-status-update': true,
++        welcome: true,
++        'user-updated': true,
++      },
++    },
++    sms: {
++      enabled: true,
++      categories: {
++        'order-confirmation': true,
++        'order-status-update': true,
++        welcome: true,
++        'user-updated': true,
++      },
++    },
++    webhook: {
++      enabled: true,
++      categories: {
++        'order-confirmation': true,
++        'order-status-update': true,
++        welcome: true,
++        'user-updated': true,
++      },
++    },
++    createdAt: now,
++    updatedAt: now,
++    ...overrides,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// Integration test suite
++// ---------------------------------------------------------------------------
++
++describe('Notification Pipeline Integration', () => {
++  let db: Database;
++  let eventBus: EventBus;
++  let preferencesRepo: PreferencesRepository;
++  let logRepo: NotificationLogRepository;
++  let historyService: NotificationHistoryService;
++  let notificationService: NotificationService;
++
++  // Transports (in-memory for inspection)
++  let emailTransport: InMemoryEmailTransport;
++  let smsTransport: InMemorySmsTransport;
++  let webhookTransport: InMemoryWebhookTransport;
++
++  // Adapters
++  let emailAdapter: EmailAdapter;
++  let smsAdapter: SmsAdapter;
++  let webhookAdapter: WebhookAdapter;
++  let recipientResolver: TestRecipientResolver;
++
++  beforeEach(() => {
++    db = new Database();
++    eventBus = new EventBus();
++    preferencesRepo = new PreferencesRepository(db);
++    logRepo = new NotificationLogRepository(db);
++    historyService = new NotificationHistoryService(logRepo);
++
++    notificationService = new NotificationService(eventBus, preferencesRepo, historyService);
++
++    emailTransport = new InMemoryEmailTransport();
++    smsTransport = new InMemorySmsTransport();
++    webhookTransport = new InMemoryWebhookTransport();
++
++    // Provide a resolver that can map user IDs → emails (e.g. for order:status-changed)
++    recipientResolver = new TestRecipientResolver();
++    recipientResolver.registerUser('user-1', 'alice@example.com');
++
++    emailAdapter = new EmailAdapter({ transport: emailTransport, recipientResolver });
++    smsAdapter = new SmsAdapter({ transport: smsTransport });
++    webhookAdapter = new WebhookAdapter({ transport: webhookTransport });
++
++    notificationService.registerAdapter(emailAdapter);
++    notificationService.registerAdapter(smsAdapter);
++    notificationService.registerAdapter(webhookAdapter);
++
++    resetNotificationIdCounter();
++    resetLogIdCounter();
++  });
++
++  // -----------------------------------------------------------------------
++  // Email channel — end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('email channel end-to-end', () => {
++    it('should deliver email notification when email preferences are enabled', async () => {
++      const user = makeUser();
++      const prefs = makePreferences(user.id);
++      preferencesRepo.save(prefs);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: makeOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      // Email was delivered through transport
++      const emails = emailTransport.getSentEmails();
++      expect(emails).toHaveLength(1);
++      expect(emails[0]!.to).toBe('alice@example.com');
++      expect(emails[0]!.subject).toContain('Order Confirmation');
++
++      // Notification recorded in service
++      const notifications = notificationService.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]!.status).toBe('sent');
++      expect(notifications[0]!.payload.channel).toBe('email');
++
++      // History logged
++      const logs = historyService.getByRecipient('alice@example.com');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('sent');
++      expect(logs[0]!.channel).toBe('email');
++      expect(logs[0]!.type).toBe('order-confirmation');
++    });
++
++    it('should deliver welcome email on user:created event', async () => {
++      const user = makeUser();
++      const prefs = makePreferences(user.id);
++      preferencesRepo.save(prefs);
++
++      const event: UserCreatedEvent = {
++        type: 'user:created',
++        user,
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const emails = emailTransport.getSentEmails();
++      expect(emails).toHaveLength(1);
++      expect(emails[0]!.subject).toBe('Welcome to TaskFlow Pro');
++      expect(emails[0]!.body).toContain('Welcome, Alice!');
++
++      const logs = historyService.getByType('welcome');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('sent');
++    });
++
++    it('should deliver order status update email on order:status-changed', async () => {
++      const user = makeUser();
++      const order = makeOrder({ status: 'shipped' });
++      const prefs = makePreferences(user.id);
++      preferencesRepo.save(prefs);
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order,
++        previousStatus: 'confirmed',
++        newStatus: 'shipped',
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      // The handler uses event.order.userId as recipient; the TestRecipientResolver
++      // maps 'user-1' → 'alice@example.com' for email delivery.
++      const emails = emailTransport.getSentEmails();
++      expect(emails).toHaveLength(1);
++      expect(emails[0]!.to).toBe('alice@example.com');
++      expect(emails[0]!.subject).toContain('Order Update');
++
++      const notifications = notificationService.getNotifications();
++      expect(notifications[0]!.payload.type).toBe('order-status-update');
++      expect(notifications[0]!.status).toBe('sent');
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // SMS channel — end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('SMS channel end-to-end', () => {
++    it('should deliver SMS notification when SMS preferences are enabled', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      const messages = smsTransport.getSentMessages();
++      expect(messages).toHaveLength(1);
++      expect(messages[0]!.to).toBe('+15551234567');
++      expect(messages[0]!.body).toContain('Order Placed');
++
++      const notifications = notificationService.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]!.status).toBe('sent');
++
++      const logs = historyService.getByRecipient('+15551234567');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('sent');
++      expect(logs[0]!.channel).toBe('sms');
++    });
++
++    it('should truncate long SMS messages to 160 characters', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      const longBody = 'A'.repeat(200);
++      await notificationService.dispatchNotification({
++        type: 'order-status-update',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'Update',
++        body: longBody,
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      const messages = smsTransport.getSentMessages();
++      expect(messages).toHaveLength(1);
++      expect(messages[0]!.body.length).toBeLessThanOrEqual(160);
++      expect(messages[0]!.body).toMatch(/\.\.\.$/);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Webhook channel — end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('webhook channel end-to-end', () => {
++    it('should deliver webhook notification', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'webhook',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Order Placed',
++        body: 'Order has been placed.',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      const requests = webhookTransport.getSentRequests();
++      expect(requests).toHaveLength(1);
++      expect(requests[0]!.url).toBe('https://hooks.example.com/notify');
++      expect(requests[0]!.body.type).toBe('order-confirmation');
++      expect(requests[0]!.body.subject).toBe('Order Placed');
++      expect(requests[0]!.headers['Content-Type']).toBe('application/json');
++
++      const notifications = notificationService.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]!.status).toBe('sent');
++
++      const logs = historyService.getByRecipient('https://hooks.example.com/notify');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('sent');
++      expect(logs[0]!.channel).toBe('webhook');
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // History logging
++  // -----------------------------------------------------------------------
++
++  describe('notification history tracking', () => {
++    it('should log all notifications to history', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      // Dispatch across all three channels
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Email notification',
++        body: 'Via email',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'SMS notification',
++        body: 'Via SMS',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'webhook',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Webhook notification',
++        body: 'Via webhook',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(historyService.getLogCount()).toBe(3);
++
++      const emailLogs = historyService.query({ channel: 'email' });
++      expect(emailLogs).toHaveLength(1);
++      expect(emailLogs[0]!.status).toBe('sent');
++
++      const smsLogs = historyService.query({ channel: 'sms' });
++      expect(smsLogs).toHaveLength(1);
++      expect(smsLogs[0]!.status).toBe('sent');
++
++      const webhookLogs = historyService.query({ channel: 'webhook' });
++      expect(webhookLogs).toHaveLength(1);
++      expect(webhookLogs[0]!.status).toBe('sent');
++    });
++
++    it('should log suppressed notifications with suppressed status', async () => {
++      const prefs = makePreferences('user-1', {
++        email: {
++          enabled: false,
++          frequency: 'immediate',
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Should be suppressed',
++        body: 'Suppressed',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      // No email sent
++      expect(emailTransport.getSentEmails()).toHaveLength(0);
++
++      // But history logs it as suppressed
++      const logs = historyService.getByRecipient('alice@example.com');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('suppressed');
++    });
++
++    it('should log failed notifications when no adapter registered', async () => {
++      // Create a service with no adapters
++      const bareService = new NotificationService(
++        new EventBus(),
++        preferencesRepo,
++        historyService,
++      );
++
++      await bareService.dispatchNotification({
++        type: 'welcome',
++        channel: 'email',
++        recipient: 'test@example.com',
++        subject: 'No adapter',
++        body: 'Should fail',
++        priority: 'normal',
++      });
++
++      const logs = historyService.getByRecipient('test@example.com');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.status).toBe('suppressed'); // no adapter = suppressed
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Preferences enforcement
++  // -----------------------------------------------------------------------
++
++  describe('user preferences enforcement', () => {
++    it('should suppress email when email globally disabled', async () => {
++      const prefs = makePreferences('user-1', {
++        email: {
++          enabled: false,
++          frequency: 'immediate',
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: makeOrder(),
++        user: makeUser(),
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      expect(emailTransport.getSentEmails()).toHaveLength(0);
++      expect(notificationService.getNotifications()).toHaveLength(0);
++    });
++
++    it('should suppress email for disabled category', async () => {
++      const prefs = makePreferences('user-1', {
++        email: {
++          enabled: true,
++          frequency: 'immediate',
++          categories: {
++            'order-confirmation': false,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: makeOrder(),
++        user: makeUser(),
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      expect(emailTransport.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should suppress SMS when SMS globally disabled', async () => {
++      const prefs = makePreferences('user-1', {
++        sms: {
++          enabled: false,
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'Suppressed SMS',
++        body: 'Should not send',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(smsTransport.getSentMessages()).toHaveLength(0);
++    });
++
++    it('should suppress webhook when webhook globally disabled', async () => {
++      const prefs = makePreferences('user-1', {
++        webhook: {
++          enabled: false,
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'webhook',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Suppressed webhook',
++        body: 'Should not send',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(webhookTransport.getSentRequests()).toHaveLength(0);
++    });
++
++    it('should allow one channel while suppressing another for the same user', async () => {
++      const prefs = makePreferences('user-1', {
++        email: {
++          enabled: true,
++          frequency: 'immediate',
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++        sms: {
++          enabled: false,
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++      });
++      preferencesRepo.save(prefs);
++
++      // Email — should deliver
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Email should send',
++        body: 'Email body',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      // SMS — should suppress
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'SMS should not send',
++        body: 'SMS body',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(emailTransport.getSentEmails()).toHaveLength(1);
++      expect(smsTransport.getSentMessages()).toHaveLength(0);
++    });
++
++    it('should default to all-enabled when user has no stored preferences', async () => {
++      // No preferences saved for user-1 — defaults should allow delivery
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Default prefs test',
++        body: 'Should deliver',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(emailTransport.getSentEmails()).toHaveLength(1);
++    });
++
++    it('should default SMS to all-enabled for email-only preference records', async () => {
++      // Save preferences with only email (no sms/webhook fields)
++      const emailOnlyPrefs: UserNotificationPreferences = {
++        id: 'pref-user-1',
++        userId: 'user-1',
++        email: {
++          enabled: true,
++          frequency: 'immediate',
++          categories: {
++            'order-confirmation': true,
++            'order-status-update': true,
++            welcome: true,
++            'user-updated': true,
++          },
++        },
++        // No sms or webhook fields
++        createdAt: new Date(),
++        updatedAt: new Date(),
++      };
++      preferencesRepo.save(emailOnlyPrefs);
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'SMS with email-only prefs',
++        body: 'Should default to enabled',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(smsTransport.getSentMessages()).toHaveLength(1);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Notification ordering
++  // -----------------------------------------------------------------------
++
++  describe('notification ordering', () => {
++    it('should preserve dispatch order across concurrent sends', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      const deliveryOrder: string[] = [];
++
++      // Replace email adapter with a slow one that records delivery order
++      const slowEmailTransport: InMemoryEmailTransport & { deliveryOrder: string[] } = Object.assign(
++        new InMemoryEmailTransport(),
++        { deliveryOrder },
++      );
++      const originalSendMail = slowEmailTransport.sendMail.bind(slowEmailTransport);
++      let callIndex = 0;
++      const delays = [30, 5, 15];
++      slowEmailTransport.sendMail = async (message) => {
++        const delay = delays[callIndex++] ?? 0;
++        await new Promise((resolve) => setTimeout(resolve, delay));
++        deliveryOrder.push(message.subject);
++        return originalSendMail(message);
++      };
++
++      const slowEmailAdapter = new EmailAdapter({ transport: slowEmailTransport, recipientResolver });
++      notificationService.registerAdapter(slowEmailAdapter);
++
++      // Fire three notifications concurrently
++      const p1 = notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'First',
++        body: 'first',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++      const p2 = notificationService.dispatchNotification({
++        type: 'order-status-update',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Second',
++        body: 'second',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++      const p3 = notificationService.dispatchNotification({
++        type: 'welcome',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Third',
++        body: 'third',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      await Promise.all([p1, p2, p3]);
++
++      // Must be in dispatch order despite variable latency
++      expect(deliveryOrder).toEqual(['First', 'Second', 'Third']);
++
++      // History should also reflect the correct order
++      const logs = historyService.getByRecipient('alice@example.com');
++      expect(logs.map((l) => l.subject)).toEqual(['First', 'Second', 'Third']);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Multi-channel delivery for same event
++  // -----------------------------------------------------------------------
++
++  describe('multi-channel dispatch', () => {
++    it('should deliver the same notification type through multiple channels independently', async () => {
++      const prefs = makePreferences('user-1');
++      preferencesRepo.save(prefs);
++
++      // Send order confirmation via email AND SMS AND webhook
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'sms',
++        recipient: '+15551234567',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      await notificationService.dispatchNotification({
++        type: 'order-confirmation',
++        channel: 'webhook',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++        priority: 'normal',
++        metadata: { userId: 'user-1' },
++      });
++
++      expect(emailTransport.getSentEmails()).toHaveLength(1);
++      expect(smsTransport.getSentMessages()).toHaveLength(1);
++      expect(webhookTransport.getSentRequests()).toHaveLength(1);
++
++      // All three logged in history
++      expect(historyService.getLogCount()).toBe(3);
++      const byType = historyService.getByType('order-confirmation');
++      expect(byType).toHaveLength(3);
++      expect(byType.map((l) => l.channel).sort()).toEqual(['email', 'sms', 'webhook']);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Event-driven pipeline (EventBus → NotificationService → Adapter → History)
++  // -----------------------------------------------------------------------
++
++  describe('full event-driven pipeline', () => {
++    it('should flow from EventBus event through to history for order:created', async () => {
++      const user = makeUser();
++      const order = makeOrder();
++      const prefs = makePreferences(user.id);
++      preferencesRepo.save(prefs);
++
++      await eventBus.emit({
++        type: 'order:created',
++        order,
++        user,
++        timestamp: new Date(),
++      } as OrderCreatedEvent);
++
++      // Verify full pipeline
++      const emails = emailTransport.getSentEmails();
++      expect(emails).toHaveLength(1);
++
++      const notifications = notificationService.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]!.status).toBe('sent');
++      expect(notifications[0]!.results).toHaveLength(1);
++      expect(notifications[0]!.results[0]!.success).toBe(true);
++
++      const logs = historyService.query({
++        type: 'order-confirmation',
++        status: 'sent',
++      });
++      expect(logs).toHaveLength(1);
++      expect(logs[0]!.notificationId).toBe(notifications[0]!.payload.id);
++    });
++
++    it('should handle multiple events in sequence through the full pipeline', async () => {
++      const user = makeUser();
++      const order = makeOrder();
++      const prefs = makePreferences(user.id);
++      preferencesRepo.save(prefs);
++
++      // 1. Order created
++      await eventBus.emit({
++        type: 'order:created',
++        order,
++        user,
++        timestamp: new Date(),
++      } as OrderCreatedEvent);
++
++      // 2. Order status changed
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: { ...order, status: 'confirmed' },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      } as OrderStatusChangedEvent);
++
++      // 3. Welcome
++      await eventBus.emit({
++        type: 'user:created',
++        user,
++        timestamp: new Date(),
++      } as UserCreatedEvent);
++
++      expect(emailTransport.getSentEmails()).toHaveLength(3);
++      expect(notificationService.getNotifications()).toHaveLength(3);
++      expect(historyService.getLogCount()).toBe(3);
++
++      // order:created and user:created use the user's email as recipient;
++      // order:status-changed uses userId ('user-1') as the payload recipient.
++      const emailLogs = historyService.getByRecipient('alice@example.com');
++      const userIdLogs = historyService.getByRecipient('user-1');
++      const allTypes = [...emailLogs, ...userIdLogs].map((l) => l.type);
++      expect(allTypes).toContain('order-confirmation');
++      expect(allTypes).toContain('order-status-update');
++      expect(allTypes).toContain('welcome');
++    });
++  });
++});

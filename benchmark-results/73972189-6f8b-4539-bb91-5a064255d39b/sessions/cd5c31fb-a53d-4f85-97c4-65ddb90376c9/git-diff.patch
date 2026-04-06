@@ -1,0 +1,375 @@
+diff --git a/src/adapters/sms.adapter.ts b/src/adapters/sms.adapter.ts
+new file mode 100644
+index 0000000..b83dc5f
+--- /dev/null
++++ b/src/adapters/sms.adapter.ts
+@@ -0,0 +1,147 @@
++/**
++ * SMS notification adapter — delivers notifications via SMS.
++ *
++ * Features:
++ * - Message formatting: concise text from NotificationPayload
++ * - Recipient resolution: resolves user IDs to phone numbers via injected resolver
++ * - In-memory send capture for testing (swap transport for production)
++ *
++ * Implements the NotificationAdapter interface. Must not throw from send().
++ */
++
++import type { NotificationPayload } from '../models/notification.js';
++import type { NotificationAdapter, DeliveryResult } from './notification.adapter.js';
++import { Logger } from '../utils/logger.js';
++
++/**
++ * Structure of an SMS message ready for delivery.
++ */
++export interface SmsMessage {
++  to: string;
++  body: string;
++  sentAt: Date;
++}
++
++/**
++ * Function that resolves a recipient identifier to a phone number.
++ * Returns null if the recipient cannot be resolved.
++ */
++export type PhoneNumberResolver = (recipient: string) => Promise<string | null>;
++
++/**
++ * Transport function that handles actual SMS delivery.
++ * The default stores in-memory; inject a real transport for production.
++ */
++export type SmsTransport = (message: SmsMessage) => Promise<void>;
++
++/**
++ * Format a notification payload into a concise SMS body.
++ * SMS messages should be short — subject + truncated body.
++ */
++function formatSmsBody(payload: NotificationPayload): string {
++  const maxLength = 160;
++  const text = `${payload.subject}: ${payload.body}`;
++  if (text.length <= maxLength) {
++    return text;
++  }
++  return text.slice(0, maxLength - 3) + '...';
++}
++
++export class SmsNotificationAdapter implements NotificationAdapter {
++  readonly channel = 'sms' as const;
++  private logger = new Logger('SmsAdapter');
++  private sentMessages: SmsMessage[] = [];
++  private recipientResolver: PhoneNumberResolver | null;
++  private transport: SmsTransport;
++
++  constructor(options?: {
++    recipientResolver?: PhoneNumberResolver;
++    transport?: SmsTransport;
++  }) {
++    this.recipientResolver = options?.recipientResolver ?? null;
++    this.transport = options?.transport ?? ((msg) => {
++      this.sentMessages.push(msg);
++      return Promise.resolve();
++    });
++  }
++
++  /**
++   * Send a notification as an SMS.
++   *
++   * 1. Resolves recipient to a phone number (if resolver is configured)
++   * 2. Formats the message body (concise, max 160 chars)
++   * 3. Delivers via the configured transport
++   */
++  async send(payload: NotificationPayload): Promise<DeliveryResult> {
++    try {
++      // Step 1: Resolve recipient to phone number
++      const phoneNumber = await this.resolveRecipient(payload.recipient);
++      if (!phoneNumber) {
++        const error = `Could not resolve recipient to phone number: ${payload.recipient}`;
++        this.logger.error(error);
++        return { success: false, error };
++      }
++
++      // Step 2: Format SMS body
++      const body = formatSmsBody(payload);
++
++      // Step 3: Deliver via transport
++      const message: SmsMessage = {
++        to: phoneNumber,
++        body,
++        sentAt: new Date(),
++      };
++
++      await this.transport(message);
++      this.logger.info(`SMS sent to ${phoneNumber}: ${payload.id}`);
++
++      return { success: true };
++    } catch (err) {
++      const message = err instanceof Error ? err.message : 'Unknown error';
++      this.logger.error(`Failed to send SMS to ${payload.recipient}: ${message}`);
++      return { success: false, error: message };
++    }
++  }
++
++  /**
++   * Resolve a recipient identifier to a phone number.
++   * If the recipient looks like a phone number, return it directly.
++   * Otherwise, use the injected resolver.
++   */
++  private async resolveRecipient(recipient: string): Promise<string | null> {
++    if (this.isPhoneNumber(recipient)) {
++      return recipient;
++    }
++
++    if (this.recipientResolver) {
++      return this.recipientResolver(recipient);
++    }
++
++    // No resolver and not a phone number — can't deliver
++    return null;
++  }
++
++  /**
++   * Basic check if a string looks like a phone number.
++   * Accepts formats like +1234567890, 1234567890, (123) 456-7890.
++   */
++  private isPhoneNumber(value: string): boolean {
++    return /^\+?[\d\s()-]{7,}$/.test(value);
++  }
++
++  /**
++   * Get all sent messages. Useful for testing.
++   */
++  getSentMessages(): SmsMessage[] {
++    return [...this.sentMessages];
++  }
++
++  /**
++   * Clear sent messages. Useful for testing.
++   */
++  clearSentMessages(): void {
++    this.sentMessages = [];
++  }
++}
++
++export { formatSmsBody };
+diff --git a/src/index.ts b/src/index.ts
+index 883b127..88dc758 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -75,6 +75,8 @@ export { EmailNotificationAdapter } from './adapters/email.adapter.js';
+ export type { EmailMessage, RecipientResolver, EmailTransport } from './adapters/email.adapter.js';
+ export { WebhookNotificationAdapter } from './adapters/webhook.adapter.js';
+ export type { WebhookPayload, WebhookDelivery, WebhookTransport } from './adapters/webhook.adapter.js';
++export { SmsNotificationAdapter } from './adapters/sms.adapter.js';
++export type { SmsMessage, PhoneNumberResolver, SmsTransport } from './adapters/sms.adapter.js';
+ 
+ // Validators
+ export {
+diff --git a/tests/adapters/sms.adapter.test.ts b/tests/adapters/sms.adapter.test.ts
+new file mode 100644
+index 0000000..c906cd4
+--- /dev/null
++++ b/tests/adapters/sms.adapter.test.ts
+@@ -0,0 +1,203 @@
++import { describe, it, expect, beforeEach, vi } from 'vitest';
++import {
++  SmsNotificationAdapter,
++  formatSmsBody,
++} from '../../src/adapters/sms.adapter.js';
++import type { SmsMessage } from '../../src/adapters/sms.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {
++  return {
++    id: 'notif-0001',
++    type: 'order-confirmation',
++    channels: ['sms'],
++    priority: 'high',
++    recipient: '+15551234567',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    metadata: { orderId: 'order-1', userId: 'user-1' },
++    createdAt: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++describe('SmsNotificationAdapter', () => {
++  let adapter: SmsNotificationAdapter;
++
++  beforeEach(() => {
++    adapter = new SmsNotificationAdapter();
++  });
++
++  describe('channel property', () => {
++    it('should be "sms"', () => {
++      expect(adapter.channel).toBe('sms');
++    });
++  });
++
++  describe('send()', () => {
++    it('should deliver SMS for a valid phone number recipient', async () => {
++      const result = await adapter.send(makePayload());
++
++      expect(result.success).toBe(true);
++      expect(result.error).toBeUndefined();
++
++      const messages = adapter.getSentMessages();
++      expect(messages).toHaveLength(1);
++      expect(messages[0]?.to).toBe('+15551234567');
++    });
++
++    it('should format message body from subject and body', async () => {
++      await adapter.send(makePayload());
++
++      const message = adapter.getSentMessages()[0]!;
++      expect(message.body).toContain('Order Confirmation');
++      expect(message.body).toContain('Widget x2');
++    });
++
++    it('should resolve recipient via resolver when not a phone number', async () => {
++      const resolver = vi.fn().mockResolvedValue('+15559876543');
++      adapter = new SmsNotificationAdapter({ recipientResolver: resolver });
++
++      const result = await adapter.send(makePayload({ recipient: 'user-1' }));
++
++      expect(result.success).toBe(true);
++      expect(resolver).toHaveBeenCalledWith('user-1');
++      expect(adapter.getSentMessages()[0]?.to).toBe('+15559876543');
++    });
++
++    it('should fail when recipient cannot be resolved', async () => {
++      adapter = new SmsNotificationAdapter();
++
++      const result = await adapter.send(makePayload({ recipient: 'user-1' }));
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Could not resolve recipient to phone number');
++    });
++
++    it('should fail when resolver returns null', async () => {
++      const resolver = vi.fn().mockResolvedValue(null);
++      adapter = new SmsNotificationAdapter({ recipientResolver: resolver });
++
++      const result = await adapter.send(makePayload({ recipient: 'user-1' }));
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Could not resolve recipient to phone number');
++    });
++
++    it('should use custom transport when provided', async () => {
++      const customTransport = vi.fn().mockResolvedValue(undefined);
++      adapter = new SmsNotificationAdapter({ transport: customTransport });
++
++      await adapter.send(makePayload());
++
++      expect(customTransport).toHaveBeenCalledTimes(1);
++      expect(customTransport).toHaveBeenCalledWith(
++        expect.objectContaining({
++          to: '+15551234567',
++          body: expect.any(String),
++        }),
++      );
++    });
++
++    it('should catch transport errors and return failure', async () => {
++      const failingTransport = vi.fn().mockRejectedValue(new Error('Network timeout'));
++      adapter = new SmsNotificationAdapter({ transport: failingTransport });
++
++      const result = await adapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('Network timeout');
++    });
++
++    it('should handle non-Error exceptions', async () => {
++      const failingTransport = vi.fn().mockRejectedValue('string error');
++      adapter = new SmsNotificationAdapter({ transport: failingTransport });
++
++      const result = await adapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('Unknown error');
++    });
++
++    it('should deliver multiple messages independently', async () => {
++      await adapter.send(makePayload({ id: 'notif-0001', recipient: '+15551111111' }));
++      await adapter.send(makePayload({ id: 'notif-0002', recipient: '+15552222222' }));
++
++      const messages = adapter.getSentMessages();
++      expect(messages).toHaveLength(2);
++      expect(messages[0]?.to).toBe('+15551111111');
++      expect(messages[1]?.to).toBe('+15552222222');
++    });
++
++    it('should accept various phone number formats', async () => {
++      for (const phone of ['+15551234567', '5551234567', '(555) 123-4567']) {
++        adapter.clearSentMessages();
++        const result = await adapter.send(makePayload({ recipient: phone }));
++        expect(result.success).toBe(true);
++      }
++    });
++
++    it('should include all notification types', async () => {
++      for (const type of ['order-confirmation', 'order-status-update', 'welcome', 'account-update'] as const) {
++        adapter.clearSentMessages();
++        await adapter.send(makePayload({ type }));
++        expect(adapter.getSentMessages()).toHaveLength(1);
++      }
++    });
++
++    it('should include all priority levels', async () => {
++      for (const priority of ['low', 'normal', 'high'] as const) {
++        adapter.clearSentMessages();
++        await adapter.send(makePayload({ priority }));
++        expect(adapter.getSentMessages()).toHaveLength(1);
++      }
++    });
++  });
++
++  describe('getSentMessages / clearSentMessages', () => {
++    it('should return a copy of sent messages', async () => {
++      await adapter.send(makePayload());
++
++      const messages1 = adapter.getSentMessages();
++      const messages2 = adapter.getSentMessages();
++      expect(messages1).toEqual(messages2);
++      expect(messages1).not.toBe(messages2);
++    });
++
++    it('should clear sent messages', async () => {
++      await adapter.send(makePayload());
++      expect(adapter.getSentMessages()).toHaveLength(1);
++
++      adapter.clearSentMessages();
++      expect(adapter.getSentMessages()).toHaveLength(0);
++    });
++  });
++});
++
++describe('formatSmsBody', () => {
++  it('should combine subject and body', () => {
++    const payload = makePayload();
++    const result = formatSmsBody(payload);
++    expect(result).toBe('Order Confirmation: order-1: Your order has been placed. Items: Widget x2. Total: $20.00');
++  });
++
++  it('should truncate long messages to 160 chars', () => {
++    const payload = makePayload({
++      subject: 'Long Subject',
++      body: 'A'.repeat(200),
++    });
++    const result = formatSmsBody(payload);
++    expect(result.length).toBe(160);
++    expect(result.endsWith('...')).toBe(true);
++  });
++
++  it('should not truncate messages at or under 160 chars', () => {
++    const payload = makePayload({
++      subject: 'Hi',
++      body: 'Short',
++    });
++    const result = formatSmsBody(payload);
++    expect(result).toBe('Hi: Short');
++    expect(result.endsWith('...')).toBe(false);
++  });
++});

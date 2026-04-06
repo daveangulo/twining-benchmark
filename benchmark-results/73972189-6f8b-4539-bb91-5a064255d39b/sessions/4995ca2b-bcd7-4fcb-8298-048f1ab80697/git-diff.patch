@@ -1,0 +1,210 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 175fe6f..defa2a7 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -589,3 +589,62 @@ All 214 tests pass (213 existing + 1 new).
+ 
+ ### Test status
+ All 238 tests pass (214 existing + 24 new).
++
++---
++
++## Agent 12 — Final Review and Cleanup (completed)
++
++### What was done
++
++**Review:** Full architectural review of the notification system built across 11 sessions. Verified compilation, test suite, adapter consistency, event coverage, preferences gating, and history logging.
++
++**Issue found and fixed: Missing user event handlers**
++
++`UserService` emitted `user:created` and `user:updated` events, and the notification types `user_welcome` and `user_updated` existed, but `NotificationService` had no handlers for them — user lifecycle notifications were silently dropped.
++
++**Fix:**
++- Added `handleUserCreated()` and `handleUserUpdated()` handlers in `NotificationService.registerHandlers()`
++- `user:created` → sends a welcome email with the user's name
++- `user:updated` → sends a profile update email listing changed fields
++- Added 2 tests covering both handlers
++
++**Other findings (no action needed):**
++- `in-app` channel is declared in `NotificationChannel` but has no adapter — this is fine as a future placeholder; the system gracefully records notifications even without an adapter
++- Adapter naming conventions differ per domain (e.g., `getSentEmails` vs `getSentMessages` vs `getSentWebhooks`; transport methods `deliver`/`send`/`post`) — these are intentional domain-appropriate names, not bugs
++- Some internal types (reset functions, `CallbackRegistry`, `EventHandler`, `DatabaseRecord`, `LogLevel`) are not re-exported from `src/index.ts` — these are internal/test utilities and don't need public export
++
++### System Architecture Summary
++
++```
++┌─────────────────┐     emit()      ┌──────────┐   subscribe   ┌─────────────────────┐
++│  Domain Services │───────────────▶│ EventBus │──────────────▶│  NotificationService │
++│  (Order, User)   │                └──────────┘               └──────────┬───────────┘
++└─────────────────┘                                                       │
++                                                              ┌───────────┼───────────┐
++                                                              ▼           ▼           ▼
++                                                     ┌───────────┐ ┌──────────┐ ┌─────────┐
++                                                     │   Email    │ │   SMS    │ │ Webhook │
++                                                     │  Adapter   │ │ Adapter  │ │ Adapter │
++                                                     └───────────┘ └──────────┘ └─────────┘
++```
++
++**Key components:**
++- **EventBus** — sole communication mechanism between domain services and notifications
++- **NotificationService** — subscribes to 4 events (`order:created`, `order:status-changed`, `user:created`, `user:updated`), builds payloads, dispatches to adapters with FIFO ordering
++- **3 Adapters** (email, SMS, webhook) — pluggable transport, retry logic, never-throw contract
++- **PreferencesService** — per-user, per-channel opt-out gating (`emailEnabled`, `smsEnabled`, `webhookEnabled` + category subscriptions)
++- **NotificationHistoryService** — logs every notification to a queryable repository with delivery status tracking
++- **Validators** — pure functions for order status transitions and notification preference checks
++
++**Known limitations:**
++- `in-app` channel declared but no adapter implemented
++- `emailFrequency` field stored but not enforced (no batching infrastructure)
++- All event handlers produce email-channel notifications only; SMS/webhook dispatch requires calling `sendNotification` directly or extending handlers
++- Phone number storage not in preferences model (SMS recipients come from the payload)
++
++### Files modified
++- `src/services/notification.service.ts` (added user event handlers)
++- `tests/services/notification.service.test.ts` (added 2 tests)
++
++### Test status
++All 240 tests pass (238 existing + 2 new). Zero compilation errors. Zero TODO/FIXME comments.
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index ac1a217..cd25f96 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -24,7 +24,7 @@
+  */
+ 
+ import type { EventBus } from '../events/event-bus.js';
+-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent, UserCreatedEvent, UserUpdatedEvent } from '../events/event-types.js';
+ import type { NotificationAdapter } from '../adapters/notification.adapter.js';
+ import type {
+   Notification,
+@@ -85,6 +85,14 @@ export class NotificationService {
+     this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {
+       await this.handleOrderStatusChanged(event);
+     });
++
++    this.eventBus.on<UserCreatedEvent>('user:created', async (event) => {
++      await this.handleUserCreated(event);
++    });
++
++    this.eventBus.on<UserUpdatedEvent>('user:updated', async (event) => {
++      await this.handleUserUpdated(event);
++    });
+   }
+ 
+   /**
+@@ -125,6 +133,39 @@ export class NotificationService {
+     });
+   }
+ 
++  /**
++   * Handle user created event — send welcome notification.
++   */
++  private async handleUserCreated(event: UserCreatedEvent): Promise<void> {
++    this.logger.info(`Sending welcome notification for user ${event.user.id}`);
++
++    await this.sendNotification({
++      recipient: event.user.email,
++      subject: 'Welcome to TaskFlowPro!',
++      body: `Hi ${event.user.name}, welcome to TaskFlowPro! Your account has been created.`,
++      channel: 'email',
++      notificationType: 'user_welcome',
++      metadata: { userId: event.user.id },
++    });
++  }
++
++  /**
++   * Handle user updated event — notify user of profile changes.
++   */
++  private async handleUserUpdated(event: UserUpdatedEvent): Promise<void> {
++    this.logger.info(`Sending profile update notification for user ${event.user.id}`);
++
++    const changeList = event.changes.join(', ');
++    await this.sendNotification({
++      recipient: event.user.email,
++      subject: 'Profile Updated',
++      body: `Your profile has been updated. Changed fields: ${changeList}.`,
++      channel: 'email',
++      notificationType: 'user_updated',
++      metadata: { userId: event.user.id, changes: event.changes.join(', ') },
++    });
++  }
++
+   /**
+    * Build a Notification record and attempt delivery via the appropriate adapter.
+    * If no adapter is registered for the channel, the notification is still
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 3c8ba74..5802ec2 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,7 +5,7 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailNotificationAdapter } from '../../src/adapters/email.adapter.js';
+-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent, UserCreatedEvent, UserUpdatedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+   let eventBus: EventBus;
+@@ -126,6 +126,61 @@ describe('NotificationService', () => {
+     });
+   });
+ 
++  describe('user:created handler', () => {
++    it('should send welcome notification on user created', async () => {
++      const event: UserCreatedEvent = {
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]?.recipient).toBe('alice@example.com');
++      expect(notifications[0]?.subject).toContain('Welcome');
++      expect(notifications[0]?.body).toContain('Alice');
++      expect(notifications[0]?.channel).toBe('email');
++      expect(notifications[0]?.notificationType).toBe('user_welcome');
++    });
++  });
++
++  describe('user:updated handler', () => {
++    it('should send update notification on user updated', async () => {
++      const event: UserUpdatedEvent = {
++        type: 'user:updated',
++        user: {
++          id: 'user-1',
++          name: 'Alice Smith',
++          email: 'alice@example.com',
++          role: 'admin',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        changes: ['name', 'role'],
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(1);
++      expect(notifications[0]?.recipient).toBe('alice@example.com');
++      expect(notifications[0]?.subject).toContain('Profile Updated');
++      expect(notifications[0]?.body).toContain('name, role');
++      expect(notifications[0]?.channel).toBe('email');
++      expect(notifications[0]?.notificationType).toBe('user_updated');
++    });
++  });
++
+   describe('adapter registration', () => {
+     it('should dispatch to registered adapter', async () => {
+       const emailAdapter = new EmailNotificationAdapter();

@@ -1,0 +1,420 @@
+diff --git a/src/events/event-types.ts b/src/events/event-types.ts
+index a05083e..ff9c2e9 100644
+--- a/src/events/event-types.ts
++++ b/src/events/event-types.ts
+@@ -37,10 +37,26 @@ export interface UserUpdatedEvent {
+   timestamp: Date;
+ }
+ 
++export type NotificationPriority = 'urgent' | 'normal' | 'low';
++
++export type NotificationChannel = 'email' | 'sms' | 'webhook';
++
++export interface NotificationDispatchedEvent {
++  type: 'notification:dispatched';
++  notificationId: string;
++  recipient: string;
++  subject: string;
++  body: string;
++  channel: NotificationChannel;
++  priority: NotificationPriority;
++  timestamp: Date;
++}
++
+ export type AppEvent =
+   | OrderCreatedEvent
+   | OrderStatusChangedEvent
+   | UserCreatedEvent
+-  | UserUpdatedEvent;
++  | UserUpdatedEvent
++  | NotificationDispatchedEvent;
+ 
+ export type EventType = AppEvent['type'];
+diff --git a/src/index.ts b/src/index.ts
+index c41a761..6f1b1de 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -42,12 +42,20 @@ export type {
+   OrderStatusChangedEvent,
+   UserCreatedEvent,
+   UserUpdatedEvent,
++  NotificationDispatchedEvent,
++  NotificationPriority,
++  NotificationChannel,
+ } from './events/event-types.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+ export { OrderService } from './services/order.service.js';
+ export { NotificationService } from './services/notification.service.js';
++export { PriorityRouterService } from './services/priority-router.service.js';
++export { SmsChannelService } from './services/sms-channel.service.js';
++export { WebhookChannelService } from './services/webhook-channel.service.js';
++export { AuditService } from './services/audit.service.js';
++export { NotificationPreferencesService } from './services/notification-preferences.service.js';
+ 
+ // Config
+ export { createConfig, defaultConfig } from './config/app.config.js';
+diff --git a/src/services/audit.service.ts b/src/services/audit.service.ts
+new file mode 100644
+index 0000000..de77c49
+--- /dev/null
++++ b/src/services/audit.service.ts
+@@ -0,0 +1,72 @@
++import type { EventBus } from '../events/event-bus.js';
++import type { NotificationDispatchedEvent, NotificationChannel, NotificationPriority } from '../events/event-types.js';
++import { Logger } from '../utils/logger.js';
++
++export interface AuditEntry {
++  id: string;
++  notificationId: string;
++  recipient: string;
++  subject: string;
++  channel: NotificationChannel;
++  priority: NotificationPriority;
++  timestamp: Date;
++  recordedAt: Date;
++}
++
++let nextAuditId = 1;
++
++function generateAuditId(): string {
++  return `audit-${String(nextAuditId++).padStart(4, '0')}`;
++}
++
++export function resetAuditIdCounter(): void {
++  nextAuditId = 1;
++}
++
++export class AuditService {
++  private logger = new Logger('AuditService');
++  private entries: AuditEntry[] = [];
++
++  constructor(private eventBus: EventBus) {
++    this.eventBus.on<NotificationDispatchedEvent>('notification:dispatched', (event) => {
++      this.record(event);
++    });
++  }
++
++  private record(event: NotificationDispatchedEvent): void {
++    const entry: AuditEntry = {
++      id: generateAuditId(),
++      notificationId: event.notificationId,
++      recipient: event.recipient,
++      subject: event.subject,
++      channel: event.channel,
++      priority: event.priority,
++      timestamp: event.timestamp,
++      recordedAt: new Date(),
++    };
++    this.entries.push(entry);
++    this.logger.info(
++      `Audit recorded: ${entry.id} — [${event.priority}] via ${event.channel} to ${event.recipient}`,
++    );
++  }
++
++  getEntries(): AuditEntry[] {
++    return [...this.entries];
++  }
++
++  getEntriesByRecipient(recipient: string): AuditEntry[] {
++    return this.entries.filter((e) => e.recipient === recipient);
++  }
++
++  getEntriesByChannel(channel: NotificationChannel): AuditEntry[] {
++    return this.entries.filter((e) => e.channel === channel);
++  }
++
++  getEntryCount(): number {
++    return this.entries.length;
++  }
++
++  clearEntries(): void {
++    this.entries = [];
++  }
++}
+diff --git a/src/services/notification-preferences.service.ts b/src/services/notification-preferences.service.ts
+new file mode 100644
+index 0000000..a31bafe
+--- /dev/null
++++ b/src/services/notification-preferences.service.ts
+@@ -0,0 +1,40 @@
++import type { NotificationChannel } from '../events/event-types.js';
++import { Logger } from '../utils/logger.js';
++
++export interface UserNotificationPreferences {
++  userId: string;
++  preferredChannel: NotificationChannel;
++}
++
++export class NotificationPreferencesService {
++  private logger = new Logger('NotificationPreferencesService');
++  private preferences: Map<string, NotificationChannel> = new Map();
++
++  setPreference(userId: string, channel: NotificationChannel): void {
++    this.preferences.set(userId, channel);
++    this.logger.info(`Set preference for ${userId}: ${channel}`);
++  }
++
++  getPreferredChannel(userId: string): NotificationChannel | undefined {
++    return this.preferences.get(userId);
++  }
++
++  removePreference(userId: string): boolean {
++    const existed = this.preferences.delete(userId);
++    if (existed) {
++      this.logger.info(`Removed preference for ${userId}`);
++    }
++    return existed;
++  }
++
++  getAllPreferences(): UserNotificationPreferences[] {
++    return Array.from(this.preferences.entries()).map(([userId, preferredChannel]) => ({
++      userId,
++      preferredChannel,
++    }));
++  }
++
++  clearPreferences(): void {
++    this.preferences.clear();
++  }
++}
+diff --git a/src/services/priority-router.service.ts b/src/services/priority-router.service.ts
+new file mode 100644
+index 0000000..5714155
+--- /dev/null
++++ b/src/services/priority-router.service.ts
+@@ -0,0 +1,128 @@
++import type { EventBus } from '../events/event-bus.js';
++import type {
++  OrderCreatedEvent,
++  OrderStatusChangedEvent,
++  NotificationPriority,
++  NotificationChannel,
++} from '../events/event-types.js';
++import type { NotificationPreferencesService } from './notification-preferences.service.js';
++import { Logger } from '../utils/logger.js';
++
++export interface RoutedNotification {
++  recipient: string;
++  subject: string;
++  body: string;
++  channel: NotificationChannel;
++  priority: NotificationPriority;
++}
++
++const PRIORITY_CHANNEL_MAP: Record<NotificationPriority, NotificationChannel> = {
++  urgent: 'sms',
++  normal: 'email',
++  low: 'webhook',
++};
++
++export class PriorityRouterService {
++  private logger = new Logger('PriorityRouterService');
++  private dispatched: RoutedNotification[] = [];
++
++  constructor(
++    private eventBus: EventBus,
++    private preferencesService?: NotificationPreferencesService,
++  ) {
++    this.registerHandlers();
++  }
++
++  private registerHandlers(): void {
++    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
++      this.routeOrderCreated(event);
++    });
++
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
++      this.routeOrderStatusChanged(event);
++    });
++  }
++
++  private async routeOrderCreated(event: OrderCreatedEvent): Promise<void> {
++    const itemSummary = event.order.items
++      .map((item) => `${item.name} x${item.quantity}`)
++      .join(', ');
++
++    await this.routeNotification({
++      userId: event.user.id,
++      recipient: event.user.email,
++      subject: `Order Confirmation: ${event.order.id}`,
++      body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,
++      priority: 'normal',
++    });
++  }
++
++  private async routeOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {
++    const priority: NotificationPriority =
++      event.newStatus === 'cancelled' ? 'urgent' : 'low';
++
++    await this.routeNotification({
++      userId: event.order.userId,
++      recipient: event.order.userId,
++      subject: `Order Update: ${event.order.id}`,
++      body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,
++      priority,
++    });
++  }
++
++  private async routeNotification(params: {
++    userId: string;
++    recipient: string;
++    subject: string;
++    body: string;
++    priority: NotificationPriority;
++  }): Promise<void> {
++    let channel = this.resolveChannel(params.priority);
++
++    if (this.preferencesService) {
++      const preferred = this.preferencesService.getPreferredChannel(params.userId);
++      if (preferred) {
++        channel = preferred;
++        this.logger.info(
++          `User ${params.userId} preference override: ${PRIORITY_CHANNEL_MAP[params.priority]} -> ${channel}`,
++        );
++      }
++    }
++
++    const routed: RoutedNotification = {
++      recipient: params.recipient,
++      subject: params.subject,
++      body: params.body,
++      channel,
++      priority: params.priority,
++    };
++    this.dispatched.push(routed);
++
++    this.logger.info(
++      `Routed [${params.priority}] notification to ${channel} for ${params.recipient}`,
++    );
++
++    await this.eventBus.emit({
++      type: 'notification:dispatched',
++      notificationId: `dispatch-${this.dispatched.length}`,
++      recipient: params.recipient,
++      subject: params.subject,
++      body: params.body,
++      channel,
++      priority: params.priority,
++      timestamp: new Date(),
++    });
++  }
++
++  resolveChannel(priority: NotificationPriority): NotificationChannel {
++    return PRIORITY_CHANNEL_MAP[priority];
++  }
++
++  getDispatched(): RoutedNotification[] {
++    return [...this.dispatched];
++  }
++
++  clearDispatched(): void {
++    this.dispatched = [];
++  }
++}
+diff --git a/src/services/sms-channel.service.ts b/src/services/sms-channel.service.ts
+new file mode 100644
+index 0000000..451133a
+--- /dev/null
++++ b/src/services/sms-channel.service.ts
+@@ -0,0 +1,40 @@
++import type { EventBus } from '../events/event-bus.js';
++import type { NotificationDispatchedEvent } from '../events/event-types.js';
++import { Logger } from '../utils/logger.js';
++
++export interface SmsMessage {
++  to: string;
++  body: string;
++  sentAt: Date;
++}
++
++export class SmsChannelService {
++  private logger = new Logger('SmsChannelService');
++  private sent: SmsMessage[] = [];
++
++  constructor(private eventBus: EventBus) {
++    this.eventBus.on<NotificationDispatchedEvent>('notification:dispatched', (event) => {
++      if (event.channel === 'sms') {
++        this.send(event);
++      }
++    });
++  }
++
++  private send(event: NotificationDispatchedEvent): void {
++    const msg: SmsMessage = {
++      to: event.recipient,
++      body: `${event.subject}: ${event.body}`,
++      sentAt: new Date(),
++    };
++    this.sent.push(msg);
++    this.logger.info(`SMS sent to ${event.recipient}`);
++  }
++
++  getSentMessages(): SmsMessage[] {
++    return [...this.sent];
++  }
++
++  clearSent(): void {
++    this.sent = [];
++  }
++}
+diff --git a/src/services/webhook-channel.service.ts b/src/services/webhook-channel.service.ts
+new file mode 100644
+index 0000000..839c396
+--- /dev/null
++++ b/src/services/webhook-channel.service.ts
+@@ -0,0 +1,53 @@
++import type { EventBus } from '../events/event-bus.js';
++import type { NotificationDispatchedEvent } from '../events/event-types.js';
++import { Logger } from '../utils/logger.js';
++
++export interface WebhookPayload {
++  url: string;
++  data: {
++    recipient: string;
++    subject: string;
++    body: string;
++    priority: string;
++  };
++  deliveredAt: Date;
++}
++
++export class WebhookChannelService {
++  private logger = new Logger('WebhookChannelService');
++  private delivered: WebhookPayload[] = [];
++  private webhookUrl: string;
++
++  constructor(eventBus: EventBus, webhookUrl = 'https://hooks.example.com/notify') {
++    this.webhookUrl = webhookUrl;
++
++    eventBus.on<NotificationDispatchedEvent>('notification:dispatched', (event) => {
++      if (event.channel === 'webhook') {
++        this.deliver(event);
++      }
++    });
++  }
++
++  private deliver(event: NotificationDispatchedEvent): void {
++    const payload: WebhookPayload = {
++      url: this.webhookUrl,
++      data: {
++        recipient: event.recipient,
++        subject: event.subject,
++        body: event.body,
++        priority: event.priority,
++      },
++      deliveredAt: new Date(),
++    };
++    this.delivered.push(payload);
++    this.logger.info(`Webhook delivered to ${this.webhookUrl} for ${event.recipient}`);
++  }
++
++  getDelivered(): WebhookPayload[] {
++    return [...this.delivered];
++  }
++
++  clearDelivered(): void {
++    this.delivered = [];
++  }
++}

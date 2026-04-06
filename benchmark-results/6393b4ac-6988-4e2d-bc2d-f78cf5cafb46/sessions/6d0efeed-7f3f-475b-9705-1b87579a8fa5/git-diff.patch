@@ -1,0 +1,227 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 1654ceb..90ac0ba 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -385,3 +385,34 @@ The current `UserPreferences` model (`src/models/user-preferences.ts`) was desig
+ - `src/index.ts` — updated exports
+ - `tests/services/preferences.service.test.ts` — 34 tests (22 existing + 12 new)
+ 
++---
++
++## Agent 10 — Notification Delivery Ordering Fix (completed)
++
++### What I did
++1. **Fixed fire-and-forget notification delivery** (`src/services/notification.service.ts`) — the root cause of out-of-order notifications was that `sendNotification()` called `adapter.send()` without awaiting it. The `.then()` chain ran asynchronously, so if two notifications were emitted in sequence, the second could resolve before the first.
++2. **Made `sendNotification()` async** — replaced `.then()/.catch()` chain with `await` + `try/catch`. Notifications now complete delivery before the method returns.
++3. **Made event handlers async** — `handleOrderCreated()` and `handleOrderStatusChanged()` now `await sendNotification()`, so `EventBus.emit()` (which already does sequential `await` on handlers) properly waits for each notification to finish before processing the next event.
++4. **Added ordering test** — new test uses a mock adapter with artificial latency (50ms for the first notification, 10ms for the second) to verify that despite the first being slower, it still delivers first.
++5. **All 189 tests pass** (188 existing + 1 new).
++
++### The bug
++```typescript
++// Before (fire-and-forget): adapter.send() not awaited — notifications race
++private sendNotification(payload: NotificationPayload): void {
++  adapter.send(payload).then((result) => { ... }).catch((err) => { ... });
++}
++
++// After (sequential): adapter.send() awaited — delivery order matches emit order
++private async sendNotification(payload: NotificationPayload): Promise<void> {
++  const result = await adapter.send(payload);
++}
++```
++
++### Why this works
++`EventBus.emit()` already processes handlers sequentially (`for...of` with `await`). The missing piece was that the notification handlers returned `void` instead of a `Promise`, so the EventBus couldn't wait for delivery to complete. Now the full chain is async: `EventBus.emit → await handler → await sendNotification → await adapter.send`.
++
++### Key files
++- `src/services/notification.service.ts` — async sendNotification + async handlers
++- `tests/services/notification.service.test.ts` — new ordering test
++
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 0f37942..8fa4889 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -74,26 +74,26 @@ export class NotificationService {
+    * All handlers subscribe to EventBus — no other notification patterns.
+    */
+   private registerHandlers(): void {
+-    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
+-      this.handleOrderCreated(event);
++    this.eventBus.on<OrderCreatedEvent>('order:created', async (event) => {
++      await this.handleOrderCreated(event);
+     });
+ 
+-    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
+-      this.handleOrderStatusChanged(event);
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {
++      await this.handleOrderStatusChanged(event);
+     });
+   }
+ 
+   /**
+    * Handle order created event — send confirmation to user.
+    */
+-  private handleOrderCreated(event: OrderCreatedEvent): void {
++  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
+     this.logger.info(`Sending order confirmation for order ${event.order.id}`);
+ 
+     const itemSummary = event.order.items
+       .map((item) => `${item.name} x${item.quantity}`)
+       .join(', ');
+ 
+-    this.sendNotification({
++    await this.sendNotification({
+       type: 'order_confirmation',
+       recipient: event.user.email,
+       subject: `Order Confirmation: ${event.order.id}`,
+@@ -106,12 +106,12 @@ export class NotificationService {
+   /**
+    * Handle order status change — notify user of update.
+    */
+-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {
++  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {
+     this.logger.info(
+       `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,
+     );
+ 
+-    this.sendNotification({
++    await this.sendNotification({
+       type: 'order_status_update',
+       recipient: event.order.userId,
+       subject: `Order Update: ${event.order.id}`,
+@@ -126,7 +126,7 @@ export class NotificationService {
+    * Checks user preferences before sending if a PreferencesService is registered.
+    * Falls back to in-memory storage if no adapter is registered for the channel.
+    */
+-  private sendNotification(payload: NotificationPayload): void {
++  private async sendNotification(payload: NotificationPayload): Promise<void> {
+     // Check user preferences if a preferences service is available
+     if (this.preferencesService && payload.metadata?.userId) {
+       const userId = payload.metadata.userId;
+@@ -151,31 +151,29 @@ export class NotificationService {
+ 
+     const adapter = this.adapters.get(payload.channel);
+     if (adapter) {
+-      adapter
+-        .send(payload)
+-        .then((result) => {
+-          if (result.success) {
+-            notification.status = 'sent';
+-            this.eventBus.emit({
+-              type: 'notification:sent',
+-              notification,
+-              timestamp: new Date(),
+-            });
+-          } else {
+-            notification.status = 'failed';
+-            notification.error = result.error;
+-            this.eventBus.emit({
+-              type: 'notification:failed',
+-              notification,
+-              error: result.error ?? 'Unknown error',
+-              timestamp: new Date(),
+-            });
+-          }
+-        })
+-        .catch((err: Error) => {
++      try {
++        const result = await adapter.send(payload);
++        if (result.success) {
++          notification.status = 'sent';
++          this.eventBus.emit({
++            type: 'notification:sent',
++            notification,
++            timestamp: new Date(),
++          });
++        } else {
+           notification.status = 'failed';
+-          notification.error = err.message;
+-        });
++          notification.error = result.error;
++          this.eventBus.emit({
++            type: 'notification:failed',
++            notification,
++            error: result.error ?? 'Unknown error',
++            timestamp: new Date(),
++          });
++        }
++      } catch (err: unknown) {
++        notification.status = 'failed';
++        notification.error = err instanceof Error ? err.message : String(err);
++      }
+     } else {
+       // No adapter registered — store as sent (in-memory fallback for testing/dev)
+       notification.status = 'sent';
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 0e1095e..9747996 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -279,6 +279,68 @@ describe('NotificationService', () => {
+     });
+   });
+ 
++  describe('notification ordering', () => {
++    it('should deliver notifications in order even with varying adapter latency', async () => {
++      const deliveryOrder: string[] = [];
++      const mockAdapter = {
++        channel: 'email' as const,
++        send: async (payload: { subject: string }) => {
++          // Simulate varying latency — first notification takes longer than second
++          const delay = payload.subject.includes('Confirmation') ? 50 : 10;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(payload.subject);
++          return { success: true };
++        },
++      };
++
++      service.registerAdapter(mockAdapter);
++
++      // Emit order created (triggers order_confirmation) then status change (triggers order_status_update)
++      await eventBus.emit({
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      });
++
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
++
++      // Despite the first notification having higher latency, it should still be delivered first
++      expect(deliveryOrder).toHaveLength(2);
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++    });
++  });
++
+   describe('adapter integration', () => {
+     it('should route notifications through registered adapter', async () => {
+       const sent: string[] = [];

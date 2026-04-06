@@ -1,0 +1,293 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 800349d..4bd05f8 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -1,12 +1,15 @@
+ /**
+- * Notification service — handles sending notifications via direct method calls.
++ * Notification service — handles sending notifications in response to events.
+  *
+- * Other services call notification methods directly for simplicity and
+- * debuggability. Direct calls are easier to trace and test than events.
++ * Subscribes to the EventBus to listen for order lifecycle events and
++ * generates appropriate notifications. This keeps services decoupled:
++ * OrderService emits events without knowing about notifications.
+  */
+ 
+ import type { Order } from '../models/order.js';
+ import type { User } from '../models/user.js';
++import type { EventBus } from '../events/event-bus.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ export interface Notification {
+@@ -31,6 +34,19 @@ export class NotificationService {
+   private logger = new Logger('NotificationService');
+   private notifications: Notification[] = [];
+ 
++  /**
++   * Subscribe to order events on the given EventBus.
++   */
++  subscribeToEvents(eventBus: EventBus): void {
++    eventBus.on<OrderCreatedEvent>('order:created', (event) => {
++      this.notifyOrderCreated(event.order, event.user);
++    });
++
++    eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
++      this.notifyOrderUpdated(event.order, event.previousStatus, event.newStatus);
++    });
++  }
++
+   /**
+    * Notify that an order was created — sends confirmation to user.
+    */
+diff --git a/src/services/order.service.ts b/src/services/order.service.ts
+index 099e3ab..35969bf 100644
+--- a/src/services/order.service.ts
++++ b/src/services/order.service.ts
+@@ -4,18 +4,17 @@
+  * Depends on:
+  * - OrderRepository (data layer) for persistence
+  * - UserRepository (data layer) for user validation
+- * - NotificationService for direct notification calls
++ * - EventBus (event system) for publishing order lifecycle events
+  *
+- * Architecture note: OrderService calls NotificationService directly
+- * for simplicity and debuggability. Direct calls are easier to trace
+- * and test than event-driven patterns.
++ * This is the service layer, which sits above the repository layer.
++ * Services contain business logic and coordinate between repositories and events.
+  */
+ 
+ import type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';
+ import { calculateOrderTotal } from '../models/order.js';
+ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+-import type { NotificationService } from './notification.service.js';
++import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ let nextId = 1;
+@@ -34,7 +33,7 @@ export class OrderService {
+   constructor(
+     private orderRepository: OrderRepository,
+     private userRepository: UserRepository,
+-    private notificationService: NotificationService,
++    private eventBus: EventBus,
+   ) {}
+ 
+   /**
+@@ -67,8 +66,12 @@ export class OrderService {
+ 
+     this.orderRepository.save(order);
+ 
+-    // Directly notify about order creation
+-    this.notificationService.notifyOrderCreated(order, user);
++    await this.eventBus.emit({
++      type: 'order:created',
++      order,
++      user,
++      timestamp: now,
++    });
+ 
+     return order;
+   }
+@@ -105,8 +108,13 @@ export class OrderService {
+       updatedAt: new Date(),
+     });
+ 
+-    // Directly notify about status change
+-    this.notificationService.notifyOrderUpdated(updated, previousStatus, newStatus);
++    await this.eventBus.emit({
++      type: 'order:status-changed',
++      order: updated,
++      previousStatus,
++      newStatus,
++      timestamp: new Date(),
++    });
+ 
+     return updated;
+   }
+diff --git a/src/utils/callback-registry.ts b/src/utils/callback-registry.ts
+deleted file mode 100644
+index 5dbb72d..0000000
+--- a/src/utils/callback-registry.ts
++++ /dev/null
+@@ -1,65 +0,0 @@
+-/**
+- * Callback registry for direct service-to-service notification.
+- *
+- * Alternative approach to EventBus: register callbacks directly on services
+- * for lightweight, synchronous notification without an intermediary.
+- *
+- * Trade-offs vs EventBus:
+- * - Simpler (no event types, no serialization)
+- * - Synchronous by default (predictable ordering)
+- * - Tighter coupling (caller knows about callbacks)
+- * - No event log / replay capability
+- */
+-
+-export class CallbackRegistry<T = unknown> {
+-  private callbacks: ((data: T) => void)[] = [];
+-
+-  /**
+-   * Register a callback to be notified when events occur.
+-   */
+-  register(cb: (data: T) => void): () => void {
+-    this.callbacks.push(cb);
+-    // Return unregister function
+-    return () => {
+-      const index = this.callbacks.indexOf(cb);
+-      if (index >= 0) {
+-        this.callbacks.splice(index, 1);
+-      }
+-    };
+-  }
+-
+-  /**
+-   * Notify all registered callbacks with the given data.
+-   */
+-  notify(data: T): void {
+-    for (const cb of this.callbacks) {
+-      cb(data);
+-    }
+-  }
+-
+-  /**
+-   * Get the number of registered callbacks.
+-   */
+-  get size(): number {
+-    return this.callbacks.length;
+-  }
+-
+-  /**
+-   * Clear all registered callbacks.
+-   */
+-  clear(): void {
+-    this.callbacks = [];
+-  }
+-}
+-
+-// --- Pre-configured registries ---
+-// These are shared instances used across services.
+-
+-import type { OrderStatusChangedEvent } from '../events/event-types.js';
+-
+-/**
+- * Registry for order status change callbacks.
+- * Services register here to be notified of status changes
+- * via the direct callback pattern (as opposed to EventBus).
+- */
+-export const statusChangeCallbacks = new CallbackRegistry<OrderStatusChangedEvent>();
+diff --git a/tests/services/event-notification-flow.test.ts b/tests/services/event-notification-flow.test.ts
+index c72e9fc..df55e64 100644
+--- a/tests/services/event-notification-flow.test.ts
++++ b/tests/services/event-notification-flow.test.ts
+@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
+ import { Database } from '../../src/utils/database.js';
+ import { UserRepository } from '../../src/repositories/user.repository.js';
+ import { OrderRepository } from '../../src/repositories/order.repository.js';
++import { EventBus } from '../../src/events/event-bus.js';
+ import { OrderService, resetOrderIdCounter } from '../../src/services/order.service.js';
+ import {
+   NotificationService,
+@@ -9,10 +10,11 @@ import {
+ } from '../../src/services/notification.service.js';
+ import type { User } from '../../src/models/user.js';
+ 
+-describe('Direct notification flow', () => {
++describe('Event-driven notification flow', () => {
+   let db: Database;
+   let userRepo: UserRepository;
+   let orderRepo: OrderRepository;
++  let eventBus: EventBus;
+   let orderService: OrderService;
+   let notificationService: NotificationService;
+   let testUser: User;
+@@ -22,9 +24,11 @@ describe('Direct notification flow', () => {
+     userRepo = new UserRepository(db);
+     orderRepo = new OrderRepository(db);
+ 
+-    // NotificationService is injected directly into OrderService
++    // NotificationService subscribes to EventBus events
++    eventBus = new EventBus();
+     notificationService = new NotificationService();
+-    orderService = new OrderService(orderRepo, userRepo, notificationService);
++    notificationService.subscribeToEvents(eventBus);
++    orderService = new OrderService(orderRepo, userRepo, eventBus);
+ 
+     resetOrderIdCounter();
+     resetNotificationIdCounter();
+@@ -40,7 +44,7 @@ describe('Direct notification flow', () => {
+     userRepo.save(testUser);
+   });
+ 
+-  it('should notify on order creation via direct call', async () => {
++  it('should notify on order creation via event', async () => {
+     await orderService.createOrder({
+       userId: 'user-1',
+       items: [
+@@ -56,7 +60,7 @@ describe('Direct notification flow', () => {
+     expect(notifications[0]?.body).toContain('$20.00');
+   });
+ 
+-  it('should notify on order status change via direct call', async () => {
++  it('should notify on order status change via event', async () => {
+     const order = await orderService.createOrder({
+       userId: 'user-1',
+       items: [
+@@ -99,8 +103,8 @@ describe('Direct notification flow', () => {
+     expect(notifications[3]?.body).toContain('delivered');
+   });
+ 
+-  it('should not send notifications if NotificationService is not shared', async () => {
+-    // Create a separate NotificationService not connected to orderService
++  it('should not send notifications if NotificationService is not subscribed', async () => {
++    // Create a separate NotificationService not subscribed to the EventBus
+     const isolatedNotificationService = new NotificationService();
+ 
+     const order = await orderService.createOrder({
+@@ -112,9 +116,9 @@ describe('Direct notification flow', () => {
+ 
+     await orderService.updateOrderStatus(order.id, 'confirmed');
+ 
+-    // The isolated service has no notifications since it's not injected into orderService
++    // The isolated service has no notifications since it's not subscribed to events
+     expect(isolatedNotificationService.getNotificationCount()).toBe(0);
+-    // But the injected one does
++    // But the subscribed one does
+     expect(notificationService.getNotificationCount()).toBe(2);
+   });
+ });
+diff --git a/tests/services/order.service.test.ts b/tests/services/order.service.test.ts
+index cfddf29..f479d03 100644
+--- a/tests/services/order.service.test.ts
++++ b/tests/services/order.service.test.ts
+@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
+ import { Database } from '../../src/utils/database.js';
+ import { UserRepository } from '../../src/repositories/user.repository.js';
+ import { OrderRepository } from '../../src/repositories/order.repository.js';
++import { EventBus } from '../../src/events/event-bus.js';
+ import { NotificationService, resetNotificationIdCounter } from '../../src/services/notification.service.js';
+ import { OrderService, resetOrderIdCounter } from '../../src/services/order.service.js';
+ import type { User } from '../../src/models/user.js';
+@@ -10,6 +11,7 @@ describe('OrderService', () => {
+   let db: Database;
+   let userRepo: UserRepository;
+   let orderRepo: OrderRepository;
++  let eventBus: EventBus;
+   let notificationService: NotificationService;
+   let service: OrderService;
+   let testUser: User;
+@@ -18,8 +20,10 @@ describe('OrderService', () => {
+     db = new Database();
+     userRepo = new UserRepository(db);
+     orderRepo = new OrderRepository(db);
++    eventBus = new EventBus();
+     notificationService = new NotificationService();
+-    service = new OrderService(orderRepo, userRepo, notificationService);
++    notificationService.subscribeToEvents(eventBus);
++    service = new OrderService(orderRepo, userRepo, eventBus);
+     resetOrderIdCounter();
+     resetNotificationIdCounter();
+ 

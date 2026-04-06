@@ -1,0 +1,168 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index f8ce0ea..c933e20 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -51,6 +51,7 @@ export class NotificationService {
+   private defaultChannel: NotificationChannel = 'email';
+   private preferencesService?: PreferencesService;
+   private historyService?: NotificationHistoryService;
++  private sendQueues: Map<string, Promise<NotificationResult | undefined>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+@@ -181,6 +182,33 @@ export class NotificationService {
+       channel?: NotificationChannel;
+       userId?: string;
+     },
++  ): Promise<NotificationResult | undefined> {
++    // Chain onto the per-recipient queue to guarantee delivery order.
++    // Each recipient's notifications are serialized so that e.g. "order placed"
++    // is always delivered before "payment confirmed" for the same user.
++    const previous = this.sendQueues.get(params.recipient) ?? Promise.resolve(undefined);
++    const current = previous.then(
++      () => this.doSend(params),
++      () => this.doSend(params),
++    );
++    this.sendQueues.set(params.recipient, current);
++    return current;
++  }
++
++  /**
++   * Internal send implementation — performs preference checks, adapter dispatch,
++   * and history recording. Called from send() via the per-recipient queue.
++   */
++  private async doSend(
++    params: {
++      type: NotificationType;
++      recipient: string;
++      subject: string;
++      body: string;
++      metadata?: Record<string, unknown>;
++      channel?: NotificationChannel;
++      userId?: string;
++    },
+   ): Promise<NotificationResult | undefined> {
+     const channel = params.channel ?? this.defaultChannel;
+ 
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 49a9467..7ec4136 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,6 +5,8 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailNotificationAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationChannel, NotificationPayload, NotificationResult } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent, UserCreatedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -315,4 +317,108 @@ describe('NotificationService', () => {
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications to the same recipient in order even with slow adapters', async () => {
++      // Create an adapter that introduces variable delay to simulate
++      // real-world network conditions where responses arrive out of order
++      const deliveryOrder: string[] = [];
++      let callCount = 0;
++      const delayAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          const thisCall = callCount++;
++          // First call takes longer than second — without queuing, the
++          // second notification would be delivered before the first
++          const delay = thisCall === 0 ? 50 : 10;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(payload.type);
++          return {
++            success: true,
++            channel: 'email',
++            notificationId: payload.id,
++            deliveredAt: new Date(),
++          };
++        },
++      };
++
++      const bus = new EventBus();
++      const svc = new NotificationService(bus);
++      svc.registerAdapter(delayAdapter);
++
++      // Fire two notifications for the same recipient concurrently
++      // (without awaiting the first before starting the second)
++      const p1 = svc.send({
++        type: 'order_confirmation',
++        recipient: 'alice@example.com',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++        metadata: { userId: 'user-1' },
++      });
++      const p2 = svc.send({
++        type: 'order_status_update',
++        recipient: 'alice@example.com',
++        subject: 'Payment Confirmed',
++        body: 'Your payment has been confirmed.',
++        metadata: { userId: 'user-1' },
++      });
++
++      await Promise.all([p1, p2]);
++
++      // Despite the first adapter call being slower, order_confirmation
++      // must be delivered before order_status_update
++      expect(deliveryOrder).toEqual(['order_confirmation', 'order_status_update']);
++
++      // The notification list should also reflect the correct order
++      const notifications = svc.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++
++    it('should not block notifications for different recipients', async () => {
++      const deliveryOrder: string[] = [];
++      let callCount = 0;
++      const delayAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          const thisCall = callCount++;
++          // First recipient (Alice) is slow, second (Bob) is fast
++          const delay = thisCall === 0 ? 50 : 10;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(`${payload.recipient}:${payload.type}`);
++          return {
++            success: true,
++            channel: 'email',
++            notificationId: payload.id,
++            deliveredAt: new Date(),
++          };
++        },
++      };
++
++      const bus = new EventBus();
++      const svc = new NotificationService(bus);
++      svc.registerAdapter(delayAdapter);
++
++      // Send to different recipients concurrently — they should NOT block each other
++      const p1 = svc.send({
++        type: 'order_confirmation',
++        recipient: 'alice@example.com',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++      });
++      const p2 = svc.send({
++        type: 'order_confirmation',
++        recipient: 'bob@example.com',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++      });
++
++      await Promise.all([p1, p2]);
++
++      // Bob's notification should complete before Alice's since they're independent
++      expect(deliveryOrder[0]).toBe('bob@example.com:order_confirmation');
++      expect(deliveryOrder[1]).toBe('alice@example.com:order_confirmation');
++    });
++  });
+ });

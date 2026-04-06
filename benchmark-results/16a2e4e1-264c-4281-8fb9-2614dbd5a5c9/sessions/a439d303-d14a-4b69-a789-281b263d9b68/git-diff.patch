@@ -1,0 +1,977 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 230bd0d..2a06ee7 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -625,3 +625,90 @@ Domain Event (e.g. order:created)
+ 
+ ---
+ 
++## Agent 11 — Integration Tests for Full Notification Pipeline
++
++### Status: COMPLETE
++
++### What I Did
++
++1. **Fixed bug: `UserRepository` missing `phone` field** (`src/repositories/user.repository.ts`):
++   - `toDomain()` and `toRecord()` were not serializing/deserializing the `phone` field added by Agent 9.
++   - This meant SMS notifications via `handleOrderStatusChanged` (which looks up the user via `userRepository.findById`) would never find the phone number.
++
++2. **Fixed bug: `handleOrderStatusChanged` used userId as email recipient** (`src/services/notification.service.ts`):
++   - The `OrderStatusChangedEvent` doesn't include the user object, only `order.userId`.
++   - The handler was passing `userId` (e.g., `"user-001"`) as the email/webhook recipient, which is not a valid email address.
++   - Fixed to look up the user from `userRepository` and use `user.email` as the recipient (falls back to `userId` when no repository is set, preserving backward compatibility with unit tests).
++
++3. **Created `tests/integration/notification-pipeline.test.ts`** — 27 integration tests covering the full pipeline:
++
++   **Email channel e2e (2 tests)**:
++   - Email delivery for `order:created` — verifies rendered email content (to, subject, HTML, text)
++   - Email delivery for `order:status-changed` — verifies subject and body content
++
++   **SMS channel e2e (3 tests)**:
++   - SMS delivery when user has phone number (`order:created`)
++   - SMS delivery via userRepository phone lookup (`order:status-changed`)
++   - SMS skipped when user has no phone number (email/webhook still sent)
++
++   **Webhook channel e2e (2 tests)**:
++   - Webhook delivery for `order:created` — verifies URL, headers, secret, JSON body
++   - Webhook delivery for `order:status-changed`
++
++   **Multi-channel dispatch (2 tests)**:
++   - All three channels dispatched for `order:created` with phone
++   - All three channels dispatched for `order:status-changed` with phone
++
++   **History logging (4 tests)**:
++   - All sent notifications logged with 'sent' status
++   - Suppressed notifications logged with 'suppressed' status
++   - Failed adapter notifications logged with 'failed' status and error message
++   - History queryable by channel
++
++   **Preferences enforcement (8 tests)**:
++   - Email globally disabled → no email, SMS/webhook still sent
++   - SMS globally disabled → no SMS, email/webhook still sent
++   - Webhook globally disabled → no webhook, email/SMS still sent
++   - Order category disabled for email → email suppressed
++   - Email frequency='none' → email suppressed
++   - All channels disabled → all suppressed, history still logged
++   - No preferences set → all channels enabled (opt-out model)
++   - Category disabled on one channel only → only that channel suppressed
++
++   **Ordering (2 tests)**:
++   - Notifications in event emission order (sequential)
++   - Ordering preserved even with concurrent emit (non-awaited)
++
++   **Error resilience (2 tests)**:
++   - Adapter failure on one channel doesn't block others
++   - Subsequent events processed after transient adapter failure
++
++   **Phone persistence regression (2 tests)**:
++   - Phone number persisted and retrieved through UserRepository
++   - User without phone handled correctly
++
++4. **All 268 tests pass** (241 existing + 27 new), TypeScript compiles cleanly.
++
++### Key Bugs Found and Fixed
++
++1. **UserRepository `phone` field missing**: Agent 9 added `phone` to the `User` model but didn't update `UserRepository.toDomain()`/`toRecord()`. Phone numbers were lost on save/retrieve.
++
++2. **Email recipient for status-changed events**: `handleOrderStatusChanged` passed `userId` (not a valid email) as the recipient for email and webhook. Fixed to look up `user.email` from `userRepository`.
++
++### Files Created
++- `tests/integration/notification-pipeline.test.ts` — 27 integration tests
++
++### Files Modified
++- `src/repositories/user.repository.ts` — added `phone` field to `toDomain()`/`toRecord()`
++- `src/services/notification.service.ts` — fixed `handleOrderStatusChanged` to use `user.email` as recipient
++
++### Context for Next Agents
++
++1. **Integration tests are in `tests/integration/`** — they wire up the full stack with no mocks: EventBus, NotificationService, all 3 adapters, PreferencesService, NotificationHistoryService, UserRepository, and all repositories with a real in-memory Database.
++
++2. **The two bugs found were real integration issues** that unit tests couldn't catch because they tested components in isolation. The phone field was lost through serialization, and the email recipient was invalid for status-changed events.
++
++3. **All 268 tests pass**: 241 existing unit tests + 27 new integration tests.
++
++---
++
+diff --git a/src/repositories/user.repository.ts b/src/repositories/user.repository.ts
+index e2c533d..a2301d4 100644
+--- a/src/repositories/user.repository.ts
++++ b/src/repositories/user.repository.ts
+@@ -16,7 +16,7 @@ export class UserRepository extends BaseRepository<User> {
+   }
+ 
+   protected toDomain(record: DatabaseRecord): User {
+-    return {
++    const user: User = {
+       id: record['id'] as string,
+       name: record['name'] as string,
+       email: record['email'] as string,
+@@ -24,10 +24,14 @@ export class UserRepository extends BaseRepository<User> {
+       createdAt: new Date(record['createdAt'] as string),
+       updatedAt: new Date(record['updatedAt'] as string),
+     };
++    if (record['phone']) {
++      user.phone = record['phone'] as string;
++    }
++    return user;
+   }
+ 
+   protected toRecord(entity: User): DatabaseRecord {
+-    return {
++    const record: DatabaseRecord = {
+       id: entity.id,
+       name: entity.name,
+       email: entity.email,
+@@ -35,6 +39,10 @@ export class UserRepository extends BaseRepository<User> {
+       createdAt: entity.createdAt.toISOString(),
+       updatedAt: entity.updatedAt.toISOString(),
+     };
++    if (entity.phone) {
++      record['phone'] = entity.phone;
++    }
++    return record;
+   }
+ 
+   /**
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 461cd17..d46a247 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -184,10 +184,14 @@ export class NotificationService {
+     const body = `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`;
+     const userId = event.order.userId;
+ 
++    // Look up user for email and phone
++    const user = this.userRepository?.findById(userId);
++    const emailRecipient = user?.email ?? userId;
++
+     // Email
+     await this.sendNotification(
+       {
+-        recipient: userId,
++        recipient: emailRecipient,
+         subject,
+         body,
+         channel: 'email',
+@@ -196,8 +200,7 @@ export class NotificationService {
+       userId,
+     );
+ 
+-    // SMS — look up user for phone number
+-    const user = this.userRepository?.findById(userId);
++    // SMS — only if user has phone number
+     if (user?.phone) {
+       await this.sendNotification(
+         {
+@@ -214,7 +217,7 @@ export class NotificationService {
+     // Webhook
+     await this.sendNotification(
+       {
+-        recipient: userId,
++        recipient: emailRecipient,
+         subject,
+         body,
+         channel: 'webhook',
+diff --git a/tests/integration/notification-pipeline.test.ts b/tests/integration/notification-pipeline.test.ts
+new file mode 100644
+index 0000000..32dfceb
+--- /dev/null
++++ b/tests/integration/notification-pipeline.test.ts
+@@ -0,0 +1,797 @@
++/**
++ * Integration tests for the full notification pipeline.
++ *
++ * Tests the end-to-end flow: EventBus → NotificationService → Adapters → History
++ * with preferences checking at each step.
++ *
++ * These tests wire up the full stack (no mocks) and verify that domain events
++ * result in the correct notifications being delivered through each channel,
++ * logged in history, and filtered by user preferences.
++ */
++
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import { NotificationService, resetNotificationIdCounter } from '../../src/services/notification.service.js';
++import { PreferencesService, resetPreferencesIdCounter } from '../../src/services/preferences.service.js';
++import { NotificationHistoryService, resetNotificationLogIdCounter } from '../../src/services/notification-history.service.js';
++import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import { SmsAdapter } from '../../src/adapters/sms.adapter.js';
++import { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';
++import { Database } from '../../src/utils/database.js';
++import { UserRepository } from '../../src/repositories/user.repository.js';
++import { PreferencesRepository } from '../../src/repositories/preferences.repository.js';
++import { NotificationLogRepository } from '../../src/repositories/notification-log.repository.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import type { User } from '../../src/models/user.js';
++import type { Order } from '../../src/models/order.js';
++
++// -- Test Fixtures --
++
++function createTestUser(overrides: Partial<User> = {}): User {
++  return {
++    id: 'user-001',
++    name: 'Alice Test',
++    email: 'alice@example.com',
++    phone: '+15551234567',
++    role: 'member',
++    createdAt: new Date('2026-01-01'),
++    updatedAt: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++function createTestOrder(overrides: Partial<Order> = {}): Order {
++  return {
++    id: 'order-001',
++    userId: 'user-001',
++    items: [
++      { productId: 'prod-1', name: 'Widget', quantity: 2, unitPrice: 9.99 },
++      { productId: 'prod-2', name: 'Gadget', quantity: 1, unitPrice: 24.99 },
++    ],
++    total: 44.97,
++    status: 'pending',
++    createdAt: new Date('2026-03-01'),
++    updatedAt: new Date('2026-03-01'),
++    ...overrides,
++  };
++}
++
++// -- Full Pipeline Setup --
++
++interface PipelineContext {
++  db: Database;
++  eventBus: EventBus;
++  userRepo: UserRepository;
++  prefsRepo: PreferencesRepository;
++  logRepo: NotificationLogRepository;
++  preferencesService: PreferencesService;
++  historyService: NotificationHistoryService;
++  notificationService: NotificationService;
++  emailAdapter: EmailAdapter;
++  smsAdapter: SmsAdapter;
++  webhookAdapter: WebhookAdapter;
++}
++
++function setupPipeline(): PipelineContext {
++  const db = new Database();
++  const eventBus = new EventBus();
++
++  // Repositories
++  const userRepo = new UserRepository(db);
++  const prefsRepo = new PreferencesRepository(db);
++  const logRepo = new NotificationLogRepository(db);
++
++  // Services
++  const preferencesService = new PreferencesService(prefsRepo, userRepo);
++  const historyService = new NotificationHistoryService(logRepo);
++
++  // Notification service (subscribes to EventBus in constructor)
++  const notificationService = new NotificationService(eventBus);
++
++  // Adapters
++  const emailAdapter = new EmailAdapter();
++  const smsAdapter = new SmsAdapter({ fromNumber: '+15550000000' });
++  const webhookAdapter = new WebhookAdapter({ url: 'https://hooks.example.com/notify', secret: 'test-secret' });
++
++  // Wire up
++  notificationService.registerAdapter(emailAdapter);
++  notificationService.registerAdapter(smsAdapter);
++  notificationService.registerAdapter(webhookAdapter);
++  notificationService.setPreferencesService(preferencesService);
++  notificationService.setHistoryService(historyService);
++  notificationService.setUserRepository(userRepo);
++
++  return {
++    db, eventBus, userRepo, prefsRepo, logRepo,
++    preferencesService, historyService, notificationService,
++    emailAdapter, smsAdapter, webhookAdapter,
++  };
++}
++
++describe('Notification Pipeline Integration', () => {
++  let ctx: PipelineContext;
++
++  beforeEach(() => {
++    resetNotificationIdCounter();
++    resetPreferencesIdCounter();
++    resetNotificationLogIdCounter();
++    ctx = setupPipeline();
++  });
++
++  // ---- Email Channel ----
++
++  describe('email channel end-to-end', () => {
++    it('should deliver email notification when order:created is emitted', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const emails = ctx.emailAdapter.getSentEmails();
++      expect(emails.length).toBe(1);
++      expect(emails[0].to).toBe('alice@example.com');
++      expect(emails[0].subject).toContain('Order Confirmation');
++      expect(emails[0].html).toContain('Widget x2');
++      expect(emails[0].text).toContain('Gadget x1');
++    });
++
++    it('should deliver email notification when order:status-changed is emitted', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++      const order = createTestOrder({ status: 'confirmed' });
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const emails = ctx.emailAdapter.getSentEmails();
++      expect(emails.length).toBe(1);
++      // For status-changed, recipient is userId (not email) because event doesn't include full user
++      expect(emails[0].subject).toContain('Order Update');
++      expect(emails[0].text).toContain('pending');
++      expect(emails[0].text).toContain('confirmed');
++    });
++  });
++
++  // ---- SMS Channel ----
++
++  describe('SMS channel end-to-end', () => {
++    it('should deliver SMS notification when user has a phone number (order:created)', async () => {
++      const user = createTestUser({ phone: '+15559876543' });
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const messages = ctx.smsAdapter.getSentMessages();
++      expect(messages.length).toBe(1);
++      expect(messages[0].to).toBe('+15559876543');
++      expect(messages[0].from).toBe('+15550000000');
++      expect(messages[0].body).toContain('Order Confirmation');
++      expect(messages[0].body).toContain('Widget x2');
++    });
++
++    it('should deliver SMS for order:status-changed by looking up user phone from repository', async () => {
++      const user = createTestUser({ phone: '+15559876543' });
++      ctx.userRepo.save(user);
++      const order = createTestOrder({ status: 'shipped' });
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order,
++        previousStatus: 'confirmed',
++        newStatus: 'shipped',
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const messages = ctx.smsAdapter.getSentMessages();
++      expect(messages.length).toBe(1);
++      expect(messages[0].to).toBe('+15559876543');
++      expect(messages[0].body).toContain('confirmed');
++      expect(messages[0].body).toContain('shipped');
++    });
++
++    it('should skip SMS when user has no phone number', async () => {
++      const user = createTestUser({ phone: undefined });
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const messages = ctx.smsAdapter.getSentMessages();
++      expect(messages.length).toBe(0);
++
++      // Email and webhook should still be sent
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++  });
++
++  // ---- Webhook Channel ----
++
++  describe('webhook channel end-to-end', () => {
++    it('should deliver webhook notification for order:created', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const deliveries = ctx.webhookAdapter.getDeliveries();
++      expect(deliveries.length).toBe(1);
++      expect(deliveries[0].url).toBe('https://hooks.example.com/notify');
++      expect(deliveries[0].headers['Content-Type']).toBe('application/json');
++      expect(deliveries[0].headers['X-Webhook-Secret']).toBe('test-secret');
++      expect(deliveries[0].body.event).toBe('order:confirmation');
++      expect(deliveries[0].body.recipient).toBe('alice@example.com');
++      expect(deliveries[0].body.subject).toContain('Order Confirmation');
++    });
++
++    it('should deliver webhook notification for order:status-changed', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++      const order = createTestOrder({ status: 'delivered' });
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order,
++        previousStatus: 'shipped',
++        newStatus: 'delivered',
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const deliveries = ctx.webhookAdapter.getDeliveries();
++      expect(deliveries.length).toBe(1);
++      expect(deliveries[0].body.event).toBe('order:status-update');
++      expect(deliveries[0].body.body).toContain('shipped');
++      expect(deliveries[0].body.body).toContain('delivered');
++    });
++  });
++
++  // ---- Multi-Channel Dispatch ----
++
++  describe('multi-channel dispatch', () => {
++    it('should dispatch to all three channels for order:created when user has phone', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++
++      // NotificationService in-memory records should have all three
++      const records = ctx.notificationService.getNotifications();
++      expect(records.length).toBe(3);
++      const channels = records.map((r) => r.channel).sort();
++      expect(channels).toEqual(['email', 'sms', 'webhook']);
++    });
++
++    it('should dispatch to all three channels for order:status-changed when user has phone', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++      const order = createTestOrder({ status: 'confirmed' });
++
++      const event: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++  });
++
++  // ---- History Logging ----
++
++  describe('notification history logging', () => {
++    it('should log all sent notifications in history', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const history = ctx.historyService.getAllHistory();
++      expect(history.length).toBe(3); // email + sms + webhook
++
++      // All should be 'sent'
++      for (const entry of history) {
++        expect(entry.status).toBe('sent');
++        expect(entry.type).toBe('order:confirmation');
++      }
++
++      const channels = history.map((e) => e.channel).sort();
++      expect(channels).toEqual(['email', 'sms', 'webhook']);
++    });
++
++    it('should log suppressed notifications in history', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      // Disable email for this user
++      ctx.preferencesService.updatePreferences(user.id, {
++        email: { enabled: false },
++      });
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const history = ctx.historyService.getAllHistory();
++      const emailHistory = history.filter((e) => e.channel === 'email');
++      const smsHistory = history.filter((e) => e.channel === 'sms');
++      const webhookHistory = history.filter((e) => e.channel === 'webhook');
++
++      // Email should be suppressed
++      expect(emailHistory.length).toBe(1);
++      expect(emailHistory[0].status).toBe('suppressed');
++
++      // SMS and webhook should be sent
++      expect(smsHistory.length).toBe(1);
++      expect(smsHistory[0].status).toBe('sent');
++      expect(webhookHistory.length).toBe(1);
++      expect(webhookHistory[0].status).toBe('sent');
++    });
++
++    it('should log failed notifications in history', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      // Register a failing email adapter
++      const failingEmailAdapter = {
++        channel: 'email' as const,
++        async send() {
++          throw new Error('SMTP connection failed');
++        },
++      };
++      ctx.notificationService.registerAdapter(failingEmailAdapter);
++
++      const event: OrderCreatedEvent = {
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      };
++
++      await ctx.eventBus.emit(event);
++
++      const history = ctx.historyService.getAllHistory();
++      const emailHistory = history.filter((e) => e.channel === 'email');
++
++      expect(emailHistory.length).toBe(1);
++      expect(emailHistory[0].status).toBe('failed');
++      expect(emailHistory[0].error).toBe('SMTP connection failed');
++
++      // SMS and webhook should still succeed
++      const smsHistory = history.filter((e) => e.channel === 'sms');
++      const webhookHistory = history.filter((e) => e.channel === 'webhook');
++      expect(smsHistory[0].status).toBe('sent');
++      expect(webhookHistory[0].status).toBe('sent');
++    });
++
++    it('should allow querying history by channel', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      const emailLogs = ctx.historyService.queryHistory({ channel: 'email' });
++      expect(emailLogs.length).toBe(1);
++      expect(emailLogs[0].channel).toBe('email');
++
++      const smsLogs = ctx.historyService.queryHistory({ channel: 'sms' });
++      expect(smsLogs.length).toBe(1);
++      expect(smsLogs[0].channel).toBe('sms');
++    });
++  });
++
++  // ---- User Preferences ----
++
++  describe('user preferences enforcement', () => {
++    it('should not send email when email is globally disabled', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        email: { enabled: false },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(0);
++      // SMS and webhook should still deliver
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++
++    it('should not send SMS when SMS is globally disabled', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        sms: { enabled: false },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(0);
++      // Email and webhook should still deliver
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++
++    it('should not send webhook when webhook is globally disabled', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        webhook: { enabled: false },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(0);
++      // Email and SMS should still deliver
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++    });
++
++    it('should not send email when order category is disabled for email', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        email: { categories: { order: false } },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(0);
++      // SMS and webhook should still deliver (their order category is still enabled)
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++
++    it('should not send email when frequency is set to none', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        email: { frequency: 'none' },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(0);
++    });
++
++    it('should suppress all channels when all are disabled', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      ctx.preferencesService.updatePreferences(user.id, {
++        email: { enabled: false },
++        sms: { enabled: false },
++        webhook: { enabled: false },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(0);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(0);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(0);
++
++      // But history should still log suppressions
++      const history = ctx.historyService.getAllHistory();
++      expect(history.length).toBe(3);
++      for (const entry of history) {
++        expect(entry.status).toBe('suppressed');
++      }
++    });
++
++    it('should send to all channels by default (no preferences set)', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++      // No preferences set — opt-out model means everything is enabled
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++
++    it('should allow disabling a specific category on one channel while others remain enabled', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      // Disable order category only for SMS
++      ctx.preferencesService.updatePreferences(user.id, {
++        sms: { categories: { order: false } },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      expect(ctx.emailAdapter.getSentEmails().length).toBe(1);
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(0); // suppressed
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++    });
++  });
++
++  // ---- Notification Ordering ----
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in the order events are emitted', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++      const order = createTestOrder();
++
++      const createdEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order,
++        user,
++        timestamp: new Date(),
++      };
++
++      const statusEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: { ...order, status: 'confirmed' },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit both events (EventBus serializes them)
++      await ctx.eventBus.emit(createdEvent);
++      await ctx.eventBus.emit(statusEvent);
++
++      const records = ctx.notificationService.getNotifications();
++
++      // First 3 should be order:confirmation (email, sms, webhook)
++      const confirmations = records.filter((r) => r.type === 'order:confirmation');
++      const statusUpdates = records.filter((r) => r.type === 'order:status-update');
++
++      expect(confirmations.length).toBe(3);
++      expect(statusUpdates.length).toBe(3);
++
++      // All confirmations should come before all status-updates in the array
++      const lastConfirmationIndex = records.findLastIndex((r) => r.type === 'order:confirmation');
++      const firstStatusUpdateIndex = records.findIndex((r) => r.type === 'order:status-update');
++      expect(lastConfirmationIndex).toBeLessThan(firstStatusUpdateIndex);
++    });
++
++    it('should maintain order even when events are emitted without awaiting', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++      const order = createTestOrder();
++
++      const createdEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order,
++        user,
++        timestamp: new Date(),
++      };
++
++      const statusEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: { ...order, status: 'confirmed' },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit concurrently without awaiting first
++      const p1 = ctx.eventBus.emit(createdEvent);
++      const p2 = ctx.eventBus.emit(statusEvent);
++      await Promise.all([p1, p2]);
++
++      const records = ctx.notificationService.getNotifications();
++      const types = records.map((r) => r.type);
++
++      // All order:confirmation should come before order:status-update
++      const lastConfIdx = types.lastIndexOf('order:confirmation');
++      const firstStatusIdx = types.indexOf('order:status-update');
++      expect(lastConfIdx).toBeLessThan(firstStatusIdx);
++    });
++  });
++
++  // ---- Error Resilience ----
++
++  describe('error resilience', () => {
++    it('should continue delivering to other channels when one adapter fails', async () => {
++      const user = createTestUser({ phone: '+15551112222' });
++      ctx.userRepo.save(user);
++
++      // Replace email adapter with one that fails
++      ctx.notificationService.registerAdapter({
++        channel: 'email' as const,
++        async send() {
++          throw new Error('Email server down');
++        },
++      });
++
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      // Email failed, but SMS and webhook should still succeed
++      expect(ctx.smsAdapter.getSentMessages().length).toBe(1);
++      expect(ctx.webhookAdapter.getDeliveries().length).toBe(1);
++
++      // History shows the failure
++      const history = ctx.historyService.getAllHistory();
++      const emailLog = history.find((e) => e.channel === 'email');
++      expect(emailLog?.status).toBe('failed');
++      expect(emailLog?.error).toBe('Email server down');
++    });
++
++    it('should continue processing subsequent events after an adapter failure', async () => {
++      const user = createTestUser();
++      ctx.userRepo.save(user);
++
++      let shouldFail = true;
++      ctx.notificationService.registerAdapter({
++        channel: 'email' as const,
++        async send() {
++          if (shouldFail) {
++            shouldFail = false;
++            throw new Error('Transient failure');
++          }
++        },
++      });
++
++      // First event — email will fail
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder(),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      // Second event — email should succeed (shouldFail is now false)
++      await ctx.eventBus.emit({
++        type: 'order:created',
++        order: createTestOrder({ id: 'order-002' }),
++        user,
++        timestamp: new Date(),
++      } satisfies OrderCreatedEvent);
++
++      const history = ctx.historyService.getAllHistory();
++      const emailLogs = history.filter((e) => e.channel === 'email');
++      expect(emailLogs.length).toBe(2);
++      expect(emailLogs[0].status).toBe('failed');
++      expect(emailLogs[1].status).toBe('sent');
++    });
++  });
++
++  // ---- UserRepository Phone Persistence ----
++
++  describe('user phone number persistence (bug regression)', () => {
++    it('should persist and retrieve user phone number through repository', () => {
++      const user = createTestUser({ phone: '+15559999999' });
++      ctx.userRepo.save(user);
++
++      const retrieved = ctx.userRepo.findById(user.id);
++      expect(retrieved).toBeDefined();
++      expect(retrieved!.phone).toBe('+15559999999');
++    });
++
++    it('should handle user without phone number', () => {
++      const user = createTestUser({ phone: undefined });
++      ctx.userRepo.save(user);
++
++      const retrieved = ctx.userRepo.findById(user.id);
++      expect(retrieved).toBeDefined();
++      expect(retrieved!.phone).toBeUndefined();
++    });
++  });
++});

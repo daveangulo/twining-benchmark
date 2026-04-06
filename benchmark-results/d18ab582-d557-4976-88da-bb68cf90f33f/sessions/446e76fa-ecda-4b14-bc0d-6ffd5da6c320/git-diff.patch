@@ -1,0 +1,220 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index f841637..c3ce35a 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -5,6 +5,30 @@ Write your updates below. There is no enforced format — use whatever structure
+ 
+ ---
+ 
++## Agent 10 — Notification Delivery Ordering Fix (completed)
++
++### What was done
++Fixed a bug where notifications could arrive out of order (e.g., "payment confirmed" before "order placed").
++
++### Root cause
++The `dispatchNotification()` method in `NotificationService` was synchronous and did not `await` the `eventBus.emit()` call for `notification:send` events. The event handler callbacks were also synchronous, not returning Promises. This meant each notification emission was fire-and-forget — when multiple domain events arrived in sequence, the `notification:send` events became floating Promises that could resolve in any order.
++
++### Fix (3 changes in `src/services/notification.service.ts`)
++1. Made `dispatchNotification()` async and added `await` on `this.eventBus.emit()`
++2. Made `handleOrderCreated()` and `handleOrderStatusChanged()` async with `await this.dispatchNotification()`
++3. Made event handler callbacks in `registerEventHandlers()` async with `await` on the handler calls
++
++This ensures each notification fully completes (including adapter delivery) before the next domain event is processed.
++
++### Tests added (2 new in `tests/services/notification.service.test.ts`)
++- "should deliver notifications in the order they were dispatched" — emits order:created then order:status-changed and verifies order_confirmation comes before order_status_update
++- "should complete notification delivery before processing next event" — uses an async listener with a delay to verify dispatch awaits completion
++
++### Test results
++- All 229 tests pass (227 existing + 2 new). TypeScript compiles cleanly.
++
++---
++
+ ## Agent 9 — Multi-Channel User Notification Preferences (completed)
+ 
+ ### What was done
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index a23bd6e..06acd1a 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -104,26 +104,26 @@ export class NotificationService {
+    * All subscriptions use EventBus — no CallbackRegistry, no direct calls.
+    */
+   private registerEventHandlers(): void {
+-    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
+-      this.handleOrderCreated(event);
++    this.eventBus.on<OrderCreatedEvent>('order:created', async (event) => {
++      await this.handleOrderCreated(event);
+     });
+ 
+-    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
+-      this.handleOrderStatusChanged(event);
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {
++      await this.handleOrderStatusChanged(event);
+     });
+   }
+ 
+   /**
+    * Handle order created — send confirmation email to user.
+    */
+-  private handleOrderCreated(event: OrderCreatedEvent): void {
++  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
+     this.logger.info(`Sending order confirmation for order ${event.order.id}`);
+ 
+     const itemSummary = event.order.items
+       .map((item) => `${item.name} x${item.quantity}`)
+       .join(', ');
+ 
+-    this.dispatchNotification({
++    await this.dispatchNotification({
+       recipient: event.user.email,
+       subject: `Order Confirmation: ${event.order.id}`,
+       body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,
+@@ -136,12 +136,12 @@ export class NotificationService {
+   /**
+    * Handle order status change — notify user of update.
+    */
+-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {
++  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {
+     this.logger.info(
+       `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,
+     );
+ 
+-    this.dispatchNotification({
++    await this.dispatchNotification({
+       recipient: event.order.userId,
+       subject: `Order Update: ${event.order.id}`,
+       body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,
+@@ -162,7 +162,7 @@ export class NotificationService {
+    * call this method (or let event handlers call it) rather than emitting
+    * notification:send directly.
+    */
+-  private dispatchNotification(payload: NotificationPayload): void {
++  private async dispatchNotification(payload: NotificationPayload): Promise<void> {
+     // Check user preferences before dispatching (all channels)
+     if (this.preferencesService) {
+       if (
+@@ -202,8 +202,8 @@ export class NotificationService {
+     };
+     this.notifications.push(notification);
+ 
+-    // Emit for adapters (and history service) to pick up
+-    this.eventBus.emit({
++    // Emit for adapters (and history service) to pick up — await to preserve ordering
++    await this.eventBus.emit({
+       type: 'notification:send',
+       payload: { ...payload, priority, notificationId: notification.id },
+       timestamp: notification.createdAt,
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index e8b6524..8315bf8 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -289,4 +289,108 @@ describe('NotificationService', () => {
+       expect(notifications[0]?.priority).toBe('normal');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in the order they were dispatched', async () => {
++      // Simulate rapid sequential events: order created then status changed
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [
++            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++          ],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit both events in sequence — the fix ensures each fully completes
++      // before the next starts, so notifications arrive in order
++      await eventBus.emit(orderCreatedEvent);
++      await eventBus.emit(statusChangedEvent);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      // Order confirmation must arrive before status update
++      expect(notifications[0]?.notificationType).toBe('order_confirmation');
++      expect(notifications[1]?.notificationType).toBe('order_status_update');
++    });
++
++    it('should complete notification delivery before processing next event', async () => {
++      const deliveryOrder: string[] = [];
++
++      // Add a listener that tracks when notification:send events are fully processed
++      eventBus.on('notification:send', async () => {
++        // Simulate async adapter work
++        await new Promise((resolve) => setTimeout(resolve, 10));
++        deliveryOrder.push('delivered');
++      });
++
++      await eventBus.emit<OrderStatusChangedEvent>({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
++
++      await eventBus.emit<OrderStatusChangedEvent>({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-2',
++          userId: 'user-1',
++          items: [],
++          total: 30,
++          status: 'shipped',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'confirmed',
++        newStatus: 'shipped',
++        timestamp: new Date(),
++      });
++
++      // Both should be delivered — if dispatch was fire-and-forget,
++      // the async listener might not have completed
++      expect(deliveryOrder).toHaveLength(2);
++      expect(deliveryOrder).toEqual(['delivered', 'delivered']);
++    });
++  });
+ });

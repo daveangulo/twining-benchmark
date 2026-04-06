@@ -1,0 +1,210 @@
+{
+  "compactionCount": 0,
+  "condition": "shared-markdown",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/COORDINATION.md b/COORDINATION.md\nindex 1654ceb..90ac0ba 100644\n--- a/COORDINATION.md\n+++ b/COORDINATION.md\n@@ -385,3 +385,34 @@ The current `UserPreferences` model (`src/models/user-preferences.ts`) was desig\n - `src/index.ts` — updated exports\n - `tests/services/preferences.service.test.ts` — 34 tests (22 existing + 12 new)\n \n+---\n+\n+## Agent 10 — Notification Delivery Ordering Fix (completed)\n+\n+### What I did\n+1. **Fixed fire-and-forget notification delivery** (`src/services/notification.service.ts`) — the root cause of out-of-order notifications was that `sendNotification()` called `adapter.send()` without awaiting it. The `.then()` chain ran asynchronously, so if two notifications were emitted in sequence, the second could resolve before the first.\n+2. **Made `sendNotification()` async** — replaced `.then()/.catch()` chain with `await` + `try/catch`. Notifications now complete delivery before the method returns.\n+3. **Made event handlers async** — `handleOrderCreated()` and `handleOrderStatusChanged()` now `await sendNotification()`, so `EventBus.emit()` (which already does sequential `await` on handlers) properly waits for each notification to finish before processing the next event.\n+4. **Added ordering test** — new test uses a mock adapter with artificial latency (50ms for the first notification, 10ms for the second) to verify that despite the first being slower, it still delivers first.\n+5. **All 189 tests pass** (188 existing + 1 new).\n+\n+### The bug\n+```typescript\n+// Before (fire-and-forget): adapter.send() not awaited — notifications race\n+private sendNotification(payload: NotificationPayload): void {\n+  adapter.send(payload).then((result) => { ... }).catch((err) => { ... });\n+}\n+\n+// After (sequential): adapter.send() awaited — delivery order matches emit order\n+private async sendNotification(payload: NotificationPayload): Promise<void> {\n+  const result = await adapter.send(payload);\n+}\n+```\n+\n+### Why this works\n+`EventBus.emit()` already processes handlers sequentially (`for...of` with `await`). The missing piece was that the notification handlers returned `void` instead of a `Promise`, so the EventBus couldn't wait for delivery to complete. Now the full chain is async: `EventBus.emit → await handler → await sendNotification → await adapter.send`.\n+\n+### Key files\n+- `src/services/notification.service.ts` — async sendNotification + async handlers\n+- `tests/services/notification.service.test.ts` — new ordering test\n+\n",
+      "linesAdded": 31,
+      "linesRemoved": 0,
+      "path": "COORDINATION.md"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts\nindex 0f37942..8fa4889 100644\n--- a/src/services/notification.service.ts\n+++ b/src/services/notification.service.ts\n@@ -74,26 +74,26 @@ export class NotificationService {\n    * All handlers subscribe to EventBus — no other notification patterns.\n    */\n   private registerHandlers(): void {\n-    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {\n-      this.handleOrderCreated(event);\n+    this.eventBus.on<OrderCreatedEvent>('order:created', async (event) => {\n+      await this.handleOrderCreated(event);\n     });\n \n-    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {\n-      this.handleOrderStatusChanged(event);\n+    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {\n+      await this.handleOrderStatusChanged(event);\n     });\n   }\n \n   /**\n    * Handle order created event — send confirmation to user.\n    */\n-  private handleOrderCreated(event: OrderCreatedEvent): void {\n+  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {\n     this.logger.info(`Sending order confirmation for order ${event.order.id}`);\n \n     const itemSummary = event.order.items\n       .map((item) => `${item.name} x${item.quantity}`)\n       .join(', ');\n \n-    this.sendNotification({\n+    await this.sendNotification({\n       type: 'order_confirmation',\n       recipient: event.user.email,\n       subject: `Order Confirmation: ${event.order.id}`,\n@@ -106,12 +106,12 @@ export class NotificationService {\n   /**\n    * Handle order status change — notify user of update.\n    */\n-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {\n+  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {\n     this.logger.info(\n       `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,\n     );\n \n-    this.sendNotification({\n+    await this.sendNotification({\n       type: 'order_status_update',\n       recipient: event.order.userId,\n       subject: `Order Update: ${event.order.id}`,\n@@ -126,7 +126,7 @@ export class NotificationService {\n    * Checks user preferences before sending if a PreferencesService is registered.\n    * Falls back to in-memory storage if no adapter is registered for the channel.\n    */\n-  private sendNotification(payload: NotificationPayload): void {\n+  private async sendNotification(payload: NotificationPayload): Promise<void> {\n     // Check user preferences if a preferences service is available\n     if (this.preferencesService && payload.metadata?.userId) {\n       const userId = payload.metadata.userId;\n@@ -151,31 +151,29 @@ export class NotificationService {\n \n     const adapter = this.adapters.get(payload.channel);\n     if (adapter) {\n-      adapter\n-        .send(payload)\n-        .then((result) => {\n-          if (result.success) {\n-            notification.status = 'sent';\n-            this.eventBus.emit({\n-              type: 'notification:sent',\n-              notification,\n-              timestamp: new Date(),\n-            });\n-          } else {\n-            notification.status = 'failed';\n-            notification.error = result.error;\n-            this.eventBus.emit({\n-              type: 'notification:failed',\n-              notification,\n-              error: result.error ?? 'Unknown error',\n-              timestamp: new Date(),\n-            });\n-          }\n-        })\n-        .catch((err: Error) => {\n+      try {\n+        const result = await adapter.send(payload);\n+        if (result.success) {\n+          notification.status = 'sent';\n+          this.eventBus.emit({\n+            type: 'notification:sent',\n+            notification,\n+            timestamp: new Date(),\n+          });\n+        } else {\n           notification.status = 'failed';\n-          notification.error = err.message;\n-        });\n+          notification.error = result.error;\n+          this.eventBus.emit({\n+            type: 'notification:failed',\n+            notification,\n+            error: result.error ?? 'Unknown error',\n+            timestamp: new Date(),\n+          });\n+        }\n+      } catch (err: unknown) {\n+        notification.status = 'failed';\n+        notification.error = err instanceof Error ? err.message : String(err);\n+      }\n     } else {\n       // No adapter registered — store as sent (in-memory fallback for testing/dev)\n       notification.status = 'sent';\n",
+      "linesAdded": 31,
+      "linesRemoved": 33,
+      "path": "src/services/notification.service.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts\nindex 0e1095e..9747996 100644\n--- a/tests/services/notification.service.test.ts\n+++ b/tests/services/notification.service.test.ts\n@@ -279,6 +279,68 @@ describe('NotificationService', () => {\n     });\n   });\n \n+  describe('notification ordering', () => {\n+    it('should deliver notifications in order even with varying adapter latency', async () => {\n+      const deliveryOrder: string[] = [];\n+      const mockAdapter = {\n+        channel: 'email' as const,\n+        send: async (payload: { subject: string }) => {\n+          // Simulate varying latency — first notification takes longer than second\n+          const delay = payload.subject.includes('Confirmation') ? 50 : 10;\n+          await new Promise((resolve) => setTimeout(resolve, delay));\n+          deliveryOrder.push(payload.subject);\n+          return { success: true };\n+        },\n+      };\n+\n+      service.registerAdapter(mockAdapter);\n+\n+      // Emit order created (triggers order_confirmation) then status change (triggers order_status_update)\n+      await eventBus.emit({\n+        type: 'order:created',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n+          total: 10,\n+          status: 'pending',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        user: {\n+          id: 'user-1',\n+          name: 'Alice',\n+          email: 'alice@example.com',\n+          role: 'member',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        timestamp: new Date(),\n+      });\n+\n+      await eventBus.emit({\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 10,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      });\n+\n+      // Despite the first notification having higher latency, it should still be delivered first\n+      expect(deliveryOrder).toHaveLength(2);\n+      expect(deliveryOrder[0]).toContain('Order Confirmation');\n+      expect(deliveryOrder[1]).toContain('Order Update');\n+    });\n+  });\n+\n   describe('adapter integration', () => {\n     it('should route notifications through registered adapter', async () => {\n       const sent: string[] = [];\n",
+      "linesAdded": 62,
+      "linesRemoved": 0,
+      "path": "tests/services/notification.service.test.ts"
+    }
+  ],
+  "numTurns": 17,
+  "prompt": "You are Agent 10 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Fix a notification delivery ordering issue.\n\nUsers report that notifications sometimes arrive out of order — e.g., a \"payment confirmed\" notification arrives before the \"order placed\" notification.\n\nSpecifically:\n1. Check for any prior coordination context about the notification architecture.\n2. Investigate the notification service and how it dispatches to adapters.\n3. The issue is likely in how concurrent notifications are handled — check if there's a queue or if notifications fire-and-forget.\n4. Fix the ordering issue while maintaining the existing architecture.\n5. Add a test that verifies notification ordering.\n6. Make sure all tests pass.\n\nImportant:\n- Understand the notification architecture before making changes — check decisions from Session 1.\n- Keep the fix minimal — don't restructure the notification system.",
+  "runId": "6393b4ac-6988-4e2d-bc2d-f78cf5cafb46",
+  "scenario": "sprint-simulation",
+  "sessionId": "6d0efeed-7f3f-475b-9705-1b87579a8fa5",
+  "stopReason": "success",
+  "taskIndex": 9,
+  "timing": {
+    "durationMs": 105297,
+    "endTime": "2026-04-02T23:36:09.838Z",
+    "startTime": "2026-04-02T23:34:24.541Z",
+    "timeToFirstActionMs": 33969
+  },
+  "tokenUsage": {
+    "cacheCreation": 0,
+    "cacheRead": 0,
+    "costUsd": 0.589098,
+    "input": 0,
+    "output": 0,
+    "total": 0
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/COORDINATION.md"
+      },
+      "timestamp": "2026-04-02T23:34:30.856Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "pattern": "src/**/*.ts"
+      },
+      "timestamp": "2026-04-02T23:34:30.907Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-04-02T23:34:35.339Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-04-02T23:34:35.974Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-04-02T23:34:48.475Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "    this.eventBus.on<OrderCreatedEvent>('order:created', async (event) => {\n      await this.handleOrderCreated(event);\n    });\n\n    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {\n      await this.handleOrderStatusChanged(event);\n    });",
+        "old_string": "    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {\n      this.handleOrderCreated(event);\n    });\n\n    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {\n      this.handleOrderStatusChanged(event);\n    });",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:34:58.510Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {",
+        "old_string": "  private handleOrderCreated(event: OrderCreatedEvent): void {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:02.296Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "    await this.sendNotification({\n      type: 'order_confirmation',\n      recipient: event.user.email,\n      subject: `Order Confirmation: ${event.order.id}`,\n      body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,\n      channel: 'email',\n      metadata: { userId: event.user.id },\n    });\n  }\n\n  /**\n   * Handle order status change — notify user of update.\n   */\n  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {",
+        "old_string": "    this.sendNotification({\n      type: 'order_confirmation',\n      recipient: event.user.email,\n      subject: `Order Confirmation: ${event.order.id}`,\n      body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,\n      channel: 'email',\n      metadata: { userId: event.user.id },\n    });\n  }\n\n  /**\n   * Handle order status change — notify user of update.\n   */\n  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:08.611Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "    await this.sendNotification({\n      type: 'order_status_update',\n      recipient: event.order.userId,\n      subject: `Order Update: ${event.order.id}`,\n      body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,\n      channel: 'email',\n      metadata: { userId: event.order.userId },\n    });",
+        "old_string": "    this.sendNotification({\n      type: 'order_status_update',\n      recipient: event.order.userId,\n      subject: `Order Update: ${event.order.id}`,\n      body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,\n      channel: 'email',\n      metadata: { userId: event.order.userId },\n    });",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:13.235Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "  private async sendNotification(payload: NotificationPayload): Promise<void> {",
+        "old_string": "  private sendNotification(payload: NotificationPayload): void {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:17.272Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/src/services/notification.service.ts",
+        "new_string": "    const adapter = this.adapters.get(payload.channel);\n    if (adapter) {\n      try {\n        const result = await adapter.send(payload);\n        if (result.success) {\n          notification.status = 'sent';\n          this.eventBus.emit({\n            type: 'notification:sent',\n            notification,\n            timestamp: new Date(),\n          });\n        } else {\n          notification.status = 'failed';\n          notification.error = result.error;\n          this.eventBus.emit({\n            type: 'notification:failed',\n            notification,\n            error: result.error ?? 'Unknown error',\n            timestamp: new Date(),\n          });\n        }\n      } catch (err: unknown) {\n        notification.status = 'failed';\n        notification.error = err instanceof Error ? err.message : String(err);\n      }\n    } else {",
+        "old_string": "    const adapter = this.adapters.get(payload.channel);\n    if (adapter) {\n      adapter\n        .send(payload)\n        .then((result) => {\n          if (result.success) {\n            notification.status = 'sent';\n            this.eventBus.emit({\n              type: 'notification:sent',\n              notification,\n              timestamp: new Date(),\n            });\n          } else {\n            notification.status = 'failed';\n            notification.error = result.error;\n            this.eventBus.emit({\n              type: 'notification:failed',\n              notification,\n              error: result.error ?? 'Unknown error',\n              timestamp: new Date(),\n            });\n          }\n        })\n        .catch((err: Error) => {\n          notification.status = 'failed';\n          notification.error = err.message;\n        });\n    } else {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:24.292Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/tests/services/notification.service.test.ts",
+        "new_string": "  describe('notification ordering', () => {\n    it('should deliver notifications in order even with varying adapter latency', async () => {\n      const deliveryOrder: string[] = [];\n      const mockAdapter = {\n        channel: 'email' as const,\n        send: async (payload: { subject: string }) => {\n          // Simulate varying latency — first notification takes longer than second\n          const delay = payload.subject.includes('Confirmation') ? 50 : 10;\n          await new Promise((resolve) => setTimeout(resolve, delay));\n          deliveryOrder.push(payload.subject);\n          return { success: true };\n        },\n      };\n\n      service.registerAdapter(mockAdapter);\n\n      // Emit order created (triggers order_confirmation) then status change (triggers order_status_update)\n      await eventBus.emit({\n        type: 'order:created',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n          total: 10,\n          status: 'pending',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        user: {\n          id: 'user-1',\n          name: 'Alice',\n          email: 'alice@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      });\n\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 10,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      });\n\n      // Despite the first notification having higher latency, it should still be delivered first\n      expect(deliveryOrder).toHaveLength(2);\n      expect(deliveryOrder[0]).toContain('Order Confirmation');\n      expect(deliveryOrder[1]).toContain('Order Update');\n    });\n  });\n\n  describe('adapter integration', () => {\n    it('should route notifications through registered adapter', async () => {",
+        "old_string": "  describe('adapter integration', () => {\n    it('should route notifications through registered adapter', async () => {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:34.374Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "npx vitest run 2>&1 | tail -30",
+        "timeout": 60000
+      },
+      "timestamp": "2026-04-02T23:35:38.113Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/COORDINATION.md",
+        "new_string": "### Key files\n- `src/models/notification.ts` — updated `NotificationChannel` with `'sms'`\n- `src/adapters/sms.adapter.ts` — SMS adapter implementation\n- `tests/adapters/sms.adapter.test.ts` — 11 tests\n- `src/index.ts` — updated exports\n\n---\n\n## Agent 9",
+        "old_string": "### Key files\n- `src/models/notification.ts` — updated `NotificationChannel` with `'sms'`\n- `src/adapters/sms.adapter.ts` — SMS adapter implementation\n- `tests/adapters/sms.adapter.test.ts` — 11 tests\n- `src/index.ts` — updated exports\n\n---\n\n## Agent 9",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:35:45.146Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/COORDINATION.md",
+        "offset": 380
+      },
+      "timestamp": "2026-04-02T23:35:48.045Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-15622E/COORDINATION.md",
+        "new_string": "- `tests/services/preferences.service.test.ts` — 34 tests (22 existing + 12 new)\n\n---\n\n## Agent 10 — Notification Delivery Ordering Fix (completed)\n\n### What I did\n1. **Fixed fire-and-forget notification delivery** (`src/services/notification.service.ts`) — the root cause of out-of-order notifications was that `sendNotification()` called `adapter.send()` without awaiting it. The `.then()` chain ran asynchronously, so if two notifications were emitted in sequence, the second could resolve before the first.\n2. **Made `sendNotification()` async** — replaced `.then()/.catch()` chain with `await` + `try/catch`. Notifications now complete delivery before the method returns.\n3. **Made event handlers async** — `handleOrderCreated()` and `handleOrderStatusChanged()` now `await sendNotification()`, so `EventBus.emit()` (which already does sequential `await` on handlers) properly waits for each notification to finish before processing the next event.\n4. **Added ordering test** — new test uses a mock adapter with artificial latency (50ms for the first notification, 10ms for the second) to verify that despite the first being slower, it still delivers first.\n5. **All 189 tests pass** (188 existing + 1 new).\n\n### The bug\n```typescript\n// Before (fire-and-forget): adapter.send() not awaited — notifications race\nprivate sendNotification(payload: NotificationPayload): void {\n  adapter.send(payload).then((result) => { ... }).catch((err) => { ... });\n}\n\n// After (sequential): adapter.send() awaited — delivery order matches emit order\nprivate async sendNotification(payload: NotificationPayload): Promise<void> {\n  const result = await adapter.send(payload);\n}\n```\n\n### Why this works\n`EventBus.emit()` already processes handlers sequentially (`for...of` with `await`). The missing piece was that the notification handlers returned `void` instead of a `Promise`, so the EventBus couldn't wait for delivery to complete. Now the full chain is async: `EventBus.emit → await handler → await sendNotification → await adapter.send`.\n\n### Key files\n- `src/services/notification.service.ts` — async sendNotification + async handlers\n- `tests/services/notification.service.test.ts` — new ordering test\n\n",
+        "old_string": "- `tests/services/preferences.service.test.ts` — 34 tests (22 existing + 12 new)\n\n",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-02T23:36:02.853Z",
+      "toolName": "Edit"
+    }
+  ],
+  "turnUsage": []
+}

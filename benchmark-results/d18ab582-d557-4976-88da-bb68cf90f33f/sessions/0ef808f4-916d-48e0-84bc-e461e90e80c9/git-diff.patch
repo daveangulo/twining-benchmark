@@ -1,0 +1,162 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index c313398..fd1efe7 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -1,5 +1,21 @@
+ # Coordination Log
+ 
++## Agent 10 — Fix Notification Delivery Ordering (completed)
++
++### What was done
++1. **Updated `src/services/notification.service.ts`** — Added a per-recipient promise chain (`recipientQueues: Map<string, Promise<void>>`) to guarantee FIFO delivery order. Split `sendNotification` into a queuing method and a `deliverNotification` method. `sendNotification` now chains onto the previous promise for the same recipient, ensuring that even when events fire concurrently, notifications for the same recipient are delivered in the order they were queued.
++2. **Added ordering test in `tests/services/notification.service.test.ts`** — Test fires `order:created` and `order:status-changed` events concurrently with a slow adapter (first notification has a 50ms delay). Verifies that the "Order Confirmation" notification is still delivered before the "Order Update" notification despite the artificial delay.
++
++### Key design decisions
++- **Per-recipient queuing, not global**: Notifications for different recipients can still be sent concurrently. Only same-recipient notifications are serialized.
++- **Minimal change**: No new files, no architectural changes. The queue is a simple promise chain — each new notification for a recipient chains `.then()` onto the previous one. Failed deliveries don't block subsequent ones (`.catch(() => {})` on the stored chain prevents propagation).
++- **`sendNotification` became synchronous entry point**: It returns the promise but doesn't await — the actual async work happens in `deliverNotification` which runs in sequence per recipient.
++
++### Test results
++All 239 tests pass (238 existing + 1 new).
++
++---
++
+ ## Agent 9 — Multi-Channel User Notification Preferences (completed)
+ 
+ ### What was done
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 011a3c8..087e1b1 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -46,6 +46,8 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | undefined;
++  /** Per-recipient promise chain to ensure FIFO notification delivery order. */
++  private recipientQueues: Map<string, Promise<void>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerHandlers();
+@@ -176,9 +178,21 @@ export class NotificationService {
+ 
+   /**
+    * Send a notification through the appropriate adapter.
++   * Queues per-recipient to guarantee FIFO delivery order.
+    * Falls back to in-memory storage if no adapter is registered for the channel.
+    */
+-  private async sendNotification(payload: NotificationPayload): Promise<void> {
++  private sendNotification(payload: NotificationPayload): Promise<void> {
++    const recipient = payload.recipient;
++    const previous = this.recipientQueues.get(recipient) ?? Promise.resolve();
++    const current = previous.then(() => this.deliverNotification(payload));
++    this.recipientQueues.set(recipient, current.catch(() => {}));
++    return current;
++  }
++
++  /**
++   * Internal delivery — called in sequence per recipient via the queue.
++   */
++  private async deliverNotification(payload: NotificationPayload): Promise<void> {
+     const notification: Notification = {
+       id: generateNotificationId(),
+       recipient: payload.recipient,
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index ce69310..8abd806 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,6 +5,8 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationAdapter, NotificationResult } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -256,6 +258,86 @@ describe('NotificationService', () => {
+       expect(service.getNotificationCount()).toBe(0);
+     });
+ 
++    it('should deliver notifications in order when events fire concurrently', async () => {
++      // Create a slow adapter that delays delivery to expose ordering issues
++      const deliveryOrder: string[] = [];
++      let resolveFirst: (() => void) | undefined;
++      const firstSendStarted = new Promise<void>((r) => { resolveFirst = r; });
++      let callCount = 0;
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as const,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          callCount++;
++          if (callCount === 1) {
++            // First notification: signal that it started, then wait
++            resolveFirst!();
++            await new Promise<void>((resolve) => setTimeout(resolve, 50));
++          }
++          deliveryOrder.push(payload.subject);
++          return { success: true };
++        },
++      };
++
++      service.registerAdapter(slowAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'alice@example.com',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently — the first one is slow
++      const p1 = eventBus.emit(orderCreatedEvent);
++      // Wait for the first send to start so we know it's in-flight
++      await firstSendStarted;
++      const p2 = eventBus.emit(statusChangedEvent);
++
++      await Promise.all([p1, p2]);
++
++      // Despite the first notification being slower, it should still be delivered first
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++
++      // Verify both notifications were stored in order
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.subject).toContain('Order Confirmation');
++      expect(notifications[1]?.subject).toContain('Order Update');
++    });
++
+     it('should generate sequential notification IDs', async () => {
+       await eventBus.emit({
+         type: 'order:status-changed',

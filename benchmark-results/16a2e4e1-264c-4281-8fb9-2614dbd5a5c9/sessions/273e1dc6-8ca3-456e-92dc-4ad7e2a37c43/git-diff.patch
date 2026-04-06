@@ -1,0 +1,159 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index b118a4c..230bd0d 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -590,3 +590,38 @@ Domain Event (e.g. order:created)
+ 
+ ---
+ 
++## Agent 10 — Notification Delivery Ordering Fix
++
++### Status: COMPLETE
++
++### What I Did
++
++1. **Diagnosed the root cause**: `EventBus.emit()` was fire-and-forget for concurrent callers. When two events were emitted without awaiting the first (e.g., `order:created` then `order:status-changed`), their handlers ran concurrently, causing notifications to arrive out of order.
++
++2. **Fixed `src/events/event-bus.ts`** — added a serial emit queue:
++   - Added `private emitQueue: Promise<void>` field that chains emits sequentially
++   - `emit()` now chains behind any pending emit via `.then()`, ensuring events are processed one at a time in emission order
++   - Errors in one emit don't block subsequent emits (queue swallows rejections)
++   - `clear()` resets the queue
++
++3. **Added ordering test** in `tests/services/notification.service.test.ts`:
++   - "should deliver notifications in event emission order even when emits are not awaited" — emits `order:created` and `order:status-changed` concurrently (without awaiting the first), then verifies all `order:confirmation` notifications come before any `order:status-update` notifications.
++
++4. **All 241 tests pass** (240 existing + 1 new), no regressions.
++
++### Key Design Decision
++
++- **Queue in EventBus, not NotificationService**: The ordering guarantee is at the event bus level, which is the right place — it ensures ALL event handlers (not just notifications) see events in order. This is a minimal 3-line change to the emit method.
++
++### Files Modified
++- `src/events/event-bus.ts` — added `emitQueue` field, chained emit processing, reset in `clear()`
++- `tests/services/notification.service.test.ts` — added ordering test
++
++### Context for Next Agents
++
++1. **EventBus now serializes emits**: Concurrent `emit()` calls are queued and processed in order. This is safe for all existing code since `emit()` was already async.
++
++2. **Error isolation**: A failed handler in one emit doesn't prevent subsequent emits from processing (the queue catches and swallows errors in the chain).
++
++---
++
+diff --git a/src/events/event-bus.ts b/src/events/event-bus.ts
+index 417e1cb..13bf835 100644
+--- a/src/events/event-bus.ts
++++ b/src/events/event-bus.ts
+@@ -16,6 +16,7 @@ export type EventHandler<T extends AppEvent = AppEvent> = (event: T) => void | P
+ export class EventBus {
+   private handlers: Map<EventType, EventHandler[]> = new Map();
+   private eventLog: AppEvent[] = [];
++  private emitQueue: Promise<void> = Promise.resolve();
+ 
+   /**
+    * Subscribe to events of a given type.
+@@ -40,13 +41,21 @@ export class EventBus {
+ 
+   /**
+    * Emit an event to all registered handlers.
++   * Emits are serialized: if a previous emit is still being processed,
++   * this one queues behind it. This guarantees notification delivery order
++   * even when multiple events are emitted without awaiting.
+    */
+   async emit<T extends AppEvent>(event: T): Promise<void> {
+-    this.eventLog.push(event);
+-    const handlers = this.handlers.get(event.type) ?? [];
+-    for (const handler of handlers) {
+-      await handler(event);
+-    }
++    const task = this.emitQueue.then(async () => {
++      this.eventLog.push(event);
++      const handlers = this.handlers.get(event.type) ?? [];
++      for (const handler of handlers) {
++        await handler(event);
++      }
++    });
++    // Swallow errors in the queue chain so one failed emit doesn't block subsequent ones
++    this.emitQueue = task.catch(() => {});
++    return task;
+   }
+ 
+   /**
+@@ -62,5 +71,6 @@ export class EventBus {
+   clear(): void {
+     this.handlers.clear();
+     this.eventLog = [];
++    this.emitQueue = Promise.resolve();
+   }
+ }
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 5476a15..b916acd 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -236,6 +236,65 @@ describe('NotificationService', () => {
+     });
+   });
+ 
++  describe('notification ordering', () => {
++    it('should deliver notifications in event emission order even when emits are not awaited', async () => {
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [
++            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++          ],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit both events WITHOUT awaiting the first — simulates concurrent emission
++      const p1 = eventBus.emit(orderCreatedEvent);
++      const p2 = eventBus.emit(statusChangedEvent);
++      await Promise.all([p1, p2]);
++
++      const notifications = service.getNotifications();
++
++      // order:created notifications (email + webhook) must come before
++      // order:status-changed notifications (email + webhook)
++      const types = notifications.map((n) => n.type);
++      const firstStatusUpdateIndex = types.indexOf('order:status-update');
++      const lastConfirmationIndex = types.lastIndexOf('order:confirmation');
++
++      expect(lastConfirmationIndex).toBeLessThan(firstStatusUpdateIndex);
++    });
++  });
++
+   describe('notification management', () => {
+     it('should count notifications', async () => {
+       expect(service.getNotificationCount()).toBe(0);

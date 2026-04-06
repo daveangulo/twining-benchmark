@@ -1,0 +1,420 @@
+diff --git a/src/adapters/webhook.adapter.ts b/src/adapters/webhook.adapter.ts
+new file mode 100644
+index 0000000..e62e364
+--- /dev/null
++++ b/src/adapters/webhook.adapter.ts
+@@ -0,0 +1,150 @@
++/**
++ * Webhook notification adapter.
++ *
++ * Implements NotificationAdapter for the webhook channel with:
++ * - URL validation
++ * - JSON payload formatting
++ * - Pluggable transport (inject any HTTP POST function)
++ * - In-memory fallback transport for development/testing
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type {
++  NotificationChannel,
++  NotificationPayload,
++  NotificationResult,
++} from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++/** Structure representing a formatted webhook request ready for delivery. */
++export interface WebhookRequest {
++  url: string;
++  headers: Record<string, string>;
++  body: string;
++}
++
++/** Transport function signature — adapts to any HTTP client. */
++export type WebhookTransport = (request: WebhookRequest) => Promise<{ requestId: string }>;
++
++/** Record of a sent webhook, stored in-memory for inspection. */
++export interface SentWebhookRecord {
++  payload: NotificationPayload;
++  request: WebhookRequest;
++  requestId: string;
++  timestamp: Date;
++}
++
++/** Configuration for the webhook adapter. */
++export interface WebhookAdapterConfig {
++  /** The URL to POST webhook notifications to. */
++  url: string;
++  /** Optional secret for signing payloads. */
++  secret?: string;
++  /** Optional custom transport. Falls back to in-memory transport if omitted. */
++  transport?: WebhookTransport;
++}
++
++/** Validate that a string is a plausible HTTP(S) URL. */
++function isValidWebhookUrl(url: string): boolean {
++  if (!url) return false;
++  return /^https?:\/\/.+/.test(url);
++}
++
++/** Format a notification payload as a JSON webhook body. */
++function formatWebhookBody(payload: NotificationPayload): string {
++  return JSON.stringify({
++    event: payload.type,
++    recipient: payload.recipient,
++    subject: payload.subject,
++    body: payload.body,
++    metadata: payload.metadata ?? {},
++    timestamp: new Date().toISOString(),
++  });
++}
++
++/** Default in-memory transport for development and testing. */
++function createInMemoryTransport(): WebhookTransport {
++  let counter = 0;
++  return async () => ({ requestId: `wh-${Date.now()}-${++counter}` });
++}
++
++export class WebhookNotificationAdapter implements NotificationAdapter {
++  readonly channel: NotificationChannel = 'webhook';
++  private logger = new Logger('WebhookAdapter');
++  private sent: SentWebhookRecord[] = [];
++  private transport: WebhookTransport;
++  private url: string;
++  private secret?: string;
++
++  constructor(config?: Partial<WebhookAdapterConfig>) {
++    this.url = config?.url ?? '';
++    this.secret = config?.secret;
++    this.transport = config?.transport ?? createInMemoryTransport();
++  }
++
++  async send(payload: NotificationPayload): Promise<NotificationResult> {
++    if (!isValidWebhookUrl(this.url)) {
++      this.logger.warn(`Invalid webhook URL: ${this.url}`);
++      return {
++        success: false,
++        channel: this.channel,
++        recipient: payload.recipient,
++        error: `Invalid webhook URL: ${this.url}`,
++      };
++    }
++
++    const body = formatWebhookBody(payload);
++    const headers: Record<string, string> = {
++      'Content-Type': 'application/json',
++    };
++
++    if (this.secret) {
++      headers['X-Webhook-Secret'] = this.secret;
++    }
++
++    const request: WebhookRequest = {
++      url: this.url,
++      headers,
++      body,
++    };
++
++    try {
++      const { requestId } = await this.transport(request);
++
++      this.logger.info(`Webhook sent to ${this.url} for ${payload.recipient} [${requestId}]`);
++      this.sent.push({ payload, request, requestId, timestamp: new Date() });
++
++      return {
++        success: true,
++        channel: this.channel,
++        recipient: payload.recipient,
++        messageId: requestId,
++      };
++    } catch (err) {
++      const errorMessage = err instanceof Error ? err.message : String(err);
++      this.logger.error(`Failed to send webhook to ${this.url}: ${errorMessage}`);
++
++      return {
++        success: false,
++        channel: this.channel,
++        recipient: payload.recipient,
++        error: errorMessage,
++      };
++    }
++  }
++
++  /** Get all sent webhook records. */
++  getSentWebhooks(): SentWebhookRecord[] {
++    return [...this.sent];
++  }
++
++  /** Clear sent webhook records. */
++  clearSentWebhooks(): void {
++    this.sent = [];
++  }
++
++  /** Get the configured webhook URL. */
++  getUrl(): string {
++    return this.url;
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 9021a41..4d8c269 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -66,6 +66,8 @@ export type {
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailNotificationAdapter } from './adapters/email.adapter.js';
+ export type { EmailTransport, RenderedEmail, SentEmailRecord, EmailAdapterConfig } from './adapters/email.adapter.js';
++export { WebhookNotificationAdapter } from './adapters/webhook.adapter.js';
++export type { WebhookTransport, WebhookRequest, SentWebhookRecord, WebhookAdapterConfig } from './adapters/webhook.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/tests/adapters/webhook.adapter.test.ts b/tests/adapters/webhook.adapter.test.ts
+new file mode 100644
+index 0000000..0d3c2fc
+--- /dev/null
++++ b/tests/adapters/webhook.adapter.test.ts
+@@ -0,0 +1,245 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  WebhookNotificationAdapter,
++  type WebhookTransport,
++  type WebhookRequest,
++} from '../../src/adapters/webhook.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {
++  return {
++    type: 'order_confirmation',
++    recipient: 'alice@example.com',
++    subject: 'Order Confirmation: ord-001',
++    body: 'Your order has been placed. Items: Widget x2. Total: $25.00',
++    metadata: { orderId: 'ord-001', userId: 'user-001' },
++    ...overrides,
++  };
++}
++
++describe('WebhookNotificationAdapter', () => {
++  let adapter: WebhookNotificationAdapter;
++
++  beforeEach(() => {
++    adapter = new WebhookNotificationAdapter({ url: 'https://hooks.example.com/notify' });
++  });
++
++  describe('channel', () => {
++    it('should report webhook channel', () => {
++      expect(adapter.channel).toBe('webhook');
++    });
++  });
++
++  describe('configuration', () => {
++    it('should store configured URL', () => {
++      expect(adapter.getUrl()).toBe('https://hooks.example.com/notify');
++    });
++
++    it('should default to empty URL when no config provided', () => {
++      const noConfig = new WebhookNotificationAdapter();
++      expect(noConfig.getUrl()).toBe('');
++    });
++
++    it('should accept custom transport', async () => {
++      const transport: WebhookTransport = async () => ({ requestId: 'custom-456' });
++      const custom = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        transport,
++      });
++      const result = await custom.send(makePayload());
++      expect(result.messageId).toBe('custom-456');
++    });
++  });
++
++  describe('URL validation', () => {
++    it('should reject empty URL', async () => {
++      const noUrl = new WebhookNotificationAdapter({ url: '' });
++      const result = await noUrl.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid webhook URL');
++    });
++
++    it('should reject missing URL (no config)', async () => {
++      const noConfig = new WebhookNotificationAdapter();
++      const result = await noConfig.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid webhook URL');
++    });
++
++    it('should reject non-HTTP URL', async () => {
++      const ftpUrl = new WebhookNotificationAdapter({ url: 'ftp://example.com/hook' });
++      const result = await ftpUrl.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid webhook URL');
++    });
++
++    it('should reject malformed URL', async () => {
++      const bad = new WebhookNotificationAdapter({ url: 'not-a-url' });
++      const result = await bad.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid webhook URL');
++    });
++
++    it('should accept http URL', async () => {
++      const httpAdapter = new WebhookNotificationAdapter({ url: 'http://localhost:3000/hook' });
++      const result = await httpAdapter.send(makePayload());
++      expect(result.success).toBe(true);
++    });
++
++    it('should accept https URL', async () => {
++      const result = await adapter.send(makePayload());
++      expect(result.success).toBe(true);
++    });
++  });
++
++  describe('payload formatting', () => {
++    let captured: WebhookRequest[];
++    let captureAdapter: WebhookNotificationAdapter;
++
++    beforeEach(() => {
++      captured = [];
++      const transport: WebhookTransport = async (req) => {
++        captured.push(req);
++        return { requestId: 'test-req' };
++      };
++      captureAdapter = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        transport,
++      });
++    });
++
++    it('should format payload as JSON', async () => {
++      await captureAdapter.send(makePayload());
++      expect(captured).toHaveLength(1);
++      const body = JSON.parse(captured[0]!.body);
++      expect(body.event).toBe('order_confirmation');
++      expect(body.recipient).toBe('alice@example.com');
++      expect(body.subject).toBe('Order Confirmation: ord-001');
++      expect(body.body).toBe('Your order has been placed. Items: Widget x2. Total: $25.00');
++    });
++
++    it('should include metadata in JSON body', async () => {
++      await captureAdapter.send(makePayload());
++      const body = JSON.parse(captured[0]!.body);
++      expect(body.metadata.orderId).toBe('ord-001');
++      expect(body.metadata.userId).toBe('user-001');
++    });
++
++    it('should include timestamp in JSON body', async () => {
++      await captureAdapter.send(makePayload());
++      const body = JSON.parse(captured[0]!.body);
++      expect(body.timestamp).toBeDefined();
++      expect(() => new Date(body.timestamp)).not.toThrow();
++    });
++
++    it('should default metadata to empty object when not provided', async () => {
++      await captureAdapter.send(makePayload({ metadata: undefined }));
++      const body = JSON.parse(captured[0]!.body);
++      expect(body.metadata).toEqual({});
++    });
++
++    it('should set Content-Type header to application/json', async () => {
++      await captureAdapter.send(makePayload());
++      expect(captured[0]!.headers['Content-Type']).toBe('application/json');
++    });
++
++    it('should set target URL on the request', async () => {
++      await captureAdapter.send(makePayload());
++      expect(captured[0]!.url).toBe('https://hooks.example.com/notify');
++    });
++  });
++
++  describe('secret header', () => {
++    it('should include X-Webhook-Secret header when secret is configured', async () => {
++      const captured: WebhookRequest[] = [];
++      const transport: WebhookTransport = async (req) => {
++        captured.push(req);
++        return { requestId: 'test-req' };
++      };
++      const secretAdapter = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        secret: 'my-secret-token',
++        transport,
++      });
++      await secretAdapter.send(makePayload());
++      expect(captured[0]!.headers['X-Webhook-Secret']).toBe('my-secret-token');
++    });
++
++    it('should not include X-Webhook-Secret header when no secret configured', async () => {
++      const captured: WebhookRequest[] = [];
++      const transport: WebhookTransport = async (req) => {
++        captured.push(req);
++        return { requestId: 'test-req' };
++      };
++      const noSecret = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        transport,
++      });
++      await noSecret.send(makePayload());
++      expect(captured[0]!.headers['X-Webhook-Secret']).toBeUndefined();
++    });
++  });
++
++  describe('send success', () => {
++    it('should return success result with requestId as messageId', async () => {
++      const result = await adapter.send(makePayload());
++      expect(result.success).toBe(true);
++      expect(result.channel).toBe('webhook');
++      expect(result.recipient).toBe('alice@example.com');
++      expect(result.messageId).toBeDefined();
++    });
++
++    it('should track sent webhooks', async () => {
++      await adapter.send(makePayload());
++      await adapter.send(makePayload({ recipient: 'bob@example.com' }));
++      const sent = adapter.getSentWebhooks();
++      expect(sent).toHaveLength(2);
++      expect(sent[0]!.payload.recipient).toBe('alice@example.com');
++      expect(sent[1]!.payload.recipient).toBe('bob@example.com');
++    });
++
++    it('should store request in sent records', async () => {
++      await adapter.send(makePayload());
++      const sent = adapter.getSentWebhooks();
++      expect(sent[0]!.request.url).toBe('https://hooks.example.com/notify');
++      expect(sent[0]!.request.headers['Content-Type']).toBe('application/json');
++    });
++  });
++
++  describe('transport failure', () => {
++    it('should return failure result when transport throws', async () => {
++      const failing: WebhookTransport = async () => {
++        throw new Error('Connection refused');
++      };
++      const failAdapter = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        transport: failing,
++      });
++      const result = await failAdapter.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('Connection refused');
++      expect(result.channel).toBe('webhook');
++    });
++
++    it('should not record failed sends in sent list', async () => {
++      const failing: WebhookTransport = async () => {
++        throw new Error('timeout');
++      };
++      const failAdapter = new WebhookNotificationAdapter({
++        url: 'https://hooks.example.com/notify',
++        transport: failing,
++      });
++      await failAdapter.send(makePayload());
++      expect(failAdapter.getSentWebhooks()).toHaveLength(0);
++    });
++  });
++
++  describe('clearSentWebhooks', () => {
++    it('should clear sent records', async () => {
++      await adapter.send(makePayload());
++      expect(adapter.getSentWebhooks()).toHaveLength(1);
++      adapter.clearSentWebhooks();
++      expect(adapter.getSentWebhooks()).toHaveLength(0);
++    });
++  });
++});

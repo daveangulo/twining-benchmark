@@ -1,0 +1,574 @@
+diff --git a/src/adapters/sms.adapter.ts b/src/adapters/sms.adapter.ts
+index 46c7935..4ca47cc 100644
+--- a/src/adapters/sms.adapter.ts
++++ b/src/adapters/sms.adapter.ts
+@@ -4,12 +4,9 @@
+  * In this demo, "sending" means storing the SMS in an in-memory log.
+  * A real implementation would use an SMS gateway API (e.g., Twilio).
+  *
+- * NOTE: The User model currently has no `phone` field.
+- * Until user preferences are updated to support multiple notification
+- * channels (including phone numbers), the recipient will be whatever
+- * the NotificationService provides (typically an email address).
+- * See the warning posted to the project blackboard for details on
+- * what needs to change in user preferences.
++ * The User model's `phone` field provides the SMS recipient.
++ * NotificationService resolves the correct recipient per channel
++ * via channelRecipients when user preferences are available.
+  */
+ 
+ import type { NotificationAdapter, NotificationPayload } from './notification.adapter.js';
+diff --git a/src/models/user.ts b/src/models/user.ts
+index fafc20e..f4da74d 100644
+--- a/src/models/user.ts
++++ b/src/models/user.ts
+@@ -1,3 +1,34 @@
++/**
++ * Per-channel notification preference.
++ */
++export interface ChannelPreference {
++  enabled: boolean;
++}
++
++/**
++ * User notification preferences supporting multiple delivery channels.
++ *
++ * Each channel can be independently enabled/disabled. When no preferences
++ * are set, the system defaults to email-only for backward compatibility.
++ */
++export interface NotificationPreferences {
++  email: ChannelPreference;
++  sms: ChannelPreference;
++  webhook: ChannelPreference;
++}
++
++/**
++ * Default notification preferences — email enabled, others disabled.
++ * Preserves backward compatibility with the original email-only behavior.
++ */
++export function defaultNotificationPreferences(): NotificationPreferences {
++  return {
++    email: { enabled: true },
++    sms: { enabled: false },
++    webhook: { enabled: false },
++  };
++}
++
+ /**
+  * User model representing a system user.
+  */
+@@ -5,7 +36,9 @@ export interface User {
+   id: string;
+   name: string;
+   email: string;
++  phone?: string;
+   role: 'admin' | 'member' | 'viewer';
++  notificationPreferences: NotificationPreferences;
+   createdAt: Date;
+   updatedAt: Date;
+ }
+@@ -16,7 +49,9 @@ export interface User {
+ export interface CreateUserInput {
+   name: string;
+   email: string;
++  phone?: string;
+   role: 'admin' | 'member' | 'viewer';
++  notificationPreferences?: Partial<NotificationPreferences>;
+ }
+ 
+ /**
+@@ -25,5 +60,7 @@ export interface CreateUserInput {
+ export interface UpdateUserInput {
+   name?: string;
+   email?: string;
++  phone?: string;
+   role?: 'admin' | 'member' | 'viewer';
++  notificationPreferences?: Partial<NotificationPreferences>;
+ }
+diff --git a/src/repositories/user.repository.ts b/src/repositories/user.repository.ts
+index e2c533d..df01bb7 100644
+--- a/src/repositories/user.repository.ts
++++ b/src/repositories/user.repository.ts
+@@ -8,6 +8,7 @@
+ import type { DatabaseRecord } from '../utils/database.js';
+ import type { Database } from '../utils/database.js';
+ import type { User } from '../models/user.js';
++import { defaultNotificationPreferences } from '../models/user.js';
+ import { BaseRepository } from './base.repository.js';
+ 
+ export class UserRepository extends BaseRepository<User> {
+@@ -16,11 +17,16 @@ export class UserRepository extends BaseRepository<User> {
+   }
+ 
+   protected toDomain(record: DatabaseRecord): User {
++    const prefs = record['notificationPreferences'];
+     return {
+       id: record['id'] as string,
+       name: record['name'] as string,
+       email: record['email'] as string,
++      phone: record['phone'] as string | undefined,
+       role: record['role'] as User['role'],
++      notificationPreferences: prefs
++        ? JSON.parse(prefs as string)
++        : defaultNotificationPreferences(),
+       createdAt: new Date(record['createdAt'] as string),
+       updatedAt: new Date(record['updatedAt'] as string),
+     };
+@@ -31,7 +37,9 @@ export class UserRepository extends BaseRepository<User> {
+       id: entity.id,
+       name: entity.name,
+       email: entity.email,
++      ...(entity.phone !== undefined && { phone: entity.phone }),
+       role: entity.role,
++      notificationPreferences: JSON.stringify(entity.notificationPreferences),
+       createdAt: entity.createdAt.toISOString(),
+       updatedAt: entity.updatedAt.toISOString(),
+     };
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 69eea54..fa15464 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -21,9 +21,19 @@ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event
+ import type { NotificationAdapter } from '../adapters/notification.adapter.js';
+ import type { NotificationHistoryService } from './notification-history.service.js';
+ import type { NotificationChannel, NotificationType } from '../models/notification-log.js';
++import type { NotificationPreferences } from '../models/user.js';
+ import { statusChangeCallbacks } from '../utils/callback-registry.js';
+ import { Logger } from '../utils/logger.js';
+ 
++/**
++ * Maps adapter names to the notification preference channel keys.
++ */
++const ADAPTER_TO_CHANNEL: Record<string, keyof NotificationPreferences> = {
++  email: 'email',
++  sms: 'sms',
++  webhook: 'webhook',
++};
++
+ export interface Notification {
+   id: string;
+   recipient: string;
+@@ -95,6 +105,7 @@ export class NotificationService {
+ 
+   /**
+    * Handle order created event — send confirmation to user.
++   * Respects user notification preferences for channel selection.
+    */
+   private handleOrderCreated(event: OrderCreatedEvent): void {
+     this.logger.info(`Sending order confirmation for order ${event.order.id}`);
+@@ -103,11 +114,20 @@ export class NotificationService {
+       .map((item) => `${item.name} x${item.quantity}`)
+       .join(', ');
+ 
++    const channelRecipients: Partial<Record<string, string>> = {
++      email: event.user.email,
++    };
++    if (event.user.phone) {
++      channelRecipients['sms'] = event.user.phone;
++    }
++
+     this.sendNotification({
+       recipient: event.user.email,
+       subject: `Order Confirmation: ${event.order.id}`,
+       body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,
+       type: 'order-confirmation',
++      preferences: event.user.notificationPreferences,
++      channelRecipients,
+     });
+   }
+ 
+@@ -128,14 +148,33 @@ export class NotificationService {
+   }
+ 
+   /**
+-   * Send a notification — stores it in memory, dispatches to all registered adapters,
+-   * and logs to notification history if enabled.
++   * Check if an adapter is enabled for a given set of notification preferences.
++   * When no preferences are provided, all adapters are allowed (backward compatibility).
++   */
++  private isAdapterEnabled(adapter: NotificationAdapter, preferences?: NotificationPreferences): boolean {
++    if (!preferences) return true;
++    const channelKey = ADAPTER_TO_CHANNEL[adapter.name];
++    if (!channelKey) return true; // unknown adapter types are allowed by default
++    return preferences[channelKey].enabled;
++  }
++
++  /**
++   * Send a notification — stores it in memory, dispatches to enabled adapters
++   * based on user preferences, and logs to notification history if enabled.
++   *
++   * When preferences are provided, only adapters whose channel is enabled will
++   * receive the notification. When absent, all adapters fire (backward compat).
++   *
++   * channelRecipients allows per-channel recipient overrides (e.g., phone number
++   * for SMS, webhook URL for webhook).
+    */
+   private sendNotification(params: {
+     recipient: string;
+     subject: string;
+     body: string;
+     type: NotificationType;
++    preferences?: NotificationPreferences;
++    channelRecipients?: Partial<Record<string, string>>;
+   }): void {
+     const notification: Notification = {
+       id: generateNotificationId(),
+@@ -161,12 +200,19 @@ export class NotificationService {
+       });
+     }
+ 
+-    for (const adapter of this.adapters) {
+-      adapter.send(notification).then(() => {
++    const enabledAdapters = this.adapters.filter(
++      (adapter) => this.isAdapterEnabled(adapter, params.preferences),
++    );
++
++    for (const adapter of enabledAdapters) {
++      const adapterRecipient = params.channelRecipients?.[adapter.name] ?? params.recipient;
++      const adapterPayload = { ...notification, recipient: adapterRecipient };
++
++      adapter.send(adapterPayload).then(() => {
+         if (this.historyService) {
+           this.historyService.log({
+             notificationId: notification.id,
+-            recipient: params.recipient,
++            recipient: adapterRecipient,
+             channel: adapter.name as NotificationChannel,
+             type: params.type,
+             subject: params.subject,
+@@ -180,7 +226,7 @@ export class NotificationService {
+         if (this.historyService) {
+           this.historyService.log({
+             notificationId: notification.id,
+-            recipient: params.recipient,
++            recipient: adapterRecipient,
+             channel: adapter.name as NotificationChannel,
+             type: params.type,
+             subject: params.subject,
+diff --git a/src/services/user.service.ts b/src/services/user.service.ts
+index 83a1e26..10ed6a3 100644
+--- a/src/services/user.service.ts
++++ b/src/services/user.service.ts
+@@ -9,7 +9,8 @@
+  * Services contain business logic and coordinate between repositories and events.
+  */
+ 
+-import type { User, CreateUserInput, UpdateUserInput } from '../models/user.js';
++import type { User, CreateUserInput, UpdateUserInput, NotificationPreferences } from '../models/user.js';
++import { defaultNotificationPreferences } from '../models/user.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
+@@ -43,12 +44,19 @@ export class UserService {
+     const existing = this.userRepository.findByEmail(input.email);
+     validateEmailUnique(existing, input.email);
+ 
++    const defaults = defaultNotificationPreferences();
++    const prefs: NotificationPreferences = input.notificationPreferences
++      ? { ...defaults, ...input.notificationPreferences }
++      : defaults;
++
+     const now = new Date();
+     const user: User = {
+       id: generateId(),
+       name: input.name,
+       email: input.email,
++      phone: input.phone,
+       role: input.role,
++      notificationPreferences: prefs,
+       createdAt: now,
+       updatedAt: now,
+     };
+@@ -89,10 +97,17 @@ export class UserService {
+     const changes: string[] = [];
+     if (input.name && input.name !== existing.name) changes.push('name');
+     if (input.email && input.email !== existing.email) changes.push('email');
++    if (input.phone !== undefined && input.phone !== existing.phone) changes.push('phone');
+     if (input.role && input.role !== existing.role) changes.push('role');
++    if (input.notificationPreferences) changes.push('notificationPreferences');
++
++    const mergedPrefs = input.notificationPreferences
++      ? { ...existing.notificationPreferences, ...input.notificationPreferences }
++      : existing.notificationPreferences;
+ 
+     const updated = this.userRepository.update(id, {
+       ...input,
++      notificationPreferences: mergedPrefs,
+       updatedAt: new Date(),
+     });
+ 
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index ad0020f..b24e42e 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,7 +5,11 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
++import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import { SmsAdapter } from '../../src/adapters/sms.adapter.js';
++import { defaultNotificationPreferences } from '../../src/models/user.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import type { User } from '../../src/models/user.js';
+ 
+ describe('NotificationService', () => {
+   let eventBus: EventBus;
+@@ -228,4 +232,167 @@ describe('NotificationService', () => {
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('multi-channel preferences', () => {
++    function makeUser(overrides: Partial<User> = {}): User {
++      return {
++        id: 'user-1',
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++        notificationPreferences: defaultNotificationPreferences(),
++        createdAt: new Date(),
++        updatedAt: new Date(),
++        ...overrides,
++      };
++    }
++
++    function makeOrderCreatedEvent(user: User): OrderCreatedEvent {
++      return {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: user.id,
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user,
++        timestamp: new Date(),
++      };
++    }
++
++    it('should only send to email adapter when user has default preferences', async () => {
++      const emailAdapter = new EmailAdapter();
++      const smsAdapter = new SmsAdapter();
++      service.registerAdapter(emailAdapter);
++      service.registerAdapter(smsAdapter);
++
++      const user = makeUser();
++      await eventBus.emit(makeOrderCreatedEvent(user));
++
++      // Wait for adapter promises to resolve
++      await new Promise((r) => setTimeout(r, 10));
++
++      expect(emailAdapter.getSentEmails()).toHaveLength(1);
++      expect(smsAdapter.getSentMessages()).toHaveLength(0);
++    });
++
++    it('should send to both email and SMS when both are enabled', async () => {
++      const emailAdapter = new EmailAdapter();
++      const smsAdapter = new SmsAdapter();
++      service.registerAdapter(emailAdapter);
++      service.registerAdapter(smsAdapter);
++
++      const user = makeUser({
++        phone: '+15551234567',
++        notificationPreferences: {
++          email: { enabled: true },
++          sms: { enabled: true },
++          webhook: { enabled: false },
++        },
++      });
++      await eventBus.emit(makeOrderCreatedEvent(user));
++
++      await new Promise((r) => setTimeout(r, 10));
++
++      expect(emailAdapter.getSentEmails()).toHaveLength(1);
++      expect(emailAdapter.getSentEmails()[0]?.to).toBe('alice@example.com');
++      expect(smsAdapter.getSentMessages()).toHaveLength(1);
++      expect(smsAdapter.getSentMessages()[0]?.to).toBe('+15551234567');
++    });
++
++    it('should send to no adapters when all channels are disabled', async () => {
++      const emailAdapter = new EmailAdapter();
++      const smsAdapter = new SmsAdapter();
++      service.registerAdapter(emailAdapter);
++      service.registerAdapter(smsAdapter);
++
++      const user = makeUser({
++        notificationPreferences: {
++          email: { enabled: false },
++          sms: { enabled: false },
++          webhook: { enabled: false },
++        },
++      });
++      await eventBus.emit(makeOrderCreatedEvent(user));
++
++      await new Promise((r) => setTimeout(r, 10));
++
++      expect(emailAdapter.getSentEmails()).toHaveLength(0);
++      expect(smsAdapter.getSentMessages()).toHaveLength(0);
++    });
++
++    it('should still store in-memory notification even when adapters are filtered', async () => {
++      const emailAdapter = new EmailAdapter();
++      service.registerAdapter(emailAdapter);
++
++      const user = makeUser({
++        notificationPreferences: {
++          email: { enabled: false },
++          sms: { enabled: false },
++          webhook: { enabled: false },
++        },
++      });
++      await eventBus.emit(makeOrderCreatedEvent(user));
++
++      // In-memory notification is always recorded regardless of channel preferences
++      expect(service.getNotificationCount()).toBe(1);
++      expect(emailAdapter.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should send to SMS only when email is disabled', async () => {
++      const emailAdapter = new EmailAdapter();
++      const smsAdapter = new SmsAdapter();
++      service.registerAdapter(emailAdapter);
++      service.registerAdapter(smsAdapter);
++
++      const user = makeUser({
++        phone: '+15559876543',
++        notificationPreferences: {
++          email: { enabled: false },
++          sms: { enabled: true },
++          webhook: { enabled: false },
++        },
++      });
++      await eventBus.emit(makeOrderCreatedEvent(user));
++
++      await new Promise((r) => setTimeout(r, 10));
++
++      expect(emailAdapter.getSentEmails()).toHaveLength(0);
++      expect(smsAdapter.getSentMessages()).toHaveLength(1);
++      expect(smsAdapter.getSentMessages()[0]?.to).toBe('+15559876543');
++    });
++
++    it('should send to all adapters when no preferences are provided (backward compat)', async () => {
++      const emailAdapter = new EmailAdapter();
++      const smsAdapter = new SmsAdapter();
++      service.registerAdapter(emailAdapter);
++      service.registerAdapter(smsAdapter);
++
++      // Status change events don't carry user preferences — all adapters fire
++      statusChangeCallbacks.notify({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
++
++      await new Promise((r) => setTimeout(r, 10));
++
++      expect(emailAdapter.getSentEmails()).toHaveLength(1);
++      expect(smsAdapter.getSentMessages()).toHaveLength(1);
++    });
++  });
+ });
+diff --git a/tests/services/user.service.test.ts b/tests/services/user.service.test.ts
+index e7859a2..70729f6 100644
+--- a/tests/services/user.service.test.ts
++++ b/tests/services/user.service.test.ts
+@@ -190,4 +190,86 @@ describe('UserService', () => {
+       expect(service.getUser(user.id)).toBeUndefined();
+     });
+   });
++
++  describe('notification preferences', () => {
++    it('should create user with default notification preferences', async () => {
++      const user = await service.createUser({
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++      });
++
++      expect(user.notificationPreferences).toEqual({
++        email: { enabled: true },
++        sms: { enabled: false },
++        webhook: { enabled: false },
++      });
++    });
++
++    it('should create user with custom notification preferences', async () => {
++      const user = await service.createUser({
++        name: 'Alice',
++        email: 'alice@example.com',
++        phone: '+15551234567',
++        role: 'member',
++        notificationPreferences: {
++          email: { enabled: true },
++          sms: { enabled: true },
++        },
++      });
++
++      expect(user.phone).toBe('+15551234567');
++      expect(user.notificationPreferences.email.enabled).toBe(true);
++      expect(user.notificationPreferences.sms.enabled).toBe(true);
++      expect(user.notificationPreferences.webhook.enabled).toBe(false);
++    });
++
++    it('should update notification preferences', async () => {
++      const user = await service.createUser({
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++      });
++
++      const updated = await service.updateUser(user.id, {
++        notificationPreferences: {
++          sms: { enabled: true },
++        },
++      });
++
++      expect(updated.notificationPreferences.email.enabled).toBe(true);
++      expect(updated.notificationPreferences.sms.enabled).toBe(true);
++      expect(updated.notificationPreferences.webhook.enabled).toBe(false);
++    });
++
++    it('should update phone number', async () => {
++      const user = await service.createUser({
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++      });
++
++      const updated = await service.updateUser(user.id, {
++        phone: '+15559876543',
++      });
++
++      expect(updated.phone).toBe('+15559876543');
++    });
++
++    it('should emit event when preferences change', async () => {
++      const user = await service.createUser({
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++      });
++
++      await service.updateUser(user.id, {
++        notificationPreferences: { sms: { enabled: true } },
++      });
++
++      const events = eventBus.getEventLog();
++      expect(events).toHaveLength(2); // created + updated
++      expect(events[1]?.type).toBe('user:updated');
++    });
++  });
+ });

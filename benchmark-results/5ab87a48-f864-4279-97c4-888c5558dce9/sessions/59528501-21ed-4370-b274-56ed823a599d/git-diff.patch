@@ -1,0 +1,835 @@
+diff --git a/tests/integration/analytics-pipeline.test.ts b/tests/integration/analytics-pipeline.test.ts
+new file mode 100644
+index 0000000..44eb4ad
+--- /dev/null
++++ b/tests/integration/analytics-pipeline.test.ts
+@@ -0,0 +1,829 @@
++/**
++ * Integration tests for the full analytics pipeline.
++ *
++ * Tests the complete flow: HTTP request → route handler → analytics service →
++ * repositories → in-memory database, and back through the response.
++ *
++ * These tests use real instances of all layers — no mocks.
++ */
++
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database } from '../../src/utils/database.js';
++import { OrderRepository } from '../../src/repositories/order.repository.js';
++import { UserRepository } from '../../src/repositories/user.repository.js';
++import { AnalyticsService } from '../../src/services/analytics.service.js';
++import { createAnalyticsRoutes } from '../../src/routes/analytics.routes.js';
++import type { RouteDefinition, RouteRequest } from '../../src/routes/types.js';
++import type { Order } from '../../src/models/order.js';
++import type { User } from '../../src/models/user.js';
++import type {
++  DashboardData,
++  MetricDetailResponse,
++  TimeSeriesResponse,
++  TopProductsResponse,
++} from '../../src/models/analytics.js';
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++function makeOrder(overrides: Partial<Order> & { id: string; userId: string }): Order {
++  return {
++    items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++    total: 10,
++    status: 'pending',
++    createdAt: new Date('2025-01-15T12:00:00Z'),
++    updatedAt: new Date('2025-01-15T12:00:00Z'),
++    ...overrides,
++  };
++}
++
++function makeUser(overrides: Partial<User> & { id: string }): User {
++  return {
++    name: 'Test User',
++    email: `${overrides.id}@example.com`,
++    role: 'member',
++    createdAt: new Date('2025-01-15T12:00:00Z'),
++    updatedAt: new Date('2025-01-15T12:00:00Z'),
++    ...overrides,
++  };
++}
++
++function makeRequest(overrides: Partial<RouteRequest> = {}): RouteRequest {
++  return {
++    params: {},
++    query: {},
++    body: undefined,
++    ...overrides,
++  };
++}
++
++function findRoute(routes: RouteDefinition[], path: string): RouteDefinition {
++  const route = routes.find((r) => r.path === path);
++  if (!route) throw new Error(`Route not found: ${path}`);
++  return route;
++}
++
++// ---------------------------------------------------------------------------
++// Test data setup
++// ---------------------------------------------------------------------------
++
++function seedTestData(orderRepo: OrderRepository, userRepo: UserRepository) {
++  // Users created across January 2025
++  userRepo.save(makeUser({ id: 'u1', name: 'Alice', createdAt: new Date('2025-01-02T09:00:00Z') }));
++  userRepo.save(makeUser({ id: 'u2', name: 'Bob', createdAt: new Date('2025-01-05T14:00:00Z') }));
++  userRepo.save(makeUser({ id: 'u3', name: 'Charlie', createdAt: new Date('2025-01-10T11:00:00Z') }));
++
++  // Orders across January 2025 with various statuses and products
++  orderRepo.save(makeOrder({
++    id: 'o1', userId: 'u1', total: 100, status: 'delivered',
++    createdAt: new Date('2025-01-03T10:00:00Z'),
++    items: [
++      { productId: 'prod-a', name: 'Laptop Stand', quantity: 1, unitPrice: 75 },
++      { productId: 'prod-b', name: 'USB Cable', quantity: 5, unitPrice: 5 },
++    ],
++  }));
++  orderRepo.save(makeOrder({
++    id: 'o2', userId: 'u1', total: 200, status: 'shipped',
++    createdAt: new Date('2025-01-07T15:00:00Z'),
++    items: [
++      { productId: 'prod-c', name: 'Keyboard', quantity: 1, unitPrice: 120 },
++      { productId: 'prod-b', name: 'USB Cable', quantity: 16, unitPrice: 5 },
++    ],
++  }));
++  orderRepo.save(makeOrder({
++    id: 'o3', userId: 'u2', total: 50, status: 'pending',
++    createdAt: new Date('2025-01-10T08:00:00Z'),
++    items: [
++      { productId: 'prod-a', name: 'Laptop Stand', quantity: 1, unitPrice: 50 },
++    ],
++  }));
++  orderRepo.save(makeOrder({
++    id: 'o4', userId: 'u2', total: 300, status: 'confirmed',
++    createdAt: new Date('2025-01-15T12:00:00Z'),
++    items: [
++      { productId: 'prod-d', name: 'Monitor', quantity: 1, unitPrice: 300 },
++    ],
++  }));
++  orderRepo.save(makeOrder({
++    id: 'o5', userId: 'u3', total: 25, status: 'cancelled',
++    createdAt: new Date('2025-01-20T16:00:00Z'),
++    items: [
++      { productId: 'prod-b', name: 'USB Cable', quantity: 5, unitPrice: 5 },
++    ],
++  }));
++
++  // Previous period data (December 2024) for period-over-period comparison
++  userRepo.save(makeUser({ id: 'u0', name: 'Prev User', createdAt: new Date('2024-12-15T10:00:00Z') }));
++  orderRepo.save(makeOrder({
++    id: 'o-prev1', userId: 'u0', total: 150, status: 'delivered',
++    createdAt: new Date('2024-12-10T10:00:00Z'),
++    items: [{ productId: 'prod-a', name: 'Laptop Stand', quantity: 2, unitPrice: 75 }],
++  }));
++  orderRepo.save(makeOrder({
++    id: 'o-prev2', userId: 'u0', total: 80, status: 'delivered',
++    createdAt: new Date('2024-12-20T14:00:00Z'),
++    items: [{ productId: 'prod-c', name: 'Keyboard', quantity: 1, unitPrice: 80 }],
++  }));
++}
++
++// ---------------------------------------------------------------------------
++// Integration tests
++// ---------------------------------------------------------------------------
++
++describe('Analytics Pipeline Integration', () => {
++  let db: Database;
++  let orderRepo: OrderRepository;
++  let userRepo: UserRepository;
++  let service: AnalyticsService;
++  let routes: RouteDefinition[];
++
++  beforeEach(() => {
++    db = new Database();
++    orderRepo = new OrderRepository(db);
++    userRepo = new UserRepository(db);
++    service = new AnalyticsService(orderRepo, userRepo);
++    routes = createAnalyticsRoutes(service);
++  });
++
++  // -----------------------------------------------------------------------
++  // Dashboard end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('Dashboard pipeline (routes → service → repos → DB)', () => {
++    it('should return complete dashboard data from seeded database', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as DashboardData;
++
++      // Verify metrics
++      expect(data.metrics).toHaveLength(4);
++
++      const orders = data.metrics.find((m) => m.type === 'orders')!;
++      expect(orders.value).toBe(5);
++      expect(orders.previousValue).toBe(2); // Dec 2024 orders
++      expect(orders.trend).toBe('up');
++
++      const revenue = data.metrics.find((m) => m.type === 'revenue')!;
++      expect(revenue.value).toBe(675); // 100 + 200 + 50 + 300 + 25
++      expect(revenue.previousValue).toBe(230); // 150 + 80
++
++      const users = data.metrics.find((m) => m.type === 'users')!;
++      expect(users.value).toBe(3);
++
++      const aov = data.metrics.find((m) => m.type === 'average-order-value')!;
++      expect(aov.value).toBe(135); // 675 / 5
++
++      // Verify status breakdown
++      expect(data.ordersByStatus).toBeInstanceOf(Array);
++      const pending = data.ordersByStatus.find((s) => s.status === 'pending');
++      expect(pending?.count).toBe(1);
++      const cancelled = data.ordersByStatus.find((s) => s.status === 'cancelled');
++      expect(cancelled?.count).toBe(1);
++
++      // Verify time series exists and has points
++      expect(data.revenueTimeSeries.length).toBeGreaterThan(0);
++
++      // Verify query echoed back
++      expect(data.query.startDate).toBe('2025-01-01T00:00:00Z');
++      expect(data.query.endDate).toBe('2025-01-31T23:59:59Z');
++      expect(data.generatedAt).toBeDefined();
++    });
++
++    it('should filter dashboard by userId across the full stack', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++          userId: 'u1',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as DashboardData;
++
++      const orders = data.metrics.find((m) => m.type === 'orders')!;
++      expect(orders.value).toBe(2); // only u1's orders (o1, o2)
++
++      const revenue = data.metrics.find((m) => m.type === 'revenue')!;
++      expect(revenue.value).toBe(300); // 100 + 200
++    });
++
++    it('should return zeros for empty date range', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2026-01-01T00:00:00Z',
++          endDate: '2026-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as DashboardData;
++      expect(data.metrics.find((m) => m.type === 'orders')?.value).toBe(0);
++      expect(data.metrics.find((m) => m.type === 'revenue')?.value).toBe(0);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Metrics endpoint end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('Metrics pipeline', () => {
++    it('should return revenue metric with correct aggregation through full stack', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/metrics/:type');
++      const res = await route.handler(makeRequest({
++        params: { type: 'revenue' },
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as MetricDetailResponse;
++      expect(data.metric.type).toBe('revenue');
++      expect(data.metric.value).toBe(675);
++      expect(data.metric.previousValue).toBe(230);
++      expect(data.metric.trend).toBe('up');
++      expect(data.timeSeries.length).toBeGreaterThan(0);
++    });
++
++    it('should return users metric counting from user repository', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/metrics/:type');
++      const res = await route.handler(makeRequest({
++        params: { type: 'users' },
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as MetricDetailResponse;
++      expect(data.metric.type).toBe('users');
++      expect(data.metric.value).toBe(3);
++      expect(data.metric.label).toBe('New Users');
++      // User time series should also be populated
++      expect(data.timeSeries.length).toBeGreaterThan(0);
++    });
++
++    it('should return average-order-value computed correctly', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/metrics/:type');
++      const res = await route.handler(makeRequest({
++        params: { type: 'average-order-value' },
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as MetricDetailResponse;
++      expect(data.metric.value).toBe(135); // 675 / 5
++    });
++
++    it('should reject invalid metric type at route level', async () => {
++      const route = findRoute(routes, '/api/analytics/metrics/:type');
++      const res = await route.handler(makeRequest({
++        params: { type: 'nonexistent' },
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('Invalid metric type');
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Time series end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('Time series pipeline', () => {
++    it('should return daily revenue time series with correct bucketing', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'revenue',
++          granularity: 'day',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++      expect(data.metric).toBe('revenue');
++      expect(data.granularity).toBe('day');
++      expect(data.points.length).toBeGreaterThanOrEqual(31);
++
++      // Verify specific day values
++      const jan3 = data.points.find((p) => p.label === '2025-01-03');
++      expect(jan3?.value).toBe(100); // o1
++
++      const jan7 = data.points.find((p) => p.label === '2025-01-07');
++      expect(jan7?.value).toBe(200); // o2
++
++      const jan10 = data.points.find((p) => p.label === '2025-01-10');
++      expect(jan10?.value).toBe(50); // o3
++
++      const jan15 = data.points.find((p) => p.label === '2025-01-15');
++      expect(jan15?.value).toBe(300); // o4
++
++      // Empty days should be 0
++      const jan4 = data.points.find((p) => p.label === '2025-01-04');
++      expect(jan4?.value).toBe(0);
++    });
++
++    it('should return weekly order counts', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'orders',
++          granularity: 'week',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++      expect(data.granularity).toBe('week');
++      expect(data.points.length).toBeGreaterThanOrEqual(4);
++
++      // Sum of all points should equal total orders
++      const totalFromBuckets = data.points.reduce((sum, p) => sum + p.value, 0);
++      expect(totalFromBuckets).toBe(5);
++    });
++
++    it('should return monthly revenue aggregation', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'revenue',
++          granularity: 'month',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++      const jan = data.points.find((p) => p.label === '2025-01');
++      expect(jan?.value).toBe(675);
++    });
++
++    it('should return user time series by day', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'users',
++          granularity: 'day',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++
++      const jan2 = data.points.find((p) => p.label === '2025-01-02');
++      expect(jan2?.value).toBe(1); // u1
++
++      const jan5 = data.points.find((p) => p.label === '2025-01-05');
++      expect(jan5?.value).toBe(1); // u2
++
++      const jan10 = data.points.find((p) => p.label === '2025-01-10');
++      expect(jan10?.value).toBe(1); // u3
++
++      const totalUsers = data.points.reduce((sum, p) => sum + p.value, 0);
++      expect(totalUsers).toBe(3);
++    });
++
++    it('should default granularity to day when not specified', async () => {
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'orders',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-03T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++      expect(data.granularity).toBe('day');
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Top products end-to-end
++  // -----------------------------------------------------------------------
++
++  describe('Top products pipeline', () => {
++    it('should aggregate products across orders and rank by revenue', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/top-products');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TopProductsResponse;
++
++      expect(data.products.length).toBe(4); // prod-a, prod-b, prod-c, prod-d
++
++      // Monitor (prod-d): 1 * 300 = 300
++      expect(data.products[0].productId).toBe('prod-d');
++      expect(data.products[0].totalRevenue).toBe(300);
++      expect(data.products[0].name).toBe('Monitor');
++
++      // Laptop Stand (prod-a): 1*75 + 1*50 = 125
++      // USB Cable (prod-b): 5*5 + 16*5 + 5*5 = 130
++      // Keyboard (prod-c): 1*120 = 120
++      const usbCable = data.products.find((p) => p.productId === 'prod-b')!;
++      expect(usbCable.totalRevenue).toBe(130);
++      expect(usbCable.totalQuantity).toBe(26); // 5 + 16 + 5
++
++      const laptopStand = data.products.find((p) => p.productId === 'prod-a')!;
++      expect(laptopStand.totalRevenue).toBe(125);
++      expect(laptopStand.totalQuantity).toBe(2);
++
++      const keyboard = data.products.find((p) => p.productId === 'prod-c')!;
++      expect(keyboard.totalRevenue).toBe(120);
++    });
++
++    it('should respect limit parameter through full stack', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/top-products');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++          limit: '2',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TopProductsResponse;
++      expect(data.products).toHaveLength(2);
++      // Top 2 by revenue: Monitor (300), USB Cable (130)
++      expect(data.products[0].productId).toBe('prod-d');
++      expect(data.products[1].productId).toBe('prod-b');
++    });
++
++    it('should filter by date range excluding out-of-range orders', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const route = findRoute(routes, '/api/analytics/top-products');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-08T00:00:00Z', // Only includes o1 and o2
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TopProductsResponse;
++      // Only products from o1 (Laptop Stand, USB Cable) and o2 (Keyboard, USB Cable)
++      expect(data.products.length).toBe(3);
++      // No Monitor (prod-d) since o4 is on Jan 15
++      expect(data.products.find((p) => p.productId === 'prod-d')).toBeUndefined();
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Error scenarios
++  // -----------------------------------------------------------------------
++
++  describe('Error handling through full pipeline', () => {
++    it('should return 400 for invalid startDate', async () => {
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: { startDate: 'not-a-date' },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('Invalid startDate');
++    });
++
++    it('should return 400 for invalid endDate', async () => {
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: { startDate: '2025-01-01T00:00:00Z', endDate: 'bad' },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('Invalid endDate');
++    });
++
++    it('should return 400 when startDate is after endDate', async () => {
++      const route = findRoute(routes, '/api/analytics/dashboard');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-02-01T00:00:00Z',
++          endDate: '2025-01-01T00:00:00Z',
++        },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('startDate must be before endDate');
++    });
++
++    it('should return 400 for missing metric on timeseries endpoint', async () => {
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('metric');
++    });
++
++    it('should return 400 for invalid granularity on timeseries endpoint', async () => {
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'orders',
++          granularity: 'century',
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('Invalid granularity');
++    });
++
++    it('should return 400 for invalid metric type on metrics endpoint', async () => {
++      const route = findRoute(routes, '/api/analytics/metrics/:type');
++      const res = await route.handler(makeRequest({
++        params: { type: 'clicks' },
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++      expect(res.status).toBe(400);
++      expect((res.data as { error: string }).error).toContain('Invalid metric type');
++    });
++
++    it('should return 500 when service throws', async () => {
++      const brokenService = {
++        getDashboard: () => { throw new Error('Database connection lost'); },
++        getMetric: () => { throw new Error('Database connection lost'); },
++        getTimeSeries: () => { throw new Error('Database connection lost'); },
++        getTopProducts: () => { throw new Error('Database connection lost'); },
++      } as unknown as AnalyticsService;
++
++      const brokenRoutes = createAnalyticsRoutes(brokenService);
++
++      // Test all 4 endpoints return 500
++      const dashboard = await findRoute(brokenRoutes, '/api/analytics/dashboard').handler(
++        makeRequest({ query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-31T23:59:59Z' } })
++      );
++      expect(dashboard.status).toBe(500);
++      expect((dashboard.data as { error: string }).error).not.toContain('Database connection lost'); // error details hidden
++
++      const metric = await findRoute(brokenRoutes, '/api/analytics/metrics/:type').handler(
++        makeRequest({ params: { type: 'revenue' }, query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-31T23:59:59Z' } })
++      );
++      expect(metric.status).toBe(500);
++
++      const timeseries = await findRoute(brokenRoutes, '/api/analytics/timeseries').handler(
++        makeRequest({ query: { metric: 'orders', startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-31T23:59:59Z' } })
++      );
++      expect(timeseries.status).toBe(500);
++
++      const topProducts = await findRoute(brokenRoutes, '/api/analytics/top-products').handler(
++        makeRequest({ query: { startDate: '2025-01-01T00:00:00Z', endDate: '2025-01-31T23:59:59Z' } })
++      );
++      expect(topProducts.status).toBe(500);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Cross-endpoint consistency
++  // -----------------------------------------------------------------------
++
++  describe('Cross-endpoint data consistency', () => {
++    it('should return consistent revenue across dashboard and metric endpoints', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const dateQuery = {
++        startDate: '2025-01-01T00:00:00Z',
++        endDate: '2025-01-31T23:59:59Z',
++      };
++
++      const dashboardRoute = findRoute(routes, '/api/analytics/dashboard');
++      const dashRes = await dashboardRoute.handler(makeRequest({ query: dateQuery }));
++      const dashData = dashRes.data as DashboardData;
++      const dashRevenue = dashData.metrics.find((m) => m.type === 'revenue')!.value;
++
++      const metricRoute = findRoute(routes, '/api/analytics/metrics/:type');
++      const metricRes = await metricRoute.handler(makeRequest({
++        params: { type: 'revenue' },
++        query: dateQuery,
++      }));
++      const metricData = metricRes.data as MetricDetailResponse;
++      const metricRevenue = metricData.metric.value;
++
++      expect(dashRevenue).toBe(metricRevenue);
++    });
++
++    it('should return consistent order counts across dashboard and timeseries', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const dateQuery = {
++        startDate: '2025-01-01T00:00:00Z',
++        endDate: '2025-01-31T23:59:59Z',
++      };
++
++      const dashboardRoute = findRoute(routes, '/api/analytics/dashboard');
++      const dashRes = await dashboardRoute.handler(makeRequest({ query: dateQuery }));
++      const dashData = dashRes.data as DashboardData;
++      const dashOrderCount = dashData.metrics.find((m) => m.type === 'orders')!.value;
++
++      const tsRoute = findRoute(routes, '/api/analytics/timeseries');
++      const tsRes = await tsRoute.handler(makeRequest({
++        query: { ...dateQuery, metric: 'orders', granularity: 'day' },
++      }));
++      const tsData = tsRes.data as TimeSeriesResponse;
++      const tsOrderCount = tsData.points.reduce((sum, p) => sum + p.value, 0);
++
++      expect(dashOrderCount).toBe(tsOrderCount);
++    });
++
++    it('should return consistent revenue across metric and timeseries endpoints', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const dateQuery = {
++        startDate: '2025-01-01T00:00:00Z',
++        endDate: '2025-01-31T23:59:59Z',
++      };
++
++      const metricRoute = findRoute(routes, '/api/analytics/metrics/:type');
++      const metricRes = await metricRoute.handler(makeRequest({
++        params: { type: 'revenue' },
++        query: dateQuery,
++      }));
++      const metricRevenue = (metricRes.data as MetricDetailResponse).metric.value;
++
++      const tsRoute = findRoute(routes, '/api/analytics/timeseries');
++      const tsRes = await tsRoute.handler(makeRequest({
++        query: { ...dateQuery, metric: 'revenue', granularity: 'day' },
++      }));
++      const tsRevenue = (tsRes.data as TimeSeriesResponse).points.reduce((sum, p) => sum + p.value, 0);
++
++      expect(metricRevenue).toBe(tsRevenue);
++    });
++
++    it('should return consistent user counts between metric and timeseries', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const dateQuery = {
++        startDate: '2025-01-01T00:00:00Z',
++        endDate: '2025-01-31T23:59:59Z',
++      };
++
++      const metricRes = await findRoute(routes, '/api/analytics/metrics/:type').handler(
++        makeRequest({ params: { type: 'users' }, query: dateQuery })
++      );
++      const metricUsers = (metricRes.data as MetricDetailResponse).metric.value;
++
++      const tsRes = await findRoute(routes, '/api/analytics/timeseries').handler(
++        makeRequest({ query: { ...dateQuery, metric: 'users', granularity: 'day' } })
++      );
++      const tsUsers = (tsRes.data as TimeSeriesResponse).points.reduce((sum, p) => sum + p.value, 0);
++
++      expect(metricUsers).toBe(tsUsers);
++    });
++  });
++
++  // -----------------------------------------------------------------------
++  // Data flowing through all layers
++  // -----------------------------------------------------------------------
++
++  describe('Data integrity through layers', () => {
++    it('should correctly round-trip order data through DB → repo → service → route', async () => {
++      // Insert order via repository (which serializes to DB)
++      const order: Order = {
++        id: 'round-trip-1',
++        userId: 'u1',
++        items: [
++          { productId: 'px', name: 'Special Widget', quantity: 3, unitPrice: 33.33 },
++        ],
++        total: 99.99,
++        status: 'confirmed',
++        createdAt: new Date('2025-01-15T12:00:00Z'),
++        updatedAt: new Date('2025-01-15T12:00:00Z'),
++      };
++      orderRepo.save(order);
++
++      // Query via route handler
++      const route = findRoute(routes, '/api/analytics/top-products');
++      const res = await route.handler(makeRequest({
++        query: {
++          startDate: '2025-01-01T00:00:00Z',
++          endDate: '2025-01-31T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TopProductsResponse;
++      expect(data.products).toHaveLength(1);
++      expect(data.products[0].productId).toBe('px');
++      expect(data.products[0].name).toBe('Special Widget');
++      expect(data.products[0].totalQuantity).toBe(3);
++      expect(data.products[0].totalRevenue).toBeCloseTo(99.99);
++    });
++
++    it('should correctly handle date serialization through DB layer', async () => {
++      const exactDate = new Date('2025-01-15T12:30:45.123Z');
++      orderRepo.save(makeOrder({
++        id: 'date-test',
++        userId: 'u1',
++        total: 42,
++        createdAt: exactDate,
++      }));
++
++      // Query a range that includes this exact date
++      const route = findRoute(routes, '/api/analytics/timeseries');
++      const res = await route.handler(makeRequest({
++        query: {
++          metric: 'revenue',
++          granularity: 'day',
++          startDate: '2025-01-15T00:00:00Z',
++          endDate: '2025-01-15T23:59:59Z',
++        },
++      }));
++
++      expect(res.status).toBe(200);
++      const data = res.data as TimeSeriesResponse;
++      const jan15 = data.points.find((p) => p.label === '2025-01-15');
++      expect(jan15?.value).toBe(42);
++    });
++
++    it('should handle concurrent calls without state leaking between them', async () => {
++      seedTestData(orderRepo, userRepo);
++
++      const dateQuery = {
++        startDate: '2025-01-01T00:00:00Z',
++        endDate: '2025-01-31T23:59:59Z',
++      };
++
++      const route = findRoute(routes, '/api/analytics/dashboard');
++
++      // Run multiple concurrent requests
++      const [res1, res2, res3] = await Promise.all([
++        route.handler(makeRequest({ query: dateQuery })),
++        route.handler(makeRequest({ query: dateQuery })),
++        route.handler(makeRequest({ query: dateQuery })),
++      ]);
++
++      // All should return identical results
++      const data1 = res1.data as DashboardData;
++      const data2 = res2.data as DashboardData;
++      const data3 = res3.data as DashboardData;
++
++      expect(data1.metrics.find((m) => m.type === 'revenue')?.value)
++        .toBe(data2.metrics.find((m) => m.type === 'revenue')?.value);
++      expect(data2.metrics.find((m) => m.type === 'revenue')?.value)
++        .toBe(data3.metrics.find((m) => m.type === 'revenue')?.value);
++    });
++  });
++});

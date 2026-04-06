@@ -1,0 +1,482 @@
+diff --git a/docs/SMS_CHANNEL_ADDITION.md b/docs/SMS_CHANNEL_ADDITION.md
+new file mode 100644
+index 0000000..7542061
+--- /dev/null
++++ b/docs/SMS_CHANNEL_ADDITION.md
+@@ -0,0 +1,59 @@
++# SMS Channel Addition — Breaking Assumption in User Preferences
++
++## What changed
++
++An SMS notification adapter (`src/adapters/sms.adapter.ts`) has been added to the notification
++system. The `NotificationChannel` type now includes `'sms'` alongside `'email'`, `'webhook'`,
++and `'in-app'`.
++
++The SMS adapter follows the same pattern as `EmailAdapter` and `WebhookAdapter`:
++- Implements `NotificationAdapter`
++- Validates recipients (E.164 phone numbers)
++- Renders per-type message templates (plain text, SMS-length aware)
++- In-memory delivery log for testing
++- Registered via `NotificationService.registerAdapter()`
++
++## What needs to change next: User Preferences
++
++**The user preferences model was designed with an email-only assumption. This is no longer valid.**
++
++### Current state (email-only)
++
++The `UserPreferences` model (`src/models/user-preferences.ts`) has a single `email` field of type
++`EmailPreferences`. The `PreferencesService` only exposes `isEmailAllowed()`. The
++`NotificationService.dispatchNotification()` only checks preferences when `payload.channel === 'email'`.
++
++Affected files:
++- `src/models/user-preferences.ts` — `UserPreferences` interface only has `email: EmailPreferences`
++- `src/services/preferences.service.ts` — only has `isEmailAllowed()`, no channel-generic method
++- `src/services/notification.service.ts:179` — preference check is hardcoded to `payload.channel === 'email'`
++- `src/repositories/preferences.repository.ts` — serializes only email preference fields
++- `src/validators/preferences.validator.ts` — only validates email-related categories
++- `tests/services/notification-preferences.test.ts` — tests only email preference filtering
++
++### Required changes
++
++1. **`UserPreferences` model**: Add an `sms` field (e.g., `sms?: SmsPreferences`) with its own
++   `enabled`, `subscribedCategories`, and any SMS-specific settings (no frequency/digest for SMS).
++
++2. **`PreferencesService`**: Add a channel-generic method like `isChannelAllowed(userId, channel, notificationType)`
++   or a specific `isSmsAllowed()` method. The current `isEmailAllowed()` should remain for
++   backwards compatibility.
++
++3. **`NotificationService.dispatchNotification()`**: The preference check at line 179 is hardcoded
++   to `payload.channel === 'email'`. This must be updated to check preferences for all channels
++   that support user opt-out (email and SMS at minimum).
++
++4. **`PreferencesRepository`**: Update serialization to handle SMS preference fields.
++
++5. **`CreatePreferencesInput` / `UpdatePreferencesInput`**: Add optional `sms` fields.
++
++6. **Default preferences**: Define `DEFAULT_SMS_PREFERENCES` similar to `DEFAULT_EMAIL_PREFERENCES`.
++
++7. **Tests**: Update preference-related tests to cover SMS opt-in/opt-out.
++
++### Why this matters
++
++Without these changes, SMS notifications will bypass user preferences entirely — there is no
++preference check for the `'sms'` channel. Users cannot opt out of SMS notifications until
++the preferences model is updated.
+diff --git a/src/adapters/sms.adapter.ts b/src/adapters/sms.adapter.ts
+new file mode 100644
+index 0000000..1e87ce2
+--- /dev/null
++++ b/src/adapters/sms.adapter.ts
+@@ -0,0 +1,152 @@
++/**
++ * SMS notification adapter — delivers notifications via SMS.
++ *
++ * Features:
++ * - Message formatting per notification type (plain text, SMS-length aware)
++ * - Phone number validation (E.164 format)
++ * - Configurable sender ID
++ * - In-memory send log for testing
++ *
++ * Implements NotificationAdapter so the NotificationService can
++ * route sms-channel notifications here.
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type { NotificationPayload, NotificationType } from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++export interface SmsConfig {
++  /** Sender ID or phone number shown as the sender. */
++  fromNumber: string;
++  /** Maximum message length before truncation. */
++  maxLength: number;
++}
++
++const defaultSmsConfig: SmsConfig = {
++  fromNumber: '+15551234567',
++  maxLength: 160,
++};
++
++export interface SentSms {
++  to: string;
++  from: string;
++  body: string;
++  sentAt: Date;
++}
++
++/**
++ * SMS message templates keyed by notification type.
++ * Each template receives the payload and returns a plain text string.
++ * Messages are kept short to fit within SMS length limits.
++ */
++const smsTemplates: Record<NotificationType, (payload: NotificationPayload) => string> = {
++  order_confirmation(payload) {
++    const orderId = (payload.metadata?.orderId as string) ?? 'N/A';
++    return `TaskFlow Pro: Order ${orderId} confirmed. ${payload.body}`;
++  },
++
++  order_status_update(payload) {
++    const orderId = (payload.metadata?.orderId as string) ?? 'N/A';
++    const newStatus = (payload.metadata?.newStatus as string) ?? '';
++    return `TaskFlow Pro: Order ${orderId} is now ${newStatus}.`;
++  },
++
++  user_welcome(payload) {
++    return `Welcome to TaskFlow Pro, ${payload.recipient}! Your account is ready.`;
++  },
++
++  user_updated(payload) {
++    return `TaskFlow Pro: Your account has been updated.`;
++  },
++};
++
++/**
++ * Validate phone number in E.164 format: + followed by 7-15 digits.
++ */
++function isValidPhoneNumber(phone: string): boolean {
++  return /^\+[1-9]\d{6,14}$/.test(phone);
++}
++
++export class SmsAdapter implements NotificationAdapter {
++  readonly channel = 'sms' as const;
++  private logger = new Logger('SmsAdapter');
++  private sentMessages: SentSms[] = [];
++
++  constructor(private config: SmsConfig = defaultSmsConfig) {}
++
++  /**
++   * Render the notification body into a plain text SMS message
++   * using the appropriate template for the notification type.
++   * Truncates to maxLength if necessary.
++   */
++  renderTemplate(payload: NotificationPayload): string {
++    const templateFn = smsTemplates[payload.notificationType];
++    const message = templateFn(payload);
++
++    if (message.length > this.config.maxLength) {
++      return message.substring(0, this.config.maxLength - 3) + '...';
++    }
++    return message;
++  }
++
++  /**
++   * Resolve and validate the recipient phone number.
++   * Returns the validated phone number or null if invalid.
++   */
++  resolveRecipient(payload: NotificationPayload): string | null {
++    const phone = payload.recipient.trim();
++    if (!phone || !isValidPhoneNumber(phone)) {
++      this.logger.warn(`Invalid recipient phone number: "${payload.recipient}"`);
++      return null;
++    }
++    return phone;
++  }
++
++  /**
++   * Send an SMS notification.
++   *
++   * 1. Validates the recipient phone number.
++   * 2. Renders the message body from templates.
++   * 3. Records the SMS (in-memory for testing; swap for real provider in production).
++   */
++  async send(payload: NotificationPayload): Promise<boolean> {
++    try {
++      const recipient = this.resolveRecipient(payload);
++      if (!recipient) {
++        return false;
++      }
++
++      const body = this.renderTemplate(payload);
++
++      this.logger.info(`Sending SMS from "${this.config.fromNumber}" to ${recipient}: ${body.substring(0, 50)}...`);
++
++      this.sentMessages.push({
++        to: recipient,
++        from: this.config.fromNumber,
++        body,
++        sentAt: new Date(),
++      });
++
++      return true;
++    } catch (error) {
++      this.logger.error(
++        `Failed to send SMS to ${payload.recipient}: ${error instanceof Error ? error.message : String(error)}`,
++      );
++      return false;
++    }
++  }
++
++  /**
++   * Get all SMS messages sent through this adapter (for testing).
++   */
++  getSentMessages(): SentSms[] {
++    return [...this.sentMessages];
++  }
++
++  /**
++   * Clear sent message history (for testing).
++   */
++  clearSentMessages(): void {
++    this.sentMessages = [];
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index dabe74a..b85a79f 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -78,6 +78,8 @@ export type {
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter } from './adapters/email.adapter.js';
+ export type { EmailConfig, SentEmail } from './adapters/email.adapter.js';
++export { SmsAdapter } from './adapters/sms.adapter.js';
++export type { SmsConfig, SentSms } from './adapters/sms.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/src/models/notification.ts b/src/models/notification.ts
+index 8974077..4b879e1 100644
+--- a/src/models/notification.ts
++++ b/src/models/notification.ts
+@@ -11,7 +11,7 @@
+  * Supported notification channels. Each channel corresponds to a
+  * NotificationAdapter implementation.
+  */
+-export type NotificationChannel = 'email' | 'webhook' | 'in-app';
++export type NotificationChannel = 'email' | 'webhook' | 'in-app' | 'sms';
+ 
+ /**
+  * Categories of notifications. Used by adapters to decide formatting
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+index 85e9086..23c034e 100644
+--- a/src/models/user-preferences.ts
++++ b/src/models/user-preferences.ts
+@@ -2,8 +2,12 @@
+  * User notification preferences model.
+  *
+  * Controls how and when a user receives notifications via email.
+- * Currently email is the only channel; the model is designed to
+- * accommodate additional channels in the future.
++ *
++ * TODO(sms-preferences): This model was designed assuming email-only notifications.
++ * Now that an SMS channel has been added (see src/adapters/sms.adapter.ts), this model
++ * needs to be extended with SMS preferences (e.g., sms?: SmsPreferences). Until then,
++ * SMS notifications bypass user preference checks entirely. See docs/SMS_CHANNEL_ADDITION.md
++ * for the full list of required changes.
+  */
+ 
+ import type { NotificationType } from './notification.js';
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index b916e81..4437f7b 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -176,6 +176,9 @@ export class NotificationService {
+    * checked before dispatching. Blocked notifications are not persisted.
+    */
+   private dispatchNotification(payload: NotificationPayload): void {
++    // TODO(sms-preferences): This preference check is email-only. SMS (and future channels)
++    // bypass preferences entirely. Update to check preferences for all opt-out channels.
++    // See docs/SMS_CHANNEL_ADDITION.md for details.
+     if (this.preferencesService && payload.channel === 'email') {
+       const userId = payload.metadata?.['userId'] as string | undefined;
+       if (userId && !this.preferencesService.isEmailAllowed(userId, payload.notificationType)) {
+diff --git a/tests/adapters/sms.adapter.test.ts b/tests/adapters/sms.adapter.test.ts
+new file mode 100644
+index 0000000..9814597
+--- /dev/null
++++ b/tests/adapters/sms.adapter.test.ts
+@@ -0,0 +1,194 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { SmsAdapter } from '../../src/adapters/sms.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides: Partial<NotificationPayload> = {}): NotificationPayload {
++  return {
++    recipient: '+15559876543',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    channel: 'sms',
++    notificationType: 'order_confirmation',
++    metadata: { orderId: 'order-1', userId: 'user-1' },
++    ...overrides,
++  };
++}
++
++describe('SmsAdapter', () => {
++  let adapter: SmsAdapter;
++
++  beforeEach(() => {
++    adapter = new SmsAdapter();
++  });
++
++  describe('send', () => {
++    it('should send an SMS and return true on success', async () => {
++      const result = await adapter.send(makePayload());
++
++      expect(result).toBe(true);
++      const sent = adapter.getSentMessages();
++      expect(sent).toHaveLength(1);
++      expect(sent[0]?.to).toBe('+15559876543');
++      expect(sent[0]?.body).toContain('order-1');
++    });
++
++    it('should return false for invalid phone number', async () => {
++      const result = await adapter.send(makePayload({ recipient: 'not-a-phone' }));
++      expect(result).toBe(false);
++      expect(adapter.getSentMessages()).toHaveLength(0);
++    });
++
++    it('should return false for empty recipient', async () => {
++      const result = await adapter.send(makePayload({ recipient: '' }));
++      expect(result).toBe(false);
++    });
++
++    it('should return false for recipient with spaces only', async () => {
++      const result = await adapter.send(makePayload({ recipient: '   ' }));
++      expect(result).toBe(false);
++    });
++
++    it('should return false for phone number without + prefix', async () => {
++      const result = await adapter.send(makePayload({ recipient: '15559876543' }));
++      expect(result).toBe(false);
++    });
++
++    it('should return false for phone number starting with +0', async () => {
++      const result = await adapter.send(makePayload({ recipient: '+05559876543' }));
++      expect(result).toBe(false);
++    });
++
++    it('should include from number in sent message', async () => {
++      await adapter.send(makePayload());
++
++      const sent = adapter.getSentMessages();
++      expect(sent[0]?.from).toBe('+15551234567');
++    });
++
++    it('should use custom config when provided', async () => {
++      const custom = new SmsAdapter({
++        fromNumber: '+44700000000',
++        maxLength: 160,
++      });
++
++      await custom.send(makePayload());
++
++      const sent = custom.getSentMessages();
++      expect(sent[0]?.from).toBe('+44700000000');
++    });
++
++    it('should record sentAt timestamp', async () => {
++      const before = new Date();
++      await adapter.send(makePayload());
++      const after = new Date();
++
++      const sent = adapter.getSentMessages();
++      expect(sent[0]?.sentAt.getTime()).toBeGreaterThanOrEqual(before.getTime());
++      expect(sent[0]?.sentAt.getTime()).toBeLessThanOrEqual(after.getTime());
++    });
++  });
++
++  describe('renderTemplate', () => {
++    it('should render order_confirmation template with order ID', () => {
++      const body = adapter.renderTemplate(makePayload());
++      expect(body).toContain('order-1');
++      expect(body).toContain('TaskFlow Pro');
++    });
++
++    it('should render order_status_update template', () => {
++      const body = adapter.renderTemplate(
++        makePayload({
++          notificationType: 'order_status_update',
++          metadata: { orderId: 'order-1', previousStatus: 'pending', newStatus: 'confirmed' },
++        }),
++      );
++      expect(body).toContain('order-1');
++      expect(body).toContain('confirmed');
++    });
++
++    it('should render user_welcome template', () => {
++      const body = adapter.renderTemplate(
++        makePayload({
++          notificationType: 'user_welcome',
++          subject: 'Welcome to TaskFlow Pro',
++          body: 'Welcome! Your account has been created.',
++        }),
++      );
++      expect(body).toContain('Welcome to TaskFlow Pro');
++    });
++
++    it('should render user_updated template', () => {
++      const body = adapter.renderTemplate(
++        makePayload({
++          notificationType: 'user_updated',
++          subject: 'Account Updated',
++          body: 'Your account has been updated.',
++        }),
++      );
++      expect(body).toContain('updated');
++    });
++
++    it('should truncate messages exceeding maxLength', () => {
++      const shortAdapter = new SmsAdapter({ fromNumber: '+15551234567', maxLength: 30 });
++      const body = shortAdapter.renderTemplate(makePayload());
++      expect(body.length).toBeLessThanOrEqual(30);
++      expect(body).toMatch(/\.\.\.$/);
++    });
++
++    it('should not truncate messages within maxLength', () => {
++      const longAdapter = new SmsAdapter({ fromNumber: '+15551234567', maxLength: 500 });
++      const body = longAdapter.renderTemplate(makePayload());
++      expect(body).not.toMatch(/\.\.\.$/);
++    });
++  });
++
++  describe('resolveRecipient', () => {
++    it('should return valid E.164 phone number', () => {
++      const result = adapter.resolveRecipient(makePayload());
++      expect(result).toBe('+15559876543');
++    });
++
++    it('should return null for invalid phone number', () => {
++      expect(adapter.resolveRecipient(makePayload({ recipient: 'bad' }))).toBeNull();
++    });
++
++    it('should return null for phone number too short', () => {
++      expect(adapter.resolveRecipient(makePayload({ recipient: '+1234' }))).toBeNull();
++    });
++
++    it('should return null for phone number with letters', () => {
++      expect(adapter.resolveRecipient(makePayload({ recipient: '+1555abc4567' }))).toBeNull();
++    });
++
++    it('should trim whitespace from recipient', () => {
++      const result = adapter.resolveRecipient(makePayload({ recipient: '  +15559876543  ' }));
++      expect(result).toBe('+15559876543');
++    });
++  });
++
++  describe('channel', () => {
++    it('should report sms as its channel', () => {
++      expect(adapter.channel).toBe('sms');
++    });
++  });
++
++  describe('getSentMessages / clearSentMessages', () => {
++    it('should return empty array initially', () => {
++      expect(adapter.getSentMessages()).toEqual([]);
++    });
++
++    it('should return a copy of sent messages', async () => {
++      await adapter.send(makePayload());
++      const first = adapter.getSentMessages();
++      const second = adapter.getSentMessages();
++      expect(first).toEqual(second);
++      expect(first).not.toBe(second);
++    });
++
++    it('should clear all sent messages', async () => {
++      await adapter.send(makePayload());
++      adapter.clearSentMessages();
++      expect(adapter.getSentMessages()).toHaveLength(0);
++    });
++  });
++});

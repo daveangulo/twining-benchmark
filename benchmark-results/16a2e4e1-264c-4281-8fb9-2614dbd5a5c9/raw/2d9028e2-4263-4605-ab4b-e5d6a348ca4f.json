@@ -1,0 +1,1122 @@
+{
+  "compactionCount": 0,
+  "condition": "baseline",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "added",
+      "diff": "diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md\nnew file mode 100644\nindex 0000000..1aa4586\n--- /dev/null\n+++ b/ARCHITECTURE.md\n@@ -0,0 +1,103 @@\n+# Notification System Architecture\n+\n+## Decision: Event-Driven with Adapter Dispatch\n+\n+**Pattern chosen:** Event-driven (EventBus with subscribers)\n+**Pattern rejected:** Direct service calls / CallbackRegistry\n+\n+### Why Event-Driven?\n+\n+1. **The codebase already uses EventBus.** The EventBus was the primary inter-service communication mechanism. The prior inconsistency (mixing CallbackRegistry with EventBus) was explicitly flagged as a problem to fix. We unified on EventBus.\n+\n+2. **Loose coupling.** Domain services (OrderService, UserService) emit events without knowing who listens. Adding a new notification channel (SMS, webhook) requires zero changes to existing services — just register a new adapter.\n+\n+3. **Extensibility for 11+ developers.** With 11 more developers building on this foundation, a single extension point (implement `NotificationAdapter`, register it) is far easier to coordinate than modifying shared service call chains.\n+\n+4. **Observability.** EventBus maintains an event log. Every domain event and every notification lifecycle event (sent, failed) is recorded, enabling audit trails, debugging, and testing.\n+\n+5. **Async-first.** EventBus handlers are async, which matches the reality of notification delivery (network I/O to SMTP, SMS gateways, webhooks).\n+\n+### Architecture Overview\n+\n+```\n+┌─────────────────┐     emit()      ┌──────────┐     on()     ┌─────────────────────┐\n+│  OrderService    │ ──────────────► │          │ ────────────► │                     │\n+│  UserService     │   domain events │ EventBus │              │ NotificationService │\n+│  (any service)   │                 │          │ ◄──────────── │                     │\n+└─────────────────┘                  └──────────┘   emit()     └──────────┬──────────┘\n+                                                  lifecycle events        │\n+                                                                         │ dispatch by channel\n+                                                                         ▼\n+                                                              ┌─────────────────────┐\n+                                                              │  Adapter Registry    │\n+                                                              │                     │\n+                                                              │  email → EmailAdapter│\n+                                                              │  sms   → SmsAdapter │\n+                                                              │  ...   → ...        │\n+                                                              └─────────────────────┘\n+```\n+\n+### Flow\n+\n+1. A domain service performs a business action and calls `eventBus.emit({ type: 'order:created', ... })`.\n+2. `NotificationService` has subscribed to `'order:created'` via `eventBus.on()`.\n+3. The handler maps the domain event to a `CreateNotificationInput` (choosing type, recipient, subject, body, channel, priority).\n+4. `NotificationService.send()` looks up the registered `NotificationAdapter` for the specified channel.\n+5. The adapter's `send()` method attempts delivery and returns a `NotificationResult`.\n+6. A `NotificationRecord` is stored with the delivery status.\n+7. A lifecycle event (`notification:sent` or `notification:failed`) is emitted back to EventBus.\n+\n+### Constraints (MUST follow)\n+\n+1. **All cross-service communication MUST go through EventBus.** Do NOT use `CallbackRegistry`, direct function calls between services, or shared mutable state. The `CallbackRegistry` still exists in `/src/utils/` for backward compatibility but MUST NOT be used for new features.\n+\n+2. **All notification delivery adapters MUST implement `NotificationAdapter`.** This interface is defined in `/src/adapters/notification.adapter.ts`. It requires:\n+   - A `readonly channel` property matching a `NotificationChannel` value.\n+   - An async `send(payload)` method returning a `NotificationResult`.\n+\n+3. **Adapters MUST NOT throw from `send()`.** Return `{ success: false, failureReason: '...' }` instead. The `NotificationService` has a safety catch, but adapters should handle their own errors.\n+\n+4. **One adapter per channel.** Registering a second adapter for the same channel replaces the first. If you need multiple providers for the same channel (e.g., failover), implement that inside a single adapter.\n+\n+5. **All notifications go through `NotificationService.send()`.** Do not bypass it to call adapters directly. The service handles record-keeping and lifecycle events.\n+\n+6. **Notification types must be declared.** Add new values to the `NotificationType` union in `/src/models/notification.ts` when adding new notification-worthy events.\n+\n+### Type Reference\n+\n+| Type | Location | Purpose |\n+|------|----------|---------|\n+| `NotificationType` | `src/models/notification.ts` | What happened (e.g., `'order_confirmation'`) |\n+| `NotificationChannel` | `src/models/notification.ts` | How to deliver (e.g., `'email'`, `'sms'`) |\n+| `NotificationPriority` | `src/models/notification.ts` | Urgency level (`'low'` to `'urgent'`) |\n+| `NotificationStatus` | `src/models/notification.ts` | Delivery state (`'pending'`, `'sent'`, `'failed'`) |\n+| `NotificationPayload` | `src/models/notification.ts` | What's passed to adapters |\n+| `NotificationRecord` | `src/models/notification.ts` | What's stored (includes status) |\n+| `NotificationResult` | `src/models/notification.ts` | What adapters return |\n+| `CreateNotificationInput` | `src/models/notification.ts` | Convenience input for `send()` |\n+| `NotificationAdapter` | `src/adapters/notification.adapter.ts` | Interface for all adapters |\n+| `NotificationSentEvent` | `src/events/event-types.ts` | Lifecycle event on success |\n+| `NotificationFailedEvent` | `src/events/event-types.ts` | Lifecycle event on failure |\n+\n+### How to Add a New Notification Channel\n+\n+1. Create `src/adapters/<channel>.adapter.ts` implementing `NotificationAdapter`.\n+2. Add any channel-specific config interface.\n+3. Register the adapter: `notificationService.registerAdapter(new MyAdapter(config))`.\n+4. Export from `src/index.ts`.\n+5. Add tests in `tests/adapters/<channel>.adapter.test.ts`.\n+\n+### How to Add a New Notification-Worthy Event\n+\n+1. Define the event interface in `src/events/event-types.ts`.\n+2. Add it to the `AppEvent` union type.\n+3. Add a corresponding `NotificationType` value in `src/models/notification.ts`.\n+4. Add an event handler in `NotificationService.registerEventHandlers()`.\n+5. Emit the event from the relevant domain service via `eventBus.emit()`.\n+\n+### What Changed from the Previous Architecture\n+\n+- **Unified on EventBus.** Previously, `OrderService.updateOrderStatus()` used `CallbackRegistry` (direct callbacks) while `OrderService.createOrder()` used `EventBus`. Now both use `EventBus`.\n+- **Adapter pattern for delivery.** Previously, `NotificationService` stored notifications in-memory directly. Now it dispatches to registered adapters, with `EmailAdapter` as the first implementation.\n+- **Richer notification model.** The old `Notification` interface had 5 fields. The new `NotificationRecord` has 12 fields including type, channel, status, priority, and metadata.\n+- **Lifecycle events.** `notification:sent` and `notification:failed` events are now emitted, enabling observability and downstream reactions.\n",
+      "linesAdded": 103,
+      "linesRemoved": 0,
+      "path": "ARCHITECTURE.md"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/CLAUDE.md b/CLAUDE.md\nnew file mode 100644\nindex 0000000..1ec5eb7\n--- /dev/null\n+++ b/CLAUDE.md\n@@ -0,0 +1,34 @@\n+# Project Guidelines\n+\n+## Architecture\n+- This project follows the repository pattern for data access\n+- Services depend on repositories, never on each other directly\n+- Events are preferred over direct cross-service calls for decoupling\n+- All business logic lives in the service layer\n+\n+## Coding Conventions\n+- Use TypeScript strict mode — no `any` types\n+- All public methods must have JSDoc comments\n+- Use dependency injection via constructor parameters\n+- Error handling: throw typed errors, never return null for errors\n+- Prefer async/await over raw Promises\n+\n+## Testing\n+- Tests use vitest\n+- Each module has a corresponding test file in tests/\n+- Mock external dependencies, test business logic directly\n+- Minimum: test the happy path and one error path per public method\n+\n+## File Organization\n+- src/models/ — Data models and interfaces\n+- src/repositories/ — Data access layer (implements repository interfaces)\n+- src/services/ — Business logic layer\n+- src/events/ — Event definitions and event bus\n+- src/utils/ — Shared utilities (database, logger, pagination)\n+- src/config/ — Configuration files\n+- tests/ — Test files mirroring src/ structure\n+\n+## Git Practices\n+- Commit atomically per logical change\n+- Write descriptive commit messages explaining the \"why\"\n+- Run tests before committing\n",
+      "linesAdded": 34,
+      "linesRemoved": 0,
+      "path": "CLAUDE.md"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts\nnew file mode 100644\nindex 0000000..0f3ecf3\n--- /dev/null\n+++ b/src/adapters/email.adapter.ts\n@@ -0,0 +1,159 @@\n+/**\n+ * Email notification adapter — delivers notifications via email.\n+ *\n+ * This is a stub implementation that logs email delivery instead of\n+ * actually sending. In production, replace the `deliverEmail` method\n+ * with a real SMTP client or email API integration (e.g., SendGrid, SES).\n+ *\n+ * Implements the NotificationAdapter interface. Registered with the\n+ * NotificationService to handle all notifications on the 'email' channel.\n+ *\n+ * Configuration is injected via constructor to support different\n+ * environments (dev, staging, production).\n+ */\n+\n+import type { NotificationAdapter } from './notification.adapter.js';\n+import type {\n+  NotificationChannel,\n+  NotificationPayload,\n+  NotificationResult,\n+} from '../models/notification.js';\n+import { Logger } from '../utils/logger.js';\n+\n+/**\n+ * Configuration for the email adapter.\n+ */\n+export interface EmailAdapterConfig {\n+  /** SMTP host or email API endpoint. */\n+  host: string;\n+  /** SMTP port (e.g., 587 for TLS). */\n+  port: number;\n+  /** Sender email address for the \"From\" field. */\n+  fromAddress: string;\n+  /** Whether this is a stub (logs instead of sending). */\n+  stubMode: boolean;\n+}\n+\n+/**\n+ * Default configuration for development/testing.\n+ */\n+export const defaultEmailConfig: EmailAdapterConfig = {\n+  host: 'localhost',\n+  port: 587,\n+  fromAddress: 'noreply@taskflow.dev',\n+  stubMode: true,\n+};\n+\n+/**\n+ * Email notification adapter.\n+ *\n+ * Sends notifications via email. In stub mode (default), logs the\n+ * email details instead of actually delivering.\n+ */\n+export class EmailAdapter implements NotificationAdapter {\n+  readonly channel: NotificationChannel = 'email';\n+\n+  private logger = new Logger('EmailAdapter');\n+  private config: EmailAdapterConfig;\n+  private sentEmails: Array<{\n+    to: string;\n+    from: string;\n+    subject: string;\n+    body: string;\n+    sentAt: Date;\n+  }> = [];\n+\n+  constructor(config?: Partial<EmailAdapterConfig>) {\n+    this.config = { ...defaultEmailConfig, ...config };\n+  }\n+\n+  /**\n+   * Send a notification via email.\n+   *\n+   * In stub mode, logs the email and records it in memory.\n+   * In production mode, would delegate to an SMTP client.\n+   *\n+   * @param payload - The notification payload to deliver via email.\n+   * @returns Result indicating success or failure. Never throws.\n+   */\n+  async send(payload: NotificationPayload): Promise<NotificationResult> {\n+    const result: NotificationResult = {\n+      success: false,\n+      notificationId: '',\n+      channel: 'email',\n+    };\n+\n+    try {\n+      if (this.config.stubMode) {\n+        // Stub mode: log instead of sending\n+        this.logger.info(\n+          `[STUB] Email to ${payload.recipient}: \"${payload.subject}\"`,\n+        );\n+        this.sentEmails.push({\n+          to: payload.recipient,\n+          from: this.config.fromAddress,\n+          subject: payload.subject,\n+          body: payload.body,\n+          sentAt: new Date(),\n+        });\n+      } else {\n+        // Production mode: delegate to real email delivery\n+        await this.deliverEmail(payload);\n+      }\n+\n+      result.success = true;\n+      this.logger.info(`Email sent to ${payload.recipient}`);\n+    } catch (error) {\n+      const message = error instanceof Error ? error.message : 'Unknown email delivery error';\n+      result.success = false;\n+      result.failureReason = message;\n+      this.logger.error(`Email delivery failed for ${payload.recipient}: ${message}`);\n+    }\n+\n+    return result;\n+  }\n+\n+  /**\n+   * Get all emails sent in stub mode. Useful for testing.\n+   */\n+  getSentEmails(): Array<{\n+    to: string;\n+    from: string;\n+    subject: string;\n+    body: string;\n+    sentAt: Date;\n+  }> {\n+    return [...this.sentEmails];\n+  }\n+\n+  /**\n+   * Clear sent email records. Useful for testing.\n+   */\n+  clearSentEmails(): void {\n+    this.sentEmails = [];\n+  }\n+\n+  /**\n+   * Get the current adapter configuration.\n+   */\n+  getConfig(): Readonly<EmailAdapterConfig> {\n+    return { ...this.config };\n+  }\n+\n+  /**\n+   * Real email delivery — override in production or replace with actual SMTP/API.\n+   *\n+   * @param _payload - The notification payload (unused in stub).\n+   * @throws Error if delivery fails.\n+   */\n+  private async deliverEmail(_payload: NotificationPayload): Promise<void> {\n+    // TODO: Replace with real SMTP client or email API integration.\n+    // Example integrations:\n+    //   - nodemailer for SMTP\n+    //   - @sendgrid/mail for SendGrid\n+    //   - @aws-sdk/client-ses for Amazon SES\n+    throw new Error(\n+      'Real email delivery not implemented. Set stubMode: true for development.',\n+    );\n+  }\n+}\n",
+      "linesAdded": 159,
+      "linesRemoved": 0,
+      "path": "src/adapters/email.adapter.ts"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/src/adapters/notification.adapter.ts b/src/adapters/notification.adapter.ts\nnew file mode 100644\nindex 0000000..2ff9a89\n--- /dev/null\n+++ b/src/adapters/notification.adapter.ts\n@@ -0,0 +1,47 @@\n+/**\n+ * Base interface for all notification adapters.\n+ *\n+ * CONSTRAINT: Every notification delivery channel (email, SMS, webhook, in-app)\n+ * MUST implement this interface. The NotificationService dispatches payloads\n+ * to adapters based on the `channel` property.\n+ *\n+ * Adapter contract:\n+ * 1. `channel` must match exactly one NotificationChannel value.\n+ * 2. `send()` must be async and return a NotificationResult.\n+ * 3. `send()` must NOT throw — return { success: false, failureReason } instead.\n+ * 4. Adapters are stateless; they do not store notifications.\n+ * 5. Adapters receive their configuration via constructor injection.\n+ *\n+ * Example implementation:\n+ * ```typescript\n+ * class EmailAdapter implements NotificationAdapter {\n+ *   readonly channel: NotificationChannel = 'email';\n+ *   async send(payload: NotificationPayload): Promise<NotificationResult> {\n+ *     // ... send email ...\n+ *     return { success: true, notificationId: payload.subject, channel: 'email' };\n+ *   }\n+ * }\n+ * ```\n+ */\n+\n+import type {\n+  NotificationChannel,\n+  NotificationPayload,\n+  NotificationResult,\n+} from '../models/notification.js';\n+\n+/**\n+ * Interface that all notification delivery adapters must implement.\n+ */\n+export interface NotificationAdapter {\n+  /** The delivery channel this adapter handles. Must be unique per adapter. */\n+  readonly channel: NotificationChannel;\n+\n+  /**\n+   * Attempt to deliver a notification.\n+   *\n+   * @param payload - The notification payload to deliver.\n+   * @returns A result indicating success or failure. Must not throw.\n+   */\n+  send(payload: NotificationPayload): Promise<NotificationResult>;\n+}\n",
+      "linesAdded": 47,
+      "linesRemoved": 0,
+      "path": "src/adapters/notification.adapter.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/events/event-types.ts b/src/events/event-types.ts\nindex a05083e..da17759 100644\n--- a/src/events/event-types.ts\n+++ b/src/events/event-types.ts\n@@ -4,10 +4,21 @@\n  * This application uses an event bus for decoupled communication between\n  * modules. Services emit events when significant actions occur, and\n  * interested listeners handle them independently.\n+ *\n+ * Event categories:\n+ * - order:*  — Order lifecycle events (emitted by OrderService)\n+ * - user:*   — User lifecycle events (emitted by UserService)\n+ * - notification:* — Notification delivery events (emitted by NotificationService)\n+ *\n+ * ALL cross-service communication MUST go through the EventBus.\n+ * Do not use direct callbacks or shared mutable state between services.\n  */\n \n import type { Order } from '../models/order.js';\n import type { User } from '../models/user.js';\n+import type { NotificationRecord } from '../models/notification.js';\n+\n+// --- Order Events ---\n \n export interface OrderCreatedEvent {\n   type: 'order:created';\n@@ -24,6 +35,8 @@ export interface OrderStatusChangedEvent {\n   timestamp: Date;\n }\n \n+// --- User Events ---\n+\n export interface UserCreatedEvent {\n   type: 'user:created';\n   user: User;\n@@ -37,10 +50,29 @@ export interface UserUpdatedEvent {\n   timestamp: Date;\n }\n \n+// --- Notification Lifecycle Events ---\n+\n+export interface NotificationSentEvent {\n+  type: 'notification:sent';\n+  notification: NotificationRecord;\n+  timestamp: Date;\n+}\n+\n+export interface NotificationFailedEvent {\n+  type: 'notification:failed';\n+  notification: NotificationRecord;\n+  reason: string;\n+  timestamp: Date;\n+}\n+\n+// --- Union Types ---\n+\n export type AppEvent =\n   | OrderCreatedEvent\n   | OrderStatusChangedEvent\n   | UserCreatedEvent\n-  | UserUpdatedEvent;\n+  | UserUpdatedEvent\n+  | NotificationSentEvent\n+  | NotificationFailedEvent;\n \n export type EventType = AppEvent['type'];\n",
+      "linesAdded": 33,
+      "linesRemoved": 1,
+      "path": "src/events/event-types.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/index.ts b/src/index.ts\nindex c41a761..e00d646 100644\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -2,14 +2,17 @@\n  * TaskFlow Pro — A task and order management system.\n  *\n  * Architecture:\n- * - Service Layer: UserService, OrderService (business logic)\n+ * - Service Layer: UserService, OrderService, NotificationService (business logic)\n  * - Repository Layer: UserRepository, OrderRepository (data access via Repository pattern)\n+ * - Adapter Layer: EmailAdapter (notification delivery via Adapter pattern)\n  * - Utility Layer: Database, Logger, Pagination (infrastructure)\n  * - Event System: EventBus with typed events (decoupled communication)\n  *\n  * Key architectural decisions:\n  * 1. Repository pattern for all data access (no direct DB calls from services)\n- * 2. Event-driven notifications (services emit events, listeners handle side effects)\n+ * 2. Event-driven notifications: ALL cross-service communication flows through EventBus\n+ * 3. Adapter pattern for notification delivery: each channel has an adapter\n+ * 4. Services emit events; NotificationService listens and dispatches to adapters\n  */\n \n // Models\n@@ -21,6 +24,16 @@ export type {\n   CreateOrderInput,\n } from './models/order.js';\n export { calculateOrderTotal } from './models/order.js';\n+export type {\n+  NotificationType,\n+  NotificationChannel,\n+  NotificationPriority,\n+  NotificationStatus,\n+  NotificationPayload,\n+  NotificationRecord,\n+  NotificationResult,\n+  CreateNotificationInput,\n+} from './models/notification.js';\n \n // Utilities\n export { Database, getDatabase, resetDatabase } from './utils/database.js';\n@@ -42,8 +55,15 @@ export type {\n   OrderStatusChangedEvent,\n   UserCreatedEvent,\n   UserUpdatedEvent,\n+  NotificationSentEvent,\n+  NotificationFailedEvent,\n } from './events/event-types.js';\n \n+// Adapters\n+export type { NotificationAdapter } from './adapters/notification.adapter.js';\n+export { EmailAdapter, defaultEmailConfig } from './adapters/email.adapter.js';\n+export type { EmailAdapterConfig } from './adapters/email.adapter.js';\n+\n // Services\n export { UserService } from './services/user.service.js';\n export { OrderService } from './services/order.service.js';\n",
+      "linesAdded": 22,
+      "linesRemoved": 2,
+      "path": "src/index.ts"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/src/models/notification.ts b/src/models/notification.ts\nnew file mode 100644\nindex 0000000..59a6ac8\n--- /dev/null\n+++ b/src/models/notification.ts\n@@ -0,0 +1,123 @@\n+/**\n+ * Notification model — core types for the notification system.\n+ *\n+ * Architecture: All notifications flow through the EventBus. When a domain\n+ * event occurs (e.g., order:created), the NotificationService listens for it,\n+ * constructs a NotificationPayload, and dispatches it to the appropriate\n+ * NotificationAdapter(s) based on channel.\n+ *\n+ * Type hierarchy:\n+ * - NotificationType: What happened (e.g., order_confirmation)\n+ * - NotificationChannel: How to deliver (e.g., email, sms)\n+ * - NotificationPayload: What to send (constructed by NotificationService)\n+ * - NotificationRecord: What's stored (includes delivery status)\n+ * - NotificationResult: What adapters return (success/failure)\n+ */\n+\n+/**\n+ * The kind of notification being sent. Maps to a domain event.\n+ * Extend this union as new notification-worthy events are added.\n+ */\n+export type NotificationType =\n+  | 'order_confirmation'\n+  | 'order_status_update'\n+  | 'welcome'\n+  | 'account_updated';\n+\n+/**\n+ * Delivery channel for a notification.\n+ * Each channel has a corresponding adapter that implements NotificationAdapter.\n+ */\n+export type NotificationChannel = 'email' | 'sms' | 'webhook' | 'in_app';\n+\n+/**\n+ * Priority level for notification delivery.\n+ * Adapters may use this to determine delivery urgency.\n+ */\n+export type NotificationPriority = 'low' | 'normal' | 'high' | 'urgent';\n+\n+/**\n+ * Delivery status of a notification.\n+ */\n+export type NotificationStatus = 'pending' | 'sent' | 'failed';\n+\n+/**\n+ * Payload describing a notification to be sent.\n+ * Constructed by the NotificationService from domain events,\n+ * then passed to adapters for delivery.\n+ */\n+export interface NotificationPayload {\n+  /** What kind of notification this is. */\n+  type: NotificationType;\n+  /** Who receives the notification (email, phone, user ID, etc.). */\n+  recipient: string;\n+  /** Subject line or title. */\n+  subject: string;\n+  /** Notification body content. */\n+  body: string;\n+  /** Which channel to deliver through. */\n+  channel: NotificationChannel;\n+  /** Delivery priority. Defaults to 'normal' if omitted. */\n+  priority: NotificationPriority;\n+  /** Optional key-value metadata for adapter-specific data. */\n+  metadata?: Record<string, unknown>;\n+}\n+\n+/**\n+ * A stored notification record with delivery status tracking.\n+ * Created by NotificationService after dispatching to an adapter.\n+ */\n+export interface NotificationRecord {\n+  /** Unique notification ID (e.g., notif-0001). */\n+  id: string;\n+  /** The notification type. */\n+  type: NotificationType;\n+  /** The delivery channel used. */\n+  channel: NotificationChannel;\n+  /** Recipient identifier. */\n+  recipient: string;\n+  /** Subject line. */\n+  subject: string;\n+  /** Body content. */\n+  body: string;\n+  /** Current delivery status. */\n+  status: NotificationStatus;\n+  /** Delivery priority. */\n+  priority: NotificationPriority;\n+  /** Optional metadata carried from the payload. */\n+  metadata?: Record<string, unknown>;\n+  /** When the notification record was created. */\n+  createdAt: Date;\n+  /** When the notification was successfully sent (if status is 'sent'). */\n+  sentAt?: Date;\n+  /** Reason for failure (if status is 'failed'). */\n+  failureReason?: string;\n+}\n+\n+/**\n+ * Result returned by a NotificationAdapter after attempting delivery.\n+ */\n+export interface NotificationResult {\n+  /** Whether delivery succeeded. */\n+  success: boolean;\n+  /** The notification ID this result pertains to. */\n+  notificationId: string;\n+  /** The channel that attempted delivery. */\n+  channel: NotificationChannel;\n+  /** Reason for failure, if success is false. */\n+  failureReason?: string;\n+}\n+\n+/**\n+ * Input for creating a notification payload.\n+ * Used by event handlers to build payloads without specifying all fields.\n+ */\n+export interface CreateNotificationInput {\n+  type: NotificationType;\n+  recipient: string;\n+  subject: string;\n+  body: string;\n+  channel?: NotificationChannel;\n+  priority?: NotificationPriority;\n+  metadata?: Record<string, unknown>;\n+}\n",
+      "linesAdded": 123,
+      "linesRemoved": 0,
+      "path": "src/models/notification.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts\nindex 836fb4e..eabe836 100644\n--- a/src/services/notification.service.ts\n+++ b/src/services/notification.service.ts\n@@ -1,143 +1,352 @@\n /**\n- * Notification service — handles sending notifications in response to events.\n+ * Notification service — orchestrates notification delivery in response to domain events.\n  *\n- * NOTE: This service currently uses TWO different patterns for receiving\n- * notifications, which is inconsistent and should be unified:\n+ * ARCHITECTURE DECISION: Event-Driven with Adapter Dispatch\n+ * =========================================================\n+ * This service uses the EventBus exclusively for receiving domain events.\n+ * ALL cross-service communication flows through EventBus — no direct callbacks,\n+ * no shared mutable state, no CallbackRegistry.\n  *\n- * 1. EventBus subscriptions (event-driven) — used for order:created events\n- * 2. CallbackRegistry (direct callbacks) — used for order:status-changed events\n+ * Flow:\n+ * 1. A domain service (OrderService, UserService) emits an event via EventBus.\n+ * 2. NotificationService listens for relevant events.\n+ * 3. Event handlers map domain events → NotificationPayload(s).\n+ * 4. Payloads are dispatched to the appropriate NotificationAdapter by channel.\n+ * 5. Delivery results are recorded as NotificationRecords.\n+ * 6. notification:sent / notification:failed events are emitted for observability.\n  *\n- * Both approaches work but the mixed usage makes the codebase harder to\n- * maintain. A future refactor should pick ONE approach and use it consistently.\n+ * CONSTRAINTS:\n+ * - All adapters MUST implement the NotificationAdapter interface.\n+ * - All domain events MUST flow through EventBus.emit().\n+ * - Adapters MUST NOT throw from send() — return { success: false } instead.\n+ * - This service owns the notification lifecycle; adapters own delivery mechanics.\n  *\n  * Depends on:\n- * - EventBus (event system) for receiving some events\n- * - CallbackRegistry (direct callbacks) for other events\n+ * - EventBus (event system) for receiving ALL domain events\n+ * - NotificationAdapter implementations for delivery\n  */\n \n import type { EventBus } from '../events/event-bus.js';\n-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';\n-import { statusChangeCallbacks } from '../utils/callback-registry.js';\n+import type {\n+  OrderCreatedEvent,\n+  OrderStatusChangedEvent,\n+  UserCreatedEvent,\n+  UserUpdatedEvent,\n+} from '../events/event-types.js';\n+import type { NotificationAdapter } from '../adapters/notification.adapter.js';\n+import type {\n+  NotificationChannel,\n+  NotificationPayload,\n+  NotificationRecord,\n+  NotificationResult,\n+  CreateNotificationInput,\n+} from '../models/notification.js';\n import { Logger } from '../utils/logger.js';\n \n-export interface Notification {\n-  id: string;\n-  recipient: string;\n-  subject: string;\n-  body: string;\n-  sentAt: Date;\n-}\n-\n let nextId = 1;\n \n function generateNotificationId(): string {\n   return `notif-${String(nextId++).padStart(4, '0')}`;\n }\n \n+/** Reset the ID counter. Used in tests. */\n export function resetNotificationIdCounter(): void {\n   nextId = 1;\n }\n \n export class NotificationService {\n   private logger = new Logger('NotificationService');\n-  private notifications: Notification[] = [];\n+  private notifications: NotificationRecord[] = [];\n+  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n \n   constructor(private eventBus: EventBus) {\n-    this.registerHandlers();\n+    this.registerEventHandlers();\n+  }\n+\n+  // ---------------------------------------------------------------------------\n+  // Adapter Registration\n+  // ---------------------------------------------------------------------------\n+\n+  /**\n+   * Register a notification adapter for a delivery channel.\n+   *\n+   * Only one adapter per channel is allowed. Registering a second adapter\n+   * for the same channel replaces the previous one.\n+   *\n+   * @param adapter - The adapter to register. Must implement NotificationAdapter.\n+   */\n+  registerAdapter(adapter: NotificationAdapter): void {\n+    this.logger.info(`Registering adapter for channel: ${adapter.channel}`);\n+    this.adapters.set(adapter.channel, adapter);\n+  }\n+\n+  /**\n+   * Unregister the adapter for a delivery channel.\n+   *\n+   * @param channel - The channel whose adapter to remove.\n+   * @returns true if an adapter was removed, false if none was registered.\n+   */\n+  unregisterAdapter(channel: NotificationChannel): boolean {\n+    this.logger.info(`Unregistering adapter for channel: ${channel}`);\n+    return this.adapters.delete(channel);\n+  }\n+\n+  /**\n+   * Get all registered adapter channels.\n+   */\n+  getRegisteredChannels(): NotificationChannel[] {\n+    return Array.from(this.adapters.keys());\n   }\n \n+  // ---------------------------------------------------------------------------\n+  // Notification Dispatch\n+  // ---------------------------------------------------------------------------\n+\n   /**\n-   * Register event handlers for notification triggers.\n+   * Send a notification through the appropriate adapter.\n+   *\n+   * This is the core dispatch method. It:\n+   * 1. Builds a NotificationRecord from the input.\n+   * 2. Looks up the adapter for the specified channel.\n+   * 3. Calls adapter.send() and records the result.\n+   * 4. Emits notification:sent or notification:failed events.\n    *\n-   * Uses EventBus for order creation (event-driven pattern)\n-   * and CallbackRegistry for status changes (direct callback pattern).\n+   * @param input - Notification details. Channel defaults to 'email'.\n+   * @returns The created NotificationRecord with delivery status.\n    */\n-  private registerHandlers(): void {\n-    // Pattern 1: EventBus subscription for order creation\n+  async send(input: CreateNotificationInput): Promise<NotificationRecord> {\n+    const channel = input.channel ?? 'email';\n+    const priority = input.priority ?? 'normal';\n+\n+    const payload: NotificationPayload = {\n+      type: input.type,\n+      recipient: input.recipient,\n+      subject: input.subject,\n+      body: input.body,\n+      channel,\n+      priority,\n+      metadata: input.metadata,\n+    };\n+\n+    const record: NotificationRecord = {\n+      id: generateNotificationId(),\n+      type: input.type,\n+      channel,\n+      recipient: input.recipient,\n+      subject: input.subject,\n+      body: input.body,\n+      status: 'pending',\n+      priority,\n+      metadata: input.metadata,\n+      createdAt: new Date(),\n+    };\n+\n+    const adapter = this.adapters.get(channel);\n+    if (!adapter) {\n+      record.status = 'failed';\n+      record.failureReason = `No adapter registered for channel: ${channel}`;\n+      this.logger.warn(record.failureReason);\n+      this.notifications.push(record);\n+\n+      await this.eventBus.emit({\n+        type: 'notification:failed',\n+        notification: record,\n+        reason: record.failureReason,\n+        timestamp: new Date(),\n+      });\n+\n+      return record;\n+    }\n+\n+    // Dispatch to the adapter\n+    let result: NotificationResult;\n+    try {\n+      result = await adapter.send(payload);\n+    } catch (error) {\n+      // Adapters should not throw, but handle it gracefully if they do\n+      const reason = error instanceof Error ? error.message : 'Unknown adapter error';\n+      result = {\n+        success: false,\n+        notificationId: record.id,\n+        channel,\n+        failureReason: reason,\n+      };\n+    }\n+\n+    // Update record based on result\n+    result.notificationId = record.id;\n+    if (result.success) {\n+      record.status = 'sent';\n+      record.sentAt = new Date();\n+    } else {\n+      record.status = 'failed';\n+      record.failureReason = result.failureReason;\n+    }\n+\n+    this.notifications.push(record);\n+\n+    // Emit lifecycle event\n+    if (record.status === 'sent') {\n+      await this.eventBus.emit({\n+        type: 'notification:sent',\n+        notification: record,\n+        timestamp: new Date(),\n+      });\n+    } else {\n+      await this.eventBus.emit({\n+        type: 'notification:failed',\n+        notification: record,\n+        reason: record.failureReason ?? 'Unknown error',\n+        timestamp: new Date(),\n+      });\n+    }\n+\n+    this.logger.info(\n+      `Notification ${record.id} ${record.status} via ${channel} to ${record.recipient}`,\n+    );\n+\n+    return record;\n+  }\n+\n+  // ---------------------------------------------------------------------------\n+  // Event Handlers — Map domain events to notifications\n+  // ---------------------------------------------------------------------------\n+\n+  /**\n+   * Register event handlers for all notification-worthy domain events.\n+   *\n+   * IMPORTANT: ALL event subscriptions go through EventBus.on().\n+   * Do NOT use CallbackRegistry or direct callbacks.\n+   */\n+  private registerEventHandlers(): void {\n     this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {\n-      this.handleOrderCreated(event);\n+      return this.handleOrderCreated(event);\n     });\n \n-    // Pattern 2: CallbackRegistry for status changes\n-    statusChangeCallbacks.register((event) => {\n-      this.handleOrderStatusChanged(event);\n+    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {\n+      return this.handleOrderStatusChanged(event);\n+    });\n+\n+    this.eventBus.on<UserCreatedEvent>('user:created', (event) => {\n+      return this.handleUserCreated(event);\n+    });\n+\n+    this.eventBus.on<UserUpdatedEvent>('user:updated', (event) => {\n+      return this.handleUserUpdated(event);\n     });\n   }\n \n   /**\n-   * Handle order created event — send confirmation to user.\n+   * Handle order created — send confirmation email to the ordering user.\n    */\n-  private handleOrderCreated(event: OrderCreatedEvent): void {\n-    this.logger.info(`Sending order confirmation for order ${event.order.id}`);\n+  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {\n+    this.logger.info(`Handling order:created for order ${event.order.id}`);\n \n     const itemSummary = event.order.items\n       .map((item) => `${item.name} x${item.quantity}`)\n       .join(', ');\n \n-    this.sendNotification({\n+    await this.send({\n+      type: 'order_confirmation',\n       recipient: event.user.email,\n       subject: `Order Confirmation: ${event.order.id}`,\n       body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,\n+      channel: 'email',\n+      priority: 'normal',\n     });\n   }\n \n   /**\n-   * Handle order status change — notify user of update.\n+   * Handle order status change — notify user of the update.\n    */\n-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {\n+  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {\n     this.logger.info(\n-      `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,\n+      `Handling order:status-changed for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,\n     );\n \n-    this.sendNotification({\n+    await this.send({\n+      type: 'order_status_update',\n       recipient: event.order.userId,\n       subject: `Order Update: ${event.order.id}`,\n       body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,\n+      channel: 'email',\n+      priority: event.newStatus === 'cancelled' ? 'high' : 'normal',\n     });\n   }\n \n   /**\n-   * Send a notification (in-memory for this demo).\n+   * Handle user created — send welcome notification.\n    */\n-  private sendNotification(params: {\n-    recipient: string;\n-    subject: string;\n-    body: string;\n-  }): void {\n-    const notification: Notification = {\n-      id: generateNotificationId(),\n-      recipient: params.recipient,\n-      subject: params.subject,\n-      body: params.body,\n-      sentAt: new Date(),\n-    };\n-    this.notifications.push(notification);\n-    this.logger.info(`Notification sent: ${notification.id} to ${params.recipient}`);\n+  private async handleUserCreated(event: UserCreatedEvent): Promise<void> {\n+    this.logger.info(`Handling user:created for user ${event.user.id}`);\n+\n+    await this.send({\n+      type: 'welcome',\n+      recipient: event.user.email,\n+      subject: 'Welcome to TaskFlow Pro!',\n+      body: `Hi ${event.user.name}, welcome to TaskFlow Pro. Your account has been created.`,\n+      channel: 'email',\n+      priority: 'normal',\n+    });\n   }\n \n   /**\n-   * Get all sent notifications.\n+   * Handle user updated — notify user of account changes.\n    */\n-  getNotifications(): Notification[] {\n+  private async handleUserUpdated(event: UserUpdatedEvent): Promise<void> {\n+    this.logger.info(`Handling user:updated for user ${event.user.id}`);\n+\n+    await this.send({\n+      type: 'account_updated',\n+      recipient: event.user.email,\n+      subject: 'Account Updated',\n+      body: `Your account has been updated. Changed fields: ${event.changes.join(', ')}.`,\n+      channel: 'email',\n+      priority: 'low',\n+    });\n+  }\n+\n+  // ---------------------------------------------------------------------------\n+  // Notification Queries\n+  // ---------------------------------------------------------------------------\n+\n+  /**\n+   * Get all notification records.\n+   */\n+  getNotifications(): NotificationRecord[] {\n     return [...this.notifications];\n   }\n \n   /**\n    * Get notifications for a specific recipient.\n    */\n-  getNotificationsForRecipient(recipient: string): Notification[] {\n+  getNotificationsForRecipient(recipient: string): NotificationRecord[] {\n     return this.notifications.filter((n) => n.recipient === recipient);\n   }\n \n   /**\n-   * Get the count of sent notifications.\n+   * Get notifications filtered by status.\n+   */\n+  getNotificationsByStatus(status: NotificationRecord['status']): NotificationRecord[] {\n+    return this.notifications.filter((n) => n.status === status);\n+  }\n+\n+  /**\n+   * Get notifications filtered by type.\n+   */\n+  getNotificationsByType(type: NotificationRecord['type']): NotificationRecord[] {\n+    return this.notifications.filter((n) => n.type === type);\n+  }\n+\n+  /**\n+   * Get the total count of notification records.\n    */\n   getNotificationCount(): number {\n     return this.notifications.length;\n   }\n \n   /**\n-   * Clear all notifications (useful for testing).\n+   * Clear all notification records. Useful for testing.\n    */\n   clearNotifications(): void {\n     this.notifications = [];\n",
+      "linesAdded": 267,
+      "linesRemoved": 58,
+      "path": "src/services/notification.service.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/services/order.service.ts b/src/services/order.service.ts\nindex 4ff339f..ff03f4f 100644\n--- a/src/services/order.service.ts\n+++ b/src/services/order.service.ts\n@@ -6,10 +6,10 @@\n  * - UserRepository (data layer) for user validation\n  * - EventBus (event system) for publishing order lifecycle events\n  *\n- * Architecture note: Order events are used to trigger side effects\n- * (notifications, analytics, etc.) without direct coupling.\n- * The OrderService emits events; it does not directly call\n- * the NotificationService.\n+ * Architecture note: ALL order events are emitted via EventBus for\n+ * decoupled communication. This includes both order creation and\n+ * status changes. The OrderService emits events; it does not directly\n+ * call the NotificationService or use CallbackRegistry.\n  */\n \n import type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';\n@@ -17,7 +17,6 @@ import { calculateOrderTotal } from '../models/order.js';\n import type { OrderRepository } from '../repositories/order.repository.js';\n import type { UserRepository } from '../repositories/user.repository.js';\n import type { EventBus } from '../events/event-bus.js';\n-import { statusChangeCallbacks } from '../utils/callback-registry.js';\n import { Logger } from '../utils/logger.js';\n \n let nextId = 1;\n@@ -112,10 +111,8 @@ export class OrderService {\n       updatedAt: new Date(),\n     });\n \n-    // NOTE: Status changes use CallbackRegistry (direct callbacks) rather than\n-    // EventBus. This is inconsistent with order creation which uses EventBus.\n-    // See notification.service.ts for the mixed pattern discussion.\n-    statusChangeCallbacks.notify({\n+    // Emit status change via EventBus — consistent with all other events\n+    await this.eventBus.emit({\n       type: 'order:status-changed',\n       order: updated,\n       previousStatus,\n",
+      "linesAdded": 6,
+      "linesRemoved": 9,
+      "path": "src/services/order.service.ts"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts\nnew file mode 100644\nindex 0000000..c37b991\n--- /dev/null\n+++ b/tests/adapters/email.adapter.test.ts\n@@ -0,0 +1,86 @@\n+import { describe, it, expect, beforeEach } from 'vitest';\n+import { EmailAdapter } from '../../src/adapters/email.adapter.js';\n+import type { NotificationPayload } from '../../src/models/notification.js';\n+\n+describe('EmailAdapter', () => {\n+  let adapter: EmailAdapter;\n+\n+  const samplePayload: NotificationPayload = {\n+    type: 'order_confirmation',\n+    recipient: 'alice@example.com',\n+    subject: 'Order Confirmation: order-0001',\n+    body: 'Your order has been placed.',\n+    channel: 'email',\n+    priority: 'normal',\n+  };\n+\n+  beforeEach(() => {\n+    adapter = new EmailAdapter({ stubMode: true });\n+  });\n+\n+  describe('send', () => {\n+    it('should succeed in stub mode', async () => {\n+      const result = await adapter.send(samplePayload);\n+\n+      expect(result.success).toBe(true);\n+      expect(result.channel).toBe('email');\n+    });\n+\n+    it('should record sent emails in stub mode', async () => {\n+      await adapter.send(samplePayload);\n+\n+      const sentEmails = adapter.getSentEmails();\n+      expect(sentEmails).toHaveLength(1);\n+      expect(sentEmails[0]?.to).toBe('alice@example.com');\n+      expect(sentEmails[0]?.subject).toBe('Order Confirmation: order-0001');\n+    });\n+\n+    it('should fail in non-stub mode (no real SMTP configured)', async () => {\n+      const productionAdapter = new EmailAdapter({ stubMode: false });\n+      const result = await productionAdapter.send(samplePayload);\n+\n+      expect(result.success).toBe(false);\n+      expect(result.failureReason).toBeDefined();\n+    });\n+  });\n+\n+  describe('configuration', () => {\n+    it('should use default config when none provided', () => {\n+      const defaultAdapter = new EmailAdapter();\n+      const config = defaultAdapter.getConfig();\n+\n+      expect(config.host).toBe('localhost');\n+      expect(config.port).toBe(587);\n+      expect(config.fromAddress).toBe('noreply@taskflow.dev');\n+      expect(config.stubMode).toBe(true);\n+    });\n+\n+    it('should merge custom config with defaults', () => {\n+      const customAdapter = new EmailAdapter({\n+        host: 'smtp.example.com',\n+        fromAddress: 'app@example.com',\n+      });\n+      const config = customAdapter.getConfig();\n+\n+      expect(config.host).toBe('smtp.example.com');\n+      expect(config.fromAddress).toBe('app@example.com');\n+      expect(config.port).toBe(587); // default preserved\n+    });\n+  });\n+\n+  describe('channel property', () => {\n+    it('should report email as its channel', () => {\n+      expect(adapter.channel).toBe('email');\n+    });\n+  });\n+\n+  describe('clearSentEmails', () => {\n+    it('should clear sent email records', async () => {\n+      await adapter.send(samplePayload);\n+      expect(adapter.getSentEmails()).toHaveLength(1);\n+\n+      adapter.clearSentEmails();\n+      expect(adapter.getSentEmails()).toHaveLength(0);\n+    });\n+  });\n+});\n",
+      "linesAdded": 86,
+      "linesRemoved": 0,
+      "path": "tests/adapters/email.adapter.test.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts\nindex ad0020f..e0b939b 100644\n--- a/tests/services/notification.service.test.ts\n+++ b/tests/services/notification.service.test.ts\n@@ -4,17 +4,26 @@ import {\n   NotificationService,\n   resetNotificationIdCounter,\n } from '../../src/services/notification.service.js';\n-import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';\n-import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';\n+import { EmailAdapter } from '../../src/adapters/email.adapter.js';\n+import type {\n+  OrderCreatedEvent,\n+  OrderStatusChangedEvent,\n+  UserCreatedEvent,\n+  UserUpdatedEvent,\n+} from '../../src/events/event-types.js';\n+import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';\n+import type { NotificationPayload, NotificationResult } from '../../src/models/notification.js';\n \n describe('NotificationService', () => {\n   let eventBus: EventBus;\n   let service: NotificationService;\n+  let emailAdapter: EmailAdapter;\n \n   beforeEach(() => {\n     eventBus = new EventBus();\n-    statusChangeCallbacks.clear();\n     service = new NotificationService(eventBus);\n+    emailAdapter = new EmailAdapter({ stubMode: true });\n+    service.registerAdapter(emailAdapter);\n     resetNotificationIdCounter();\n   });\n \n@@ -52,6 +61,9 @@ describe('NotificationService', () => {\n       expect(notifications[0]?.subject).toContain('Order Confirmation');\n       expect(notifications[0]?.body).toContain('Widget x2');\n       expect(notifications[0]?.body).toContain('$20.00');\n+      expect(notifications[0]?.status).toBe('sent');\n+      expect(notifications[0]?.type).toBe('order_confirmation');\n+      expect(notifications[0]?.channel).toBe('email');\n     });\n \n     it('should include all items in notification body', async () => {\n@@ -88,8 +100,8 @@ describe('NotificationService', () => {\n     });\n   });\n \n-  describe('order:status-changed handler', () => {\n-    it('should send notification on status change', () => {\n+  describe('order:status-changed handler (via EventBus)', () => {\n+    it('should send notification on status change via EventBus', async () => {\n       const event: OrderStatusChangedEvent = {\n         type: 'order:status-changed',\n         order: {\n@@ -106,21 +118,172 @@ describe('NotificationService', () => {\n         timestamp: new Date(),\n       };\n \n-      statusChangeCallbacks.notify(event);\n+      await eventBus.emit(event);\n \n       const notifications = service.getNotifications();\n       expect(notifications).toHaveLength(1);\n       expect(notifications[0]?.subject).toContain('Order Update');\n       expect(notifications[0]?.body).toContain('pending');\n       expect(notifications[0]?.body).toContain('confirmed');\n+      expect(notifications[0]?.type).toBe('order_status_update');\n+      expect(notifications[0]?.status).toBe('sent');\n+    });\n+\n+    it('should set high priority for cancelled orders', async () => {\n+      const event: OrderStatusChangedEvent = {\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'cancelled',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'cancelled',\n+        timestamp: new Date(),\n+      };\n+\n+      await eventBus.emit(event);\n+\n+      const notifications = service.getNotifications();\n+      expect(notifications[0]?.priority).toBe('high');\n+    });\n+  });\n+\n+  describe('user event handlers', () => {\n+    it('should send welcome notification on user:created', async () => {\n+      const event: UserCreatedEvent = {\n+        type: 'user:created',\n+        user: {\n+          id: 'user-1',\n+          name: 'Bob',\n+          email: 'bob@example.com',\n+          role: 'member',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        timestamp: new Date(),\n+      };\n+\n+      await eventBus.emit(event);\n+\n+      const notifications = service.getNotifications();\n+      expect(notifications).toHaveLength(1);\n+      expect(notifications[0]?.recipient).toBe('bob@example.com');\n+      expect(notifications[0]?.subject).toContain('Welcome');\n+      expect(notifications[0]?.type).toBe('welcome');\n+    });\n+\n+    it('should send update notification on user:updated', async () => {\n+      const event: UserUpdatedEvent = {\n+        type: 'user:updated',\n+        user: {\n+          id: 'user-1',\n+          name: 'Bob Updated',\n+          email: 'bob@example.com',\n+          role: 'admin',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        changes: ['name', 'role'],\n+        timestamp: new Date(),\n+      };\n+\n+      await eventBus.emit(event);\n+\n+      const notifications = service.getNotifications();\n+      expect(notifications).toHaveLength(1);\n+      expect(notifications[0]?.body).toContain('name');\n+      expect(notifications[0]?.body).toContain('role');\n+      expect(notifications[0]?.type).toBe('account_updated');\n+    });\n+  });\n+\n+  describe('adapter management', () => {\n+    it('should register and list adapters', () => {\n+      const channels = service.getRegisteredChannels();\n+      expect(channels).toContain('email');\n+    });\n+\n+    it('should unregister adapters', () => {\n+      const removed = service.unregisterAdapter('email');\n+      expect(removed).toBe(true);\n+      expect(service.getRegisteredChannels()).not.toContain('email');\n+    });\n+\n+    it('should record failure when no adapter registered', async () => {\n+      service.unregisterAdapter('email');\n+\n+      const event: OrderStatusChangedEvent = {\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      };\n+\n+      await eventBus.emit(event);\n+\n+      const notifications = service.getNotifications();\n+      expect(notifications).toHaveLength(1);\n+      expect(notifications[0]?.status).toBe('failed');\n+      expect(notifications[0]?.failureReason).toContain('No adapter registered');\n+    });\n+\n+    it('should handle adapter send failure gracefully', async () => {\n+      const failingAdapter: NotificationAdapter = {\n+        channel: 'email',\n+        async send(_payload: NotificationPayload): Promise<NotificationResult> {\n+          return {\n+            success: false,\n+            notificationId: '',\n+            channel: 'email',\n+            failureReason: 'SMTP connection refused',\n+          };\n+        },\n+      };\n+      service.registerAdapter(failingAdapter);\n+\n+      const event: OrderStatusChangedEvent = {\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      };\n+\n+      await eventBus.emit(event);\n+\n+      const notifications = service.getNotifications();\n+      expect(notifications[0]?.status).toBe('failed');\n+      expect(notifications[0]?.failureReason).toBe('SMTP connection refused');\n     });\n   });\n \n   describe('notification management', () => {\n-    it('should count notifications', () => {\n+    it('should count notifications', async () => {\n       expect(service.getNotificationCount()).toBe(0);\n \n-      statusChangeCallbacks.notify({\n+      await eventBus.emit({\n         type: 'order:status-changed',\n         order: {\n           id: 'order-1',\n@@ -134,7 +297,7 @@ describe('NotificationService', () => {\n         previousStatus: 'pending',\n         newStatus: 'confirmed',\n         timestamp: new Date(),\n-      });\n+      } satisfies OrderStatusChangedEvent);\n \n       expect(service.getNotificationCount()).toBe(1);\n     });\n@@ -170,8 +333,50 @@ describe('NotificationService', () => {\n       expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);\n     });\n \n-    it('should clear notifications', () => {\n-      statusChangeCallbacks.notify({\n+    it('should filter by status', async () => {\n+      await eventBus.emit({\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      } satisfies OrderStatusChangedEvent);\n+\n+      expect(service.getNotificationsByStatus('sent')).toHaveLength(1);\n+      expect(service.getNotificationsByStatus('failed')).toHaveLength(0);\n+    });\n+\n+    it('should filter by type', async () => {\n+      await eventBus.emit({\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      } satisfies OrderStatusChangedEvent);\n+\n+      expect(service.getNotificationsByType('order_status_update')).toHaveLength(1);\n+      expect(service.getNotificationsByType('order_confirmation')).toHaveLength(0);\n+    });\n+\n+    it('should clear notifications', async () => {\n+      await eventBus.emit({\n         type: 'order:status-changed',\n         order: {\n           id: 'order-1',\n@@ -185,14 +390,14 @@ describe('NotificationService', () => {\n         previousStatus: 'pending',\n         newStatus: 'confirmed',\n         timestamp: new Date(),\n-      });\n+      } satisfies OrderStatusChangedEvent);\n \n       service.clearNotifications();\n       expect(service.getNotificationCount()).toBe(0);\n     });\n \n-    it('should generate sequential notification IDs', () => {\n-      statusChangeCallbacks.notify({\n+    it('should generate sequential notification IDs', async () => {\n+      await eventBus.emit({\n         type: 'order:status-changed',\n         order: {\n           id: 'order-1',\n@@ -206,8 +411,8 @@ describe('NotificationService', () => {\n         previousStatus: 'pending',\n         newStatus: 'confirmed',\n         timestamp: new Date(),\n-      });\n-      statusChangeCallbacks.notify({\n+      } satisfies OrderStatusChangedEvent);\n+      await eventBus.emit({\n         type: 'order:status-changed',\n         order: {\n           id: 'order-2',\n@@ -221,11 +426,59 @@ describe('NotificationService', () => {\n         previousStatus: 'confirmed',\n         newStatus: 'shipped',\n         timestamp: new Date(),\n-      });\n+      } satisfies OrderStatusChangedEvent);\n \n       const notifications = service.getNotifications();\n       expect(notifications[0]?.id).toBe('notif-0001');\n       expect(notifications[1]?.id).toBe('notif-0002');\n     });\n   });\n+\n+  describe('notification lifecycle events', () => {\n+    it('should emit notification:sent event on successful delivery', async () => {\n+      await eventBus.emit({\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      } satisfies OrderStatusChangedEvent);\n+\n+      const events = eventBus.getEventLog();\n+      const sentEvents = events.filter((e) => e.type === 'notification:sent');\n+      expect(sentEvents).toHaveLength(1);\n+    });\n+\n+    it('should emit notification:failed event when no adapter registered', async () => {\n+      service.unregisterAdapter('email');\n+\n+      await eventBus.emit({\n+        type: 'order:status-changed',\n+        order: {\n+          id: 'order-1',\n+          userId: 'user-1',\n+          items: [],\n+          total: 20,\n+          status: 'confirmed',\n+          createdAt: new Date(),\n+          updatedAt: new Date(),\n+        },\n+        previousStatus: 'pending',\n+        newStatus: 'confirmed',\n+        timestamp: new Date(),\n+      } satisfies OrderStatusChangedEvent);\n+\n+      const events = eventBus.getEventLog();\n+      const failedEvents = events.filter((e) => e.type === 'notification:failed');\n+      expect(failedEvents).toHaveLength(1);\n+    });\n+  });\n });\n",
+      "linesAdded": 270,
+      "linesRemoved": 17,
+      "path": "tests/services/notification.service.test.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/tests/services/order.service.test.ts b/tests/services/order.service.test.ts\nindex 87149ce..1d420b2 100644\n--- a/tests/services/order.service.test.ts\n+++ b/tests/services/order.service.test.ts\n@@ -95,7 +95,7 @@ describe('OrderService', () => {\n   });\n \n   describe('updateOrderStatus', () => {\n-    it('should update status and emit event', async () => {\n+    it('should update status and emit event via EventBus', async () => {\n       const order = await service.createOrder({\n         userId: 'user-1',\n         items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n@@ -104,10 +104,11 @@ describe('OrderService', () => {\n       const updated = await service.updateOrderStatus(order.id, 'confirmed');\n       expect(updated.status).toBe('confirmed');\n \n-      // order:created goes through EventBus, status-changed goes through CallbackRegistry\n+      // Both order:created and order:status-changed go through EventBus\n       const events = eventBus.getEventLog();\n-      expect(events).toHaveLength(1); // only created\n+      expect(events).toHaveLength(2);\n       expect(events[0]?.type).toBe('order:created');\n+      expect(events[1]?.type).toBe('order:status-changed');\n     });\n \n     it('should reject invalid status transition', async () => {\n",
+      "linesAdded": 4,
+      "linesRemoved": 3,
+      "path": "tests/services/order.service.test.ts"
+    }
+  ],
+  "numTurns": 47,
+  "prompt": "You are Agent 1 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Design and implement the foundation of a notification system.\n\nSpecifically:\n1. Choose an architecture for notifications: event-driven (EventBus with subscribers) OR direct service calls. Commit to ONE approach.\n2. Define the notification service interface and core types (NotificationType, NotificationPayload, etc.) in src/services/ and src/models/.\n3. Implement the base notification service with the chosen architecture.\n4. Create an email notification adapter in src/adapters/email.adapter.ts (stub is fine, but interface must be real).\n5. Document your architectural decision — the pattern you chose, why, and what constraints it imposes.\n6. Make sure the codebase compiles.\n\nImportant:\n- Pick ONE pattern (event-driven OR direct calls) and commit to it. Do not mix approaches.\n- Define clear interfaces that other developers will implement against.\n- Document constraints: e.g., \"All adapters must implement NotificationAdapter interface\" or \"All notifications must go through EventBus.emit()\".\n- 11 more developers will build on your foundation.",
+  "runId": "16a2e4e1-264c-4281-8fb9-2614dbd5a5c9",
+  "scenario": "sprint-simulation",
+  "sessionId": "2d9028e2-4263-4605-ab4b-e5d6a348ca4f",
+  "stopReason": "success",
+  "taskIndex": 0,
+  "timing": {
+    "durationMs": 522421,
+    "endTime": "2026-03-28T05:52:14.844Z",
+    "startTime": "2026-03-28T05:43:32.423Z",
+    "timeToFirstActionMs": 154182
+  },
+  "tokenUsage": {
+    "cacheCreation": 57972,
+    "cacheRead": 2190918,
+    "costUsd": 2.3707282999999997,
+    "input": 35,
+    "output": 29786,
+    "total": 2278711
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "description": "Explore entire codebase structure",
+        "prompt": "Thoroughly explore the codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm to understand:\n1. All existing files and their contents\n2. The existing patterns, interfaces, and conventions used\n3. What's in src/models/, src/services/, src/repositories/, src/utils/, src/events/, src/adapters/, src/validators/, src/config/\n4. The tsconfig.json and package.json configurations\n5. Any existing tests\n6. How the codebase is structured and what patterns are already in use\n\nRead every file in the project - it's small (~24 files, ~1140 lines). I need to understand the full picture before designing a notification system.",
+        "subagent_type": "Explore"
+      },
+      "timestamp": "2026-03-28T05:43:42.433Z",
+      "toolName": "Task"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm -type f -name \"*.json\" -o -name \"*.ts\" -o -name \"*.tsx\" -o -name \"*.md\" | head -50",
+        "description": "List all project files"
+      },
+      "timestamp": "2026-03-28T05:43:44.947Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm -type f \\( -name \"*.ts\" -o -name \"*.json\" -o -name \"*.md\" \\) -not -path \"*/node_modules/*\" | sort",
+        "description": "List all source files excluding node_modules"
+      },
+      "timestamp": "2026-03-28T05:43:47.335Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/package.json"
+      },
+      "timestamp": "2026-03-28T05:43:48.917Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tsconfig.json"
+      },
+      "timestamp": "2026-03-28T05:43:49.254Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/CLAUDE.md"
+      },
+      "timestamp": "2026-03-28T05:43:49.462Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/docs/architecture.md"
+      },
+      "timestamp": "2026-03-28T05:43:49.865Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/models/user.ts"
+      },
+      "timestamp": "2026-03-28T05:43:51.882Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/models/order.ts"
+      },
+      "timestamp": "2026-03-28T05:43:52.090Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/repositories/base.repository.ts"
+      },
+      "timestamp": "2026-03-28T05:43:53.519Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/repositories/user.repository.ts"
+      },
+      "timestamp": "2026-03-28T05:43:53.753Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/repositories/order.repository.ts"
+      },
+      "timestamp": "2026-03-28T05:43:53.991Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/user.service.ts"
+      },
+      "timestamp": "2026-03-28T05:43:55.959Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-28T05:43:56.197Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T05:43:56.469Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T05:43:58.951Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-28T05:43:59.101Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/database.ts"
+      },
+      "timestamp": "2026-03-28T05:44:01.001Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/logger.ts"
+      },
+      "timestamp": "2026-03-28T05:44:01.461Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/pagination.ts"
+      },
+      "timestamp": "2026-03-28T05:44:01.713Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/callback-registry.ts"
+      },
+      "timestamp": "2026-03-28T05:44:02.020Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/config/app.config.ts"
+      },
+      "timestamp": "2026-03-28T05:44:03.977Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/config/database.config.ts"
+      },
+      "timestamp": "2026-03-28T05:44:04.382Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/index.ts"
+      },
+      "timestamp": "2026-03-28T05:44:04.654Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:06.840Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/order.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:07.118Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/user.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:07.358Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/repositories/user.repository.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:09.804Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/repositories/order.repository.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:10.263Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/utils/database.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:10.735Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/utils/pagination.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:10.803Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/vitest.config.ts"
+      },
+      "timestamp": "2026-03-28T05:44:13.011Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-28T05:44:44.793Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T05:44:45.335Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T05:44:46.201Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/models/user.ts"
+      },
+      "timestamp": "2026-03-28T05:44:46.572Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/models/order.ts"
+      },
+      "timestamp": "2026-03-28T05:44:47.417Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/index.ts"
+      },
+      "timestamp": "2026-03-28T05:44:48.004Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-28T05:44:48.511Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/user.service.ts"
+      },
+      "timestamp": "2026-03-28T05:44:49.299Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/callback-registry.ts"
+      },
+      "timestamp": "2026-03-28T05:44:55.377Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/config/app.config.ts"
+      },
+      "timestamp": "2026-03-28T05:44:56.386Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/utils/logger.ts"
+      },
+      "timestamp": "2026-03-28T05:44:56.681Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:44:57.133Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tsconfig.json"
+      },
+      "timestamp": "2026-03-28T05:44:58.350Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/package.json"
+      },
+      "timestamp": "2026-03-28T05:44:58.653Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/CLAUDE.md"
+      },
+      "timestamp": "2026-03-28T05:44:59.189Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:45:33.370Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/order.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:45:39.096Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Notification model — core types for the notification system.\n *\n * Architecture: All notifications flow through the EventBus. When a domain\n * event occurs (e.g., order:created), the NotificationService listens for it,\n * constructs a NotificationPayload, and dispatches it to the appropriate\n * NotificationAdapter(s) based on channel.\n *\n * Type hierarchy:\n * - NotificationType: What happened (e.g., order_confirmation)\n * - NotificationChannel: How to deliver (e.g., email, sms)\n * - NotificationPayload: What to send (constructed by NotificationService)\n * - NotificationRecord: What's stored (includes delivery status)\n * - NotificationResult: What adapters return (success/failure)\n */\n\n/**\n * The kind of notification being sent. Maps to a domain event.\n * Extend this union as new notification-worthy events are added.\n */\nexport type NotificationType =\n  | 'order_confirmation'\n  | 'order_status_update'\n  | 'welcome'\n  | 'account_updated';\n\n/**\n * Delivery channel for a notification.\n * Each channel has a corresponding adapter that implements NotificationAdapter.\n */\nexport type NotificationChannel = 'email' | 'sms' | 'webhook' | 'in_app';\n\n/**\n * Priority level for notification delivery.\n * Adapters may use this to determine delivery urgency.\n */\nexport type NotificationPriority = 'low' | 'normal' | 'high' | 'urgent';\n\n/**\n * Delivery status of a notification.\n */\nexport type NotificationStatus = 'pending' | 'sent' | 'failed';\n\n/**\n * Payload describing a notification to be sent.\n * Constructed by the NotificationService from domain events,\n * then passed to adapters for delivery.\n */\nexport interface NotificationPayload {\n  /** What kind of notification this is. */\n  type: NotificationType;\n  /** Who receives the notification (email, phone, user ID, etc.). */\n  recipient: string;\n  /** Subject line or title. */\n  subject: string;\n  /** Notification body content. */\n  body: string;\n  /** Which channel to deliver through. */\n  channel: NotificationChannel;\n  /** Delivery priority. Defaults to 'normal' if omitted. */\n  priority: NotificationPriority;\n  /** Optional key-value metadata for adapter-specific data. */\n  metadata?: Record<string, unknown>;\n}\n\n/**\n * A stored notification record with delivery status tracking.\n * Created by NotificationService after dispatching to an adapter.\n */\nexport interface NotificationRecord {\n  /** Unique notification ID (e.g., notif-0001). */\n  id: string;\n  /** The notification type. */\n  type: NotificationType;\n  /** The delivery channel used. */\n  channel: NotificationChannel;\n  /** Recipient identifier. */\n  recipient: string;\n  /** Subject line. */\n  subject: string;\n  /** Body content. */\n  body: string;\n  /** Current delivery status. */\n  status: NotificationStatus;\n  /** Delivery priority. */\n  priority: NotificationPriority;\n  /** Optional metadata carried from the payload. */\n  metadata?: Record<string, unknown>;\n  /** When the notification record was created. */\n  createdAt: Date;\n  /** When the notification was successfully sent (if status is 'sent'). */\n  sentAt?: Date;\n  /** Reason for failure (if status is 'failed'). */\n  failureReason?: string;\n}\n\n/**\n * Result returned by a NotificationAdapter after attempting delivery.\n */\nexport interface NotificationResult {\n  /** Whether delivery succeeded. */\n  success: boolean;\n  /** The notification ID this result pertains to. */\n  notificationId: string;\n  /** The channel that attempted delivery. */\n  channel: NotificationChannel;\n  /** Reason for failure, if success is false. */\n  failureReason?: string;\n}\n\n/**\n * Input for creating a notification payload.\n * Used by event handlers to build payloads without specifying all fields.\n */\nexport interface CreateNotificationInput {\n  type: NotificationType;\n  recipient: string;\n  subject: string;\n  body: string;\n  channel?: NotificationChannel;\n  priority?: NotificationPriority;\n  metadata?: Record<string, unknown>;\n}\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/models/notification.ts"
+      },
+      "timestamp": "2026-03-28T05:46:06.605Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:46:14.036Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Event type definitions for the event-driven notification system.\n *\n * This application uses an event bus for decoupled communication between\n * modules. Services emit events when significant actions occur, and\n * interested listeners handle them independently.\n *\n * Event categories:\n * - order:*  — Order lifecycle events (emitted by OrderService)\n * - user:*   — User lifecycle events (emitted by UserService)\n * - notification:* — Notification delivery events (emitted by NotificationService)\n *\n * ALL cross-service communication MUST go through the EventBus.\n * Do not use direct callbacks or shared mutable state between services.\n */\n\nimport type { Order } from '../models/order.js';\nimport type { User } from '../models/user.js';\nimport type { NotificationRecord } from '../models/notification.js';\n\n// --- Order Events ---\n\nexport interface OrderCreatedEvent {\n  type: 'order:created';\n  order: Order;\n  user: User;\n  timestamp: Date;\n}\n\nexport interface OrderStatusChangedEvent {\n  type: 'order:status-changed';\n  order: Order;\n  previousStatus: string;\n  newStatus: string;\n  timestamp: Date;\n}\n\n// --- User Events ---\n\nexport interface UserCreatedEvent {\n  type: 'user:created';\n  user: User;\n  timestamp: Date;\n}\n\nexport interface UserUpdatedEvent {\n  type: 'user:updated';\n  user: User;\n  changes: string[];\n  timestamp: Date;\n}\n\n// --- Notification Lifecycle Events ---\n\nexport interface NotificationSentEvent {\n  type: 'notification:sent';\n  notification: NotificationRecord;\n  timestamp: Date;\n}\n\nexport interface NotificationFailedEvent {\n  type: 'notification:failed';\n  notification: NotificationRecord;\n  reason: string;\n  timestamp: Date;\n}\n\n// --- Union Types ---\n\nexport type AppEvent =\n  | OrderCreatedEvent\n  | OrderStatusChangedEvent\n  | UserCreatedEvent\n  | UserUpdatedEvent\n  | NotificationSentEvent\n  | NotificationFailedEvent;\n\nexport type EventType = AppEvent['type'];\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T05:46:25.105Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Base interface for all notification adapters.\n *\n * CONSTRAINT: Every notification delivery channel (email, SMS, webhook, in-app)\n * MUST implement this interface. The NotificationService dispatches payloads\n * to adapters based on the `channel` property.\n *\n * Adapter contract:\n * 1. `channel` must match exactly one NotificationChannel value.\n * 2. `send()` must be async and return a NotificationResult.\n * 3. `send()` must NOT throw — return { success: false, failureReason } instead.\n * 4. Adapters are stateless; they do not store notifications.\n * 5. Adapters receive their configuration via constructor injection.\n *\n * Example implementation:\n * ```typescript\n * class EmailAdapter implements NotificationAdapter {\n *   readonly channel: NotificationChannel = 'email';\n *   async send(payload: NotificationPayload): Promise<NotificationResult> {\n *     // ... send email ...\n *     return { success: true, notificationId: payload.subject, channel: 'email' };\n *   }\n * }\n * ```\n */\n\nimport type {\n  NotificationChannel,\n  NotificationPayload,\n  NotificationResult,\n} from '../models/notification.js';\n\n/**\n * Interface that all notification delivery adapters must implement.\n */\nexport interface NotificationAdapter {\n  /** The delivery channel this adapter handles. Must be unique per adapter. */\n  readonly channel: NotificationChannel;\n\n  /**\n   * Attempt to deliver a notification.\n   *\n   * @param payload - The notification payload to deliver.\n   * @returns A result indicating success or failure. Must not throw.\n   */\n  send(payload: NotificationPayload): Promise<NotificationResult>;\n}\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/adapters/notification.adapter.ts"
+      },
+      "timestamp": "2026-03-28T05:46:36.159Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Email notification adapter — delivers notifications via email.\n *\n * This is a stub implementation that logs email delivery instead of\n * actually sending. In production, replace the `deliverEmail` method\n * with a real SMTP client or email API integration (e.g., SendGrid, SES).\n *\n * Implements the NotificationAdapter interface. Registered with the\n * NotificationService to handle all notifications on the 'email' channel.\n *\n * Configuration is injected via constructor to support different\n * environments (dev, staging, production).\n */\n\nimport type { NotificationAdapter } from './notification.adapter.js';\nimport type {\n  NotificationChannel,\n  NotificationPayload,\n  NotificationResult,\n} from '../models/notification.js';\nimport { Logger } from '../utils/logger.js';\n\n/**\n * Configuration for the email adapter.\n */\nexport interface EmailAdapterConfig {\n  /** SMTP host or email API endpoint. */\n  host: string;\n  /** SMTP port (e.g., 587 for TLS). */\n  port: number;\n  /** Sender email address for the \"From\" field. */\n  fromAddress: string;\n  /** Whether this is a stub (logs instead of sending). */\n  stubMode: boolean;\n}\n\n/**\n * Default configuration for development/testing.\n */\nexport const defaultEmailConfig: EmailAdapterConfig = {\n  host: 'localhost',\n  port: 587,\n  fromAddress: 'noreply@taskflow.dev',\n  stubMode: true,\n};\n\n/**\n * Email notification adapter.\n *\n * Sends notifications via email. In stub mode (default), logs the\n * email details instead of actually delivering.\n */\nexport class EmailAdapter implements NotificationAdapter {\n  readonly channel: NotificationChannel = 'email';\n\n  private logger = new Logger('EmailAdapter');\n  private config: EmailAdapterConfig;\n  private sentEmails: Array<{\n    to: string;\n    from: string;\n    subject: string;\n    body: string;\n    sentAt: Date;\n  }> = [];\n\n  constructor(config?: Partial<EmailAdapterConfig>) {\n    this.config = { ...defaultEmailConfig, ...config };\n  }\n\n  /**\n   * Send a notification via email.\n   *\n   * In stub mode, logs the email and records it in memory.\n   * In production mode, would delegate to an SMTP client.\n   *\n   * @param payload - The notification payload to deliver via email.\n   * @returns Result indicating success or failure. Never throws.\n   */\n  async send(payload: NotificationPayload): Promise<NotificationResult> {\n    const result: NotificationResult = {\n      success: false,\n      notificationId: '',\n      channel: 'email',\n    };\n\n    try {\n      if (this.config.stubMode) {\n        // Stub mode: log instead of sending\n        this.logger.info(\n          `[STUB] Email to ${payload.recipient}: \"${payload.subject}\"`,\n        );\n        this.sentEmails.push({\n          to: payload.recipient,\n          from: this.config.fromAddress,\n          subject: payload.subject,\n          body: payload.body,\n          sentAt: new Date(),\n        });\n      } else {\n        // Production mode: delegate to real email delivery\n        await this.deliverEmail(payload);\n      }\n\n      result.success = true;\n      this.logger.info(`Email sent to ${payload.recipient}`);\n    } catch (error) {\n      const message = error instanceof Error ? error.message : 'Unknown email delivery error';\n      result.success = false;\n      result.failureReason = message;\n      this.logger.error(`Email delivery failed for ${payload.recipient}: ${message}`);\n    }\n\n    return result;\n  }\n\n  /**\n   * Get all emails sent in stub mode. Useful for testing.\n   */\n  getSentEmails(): Array<{\n    to: string;\n    from: string;\n    subject: string;\n    body: string;\n    sentAt: Date;\n  }> {\n    return [...this.sentEmails];\n  }\n\n  /**\n   * Clear sent email records. Useful for testing.\n   */\n  clearSentEmails(): void {\n    this.sentEmails = [];\n  }\n\n  /**\n   * Get the current adapter configuration.\n   */\n  getConfig(): Readonly<EmailAdapterConfig> {\n    return { ...this.config };\n  }\n\n  /**\n   * Real email delivery — override in production or replace with actual SMTP/API.\n   *\n   * @param _payload - The notification payload (unused in stub).\n   * @throws Error if delivery fails.\n   */\n  private async deliverEmail(_payload: NotificationPayload): Promise<void> {\n    // TODO: Replace with real SMTP client or email API integration.\n    // Example integrations:\n    //   - nodemailer for SMTP\n    //   - @sendgrid/mail for SendGrid\n    //   - @aws-sdk/client-ses for Amazon SES\n    throw new Error(\n      'Real email delivery not implemented. Set stubMode: true for development.',\n    );\n  }\n}\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-28T05:46:56.928Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:47:03.551Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Notification service — orchestrates notification delivery in response to domain events.\n *\n * ARCHITECTURE DECISION: Event-Driven with Adapter Dispatch\n * =========================================================\n * This service uses the EventBus exclusively for receiving domain events.\n * ALL cross-service communication flows through EventBus — no direct callbacks,\n * no shared mutable state, no CallbackRegistry.\n *\n * Flow:\n * 1. A domain service (OrderService, UserService) emits an event via EventBus.\n * 2. NotificationService listens for relevant events.\n * 3. Event handlers map domain events → NotificationPayload(s).\n * 4. Payloads are dispatched to the appropriate NotificationAdapter by channel.\n * 5. Delivery results are recorded as NotificationRecords.\n * 6. notification:sent / notification:failed events are emitted for observability.\n *\n * CONSTRAINTS:\n * - All adapters MUST implement the NotificationAdapter interface.\n * - All domain events MUST flow through EventBus.emit().\n * - Adapters MUST NOT throw from send() — return { success: false } instead.\n * - This service owns the notification lifecycle; adapters own delivery mechanics.\n *\n * Depends on:\n * - EventBus (event system) for receiving ALL domain events\n * - NotificationAdapter implementations for delivery\n */\n\nimport type { EventBus } from '../events/event-bus.js';\nimport type {\n  OrderCreatedEvent,\n  OrderStatusChangedEvent,\n  UserCreatedEvent,\n  UserUpdatedEvent,\n} from '../events/event-types.js';\nimport type { NotificationAdapter } from '../adapters/notification.adapter.js';\nimport type {\n  NotificationChannel,\n  NotificationPayload,\n  NotificationRecord,\n  NotificationResult,\n  CreateNotificationInput,\n} from '../models/notification.js';\nimport { Logger } from '../utils/logger.js';\n\nlet nextId = 1;\n\nfunction generateNotificationId(): string {\n  return `notif-${String(nextId++).padStart(4, '0')}`;\n}\n\n/** Reset the ID counter. Used in tests. */\nexport function resetNotificationIdCounter(): void {\n  nextId = 1;\n}\n\nexport class NotificationService {\n  private logger = new Logger('NotificationService');\n  private notifications: NotificationRecord[] = [];\n  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n\n  constructor(private eventBus: EventBus) {\n    this.registerEventHandlers();\n  }\n\n  // ---------------------------------------------------------------------------\n  // Adapter Registration\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Register a notification adapter for a delivery channel.\n   *\n   * Only one adapter per channel is allowed. Registering a second adapter\n   * for the same channel replaces the previous one.\n   *\n   * @param adapter - The adapter to register. Must implement NotificationAdapter.\n   */\n  registerAdapter(adapter: NotificationAdapter): void {\n    this.logger.info(`Registering adapter for channel: ${adapter.channel}`);\n    this.adapters.set(adapter.channel, adapter);\n  }\n\n  /**\n   * Unregister the adapter for a delivery channel.\n   *\n   * @param channel - The channel whose adapter to remove.\n   * @returns true if an adapter was removed, false if none was registered.\n   */\n  unregisterAdapter(channel: NotificationChannel): boolean {\n    this.logger.info(`Unregistering adapter for channel: ${channel}`);\n    return this.adapters.delete(channel);\n  }\n\n  /**\n   * Get all registered adapter channels.\n   */\n  getRegisteredChannels(): NotificationChannel[] {\n    return Array.from(this.adapters.keys());\n  }\n\n  // ---------------------------------------------------------------------------\n  // Notification Dispatch\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Send a notification through the appropriate adapter.\n   *\n   * This is the core dispatch method. It:\n   * 1. Builds a NotificationRecord from the input.\n   * 2. Looks up the adapter for the specified channel.\n   * 3. Calls adapter.send() and records the result.\n   * 4. Emits notification:sent or notification:failed events.\n   *\n   * @param input - Notification details. Channel defaults to 'email'.\n   * @returns The created NotificationRecord with delivery status.\n   */\n  async send(input: CreateNotificationInput): Promise<NotificationRecord> {\n    const channel = input.channel ?? 'email';\n    const priority = input.priority ?? 'normal';\n\n    const payload: NotificationPayload = {\n      type: input.type,\n      recipient: input.recipient,\n      subject: input.subject,\n      body: input.body,\n      channel,\n      priority,\n      metadata: input.metadata,\n    };\n\n    const record: NotificationRecord = {\n      id: generateNotificationId(),\n      type: input.type,\n      channel,\n      recipient: input.recipient,\n      subject: input.subject,\n      body: input.body,\n      status: 'pending',\n      priority,\n      metadata: input.metadata,\n      createdAt: new Date(),\n    };\n\n    const adapter = this.adapters.get(channel);\n    if (!adapter) {\n      record.status = 'failed';\n      record.failureReason = `No adapter registered for channel: ${channel}`;\n      this.logger.warn(record.failureReason);\n      this.notifications.push(record);\n\n      await this.eventBus.emit({\n        type: 'notification:failed',\n        notification: record,\n        reason: record.failureReason,\n        timestamp: new Date(),\n      });\n\n      return record;\n    }\n\n    // Dispatch to the adapter\n    let result: NotificationResult;\n    try {\n      result = await adapter.send(payload);\n    } catch (error) {\n      // Adapters should not throw, but handle it gracefully if they do\n      const reason = error instanceof Error ? error.message : 'Unknown adapter error';\n      result = {\n        success: false,\n        notificationId: record.id,\n        channel,\n        failureReason: reason,\n      };\n    }\n\n    // Update record based on result\n    result.notificationId = record.id;\n    if (result.success) {\n      record.status = 'sent';\n      record.sentAt = new Date();\n    } else {\n      record.status = 'failed';\n      record.failureReason = result.failureReason;\n    }\n\n    this.notifications.push(record);\n\n    // Emit lifecycle event\n    if (record.status === 'sent') {\n      await this.eventBus.emit({\n        type: 'notification:sent',\n        notification: record,\n        timestamp: new Date(),\n      });\n    } else {\n      await this.eventBus.emit({\n        type: 'notification:failed',\n        notification: record,\n        reason: record.failureReason ?? 'Unknown error',\n        timestamp: new Date(),\n      });\n    }\n\n    this.logger.info(\n      `Notification ${record.id} ${record.status} via ${channel} to ${record.recipient}`,\n    );\n\n    return record;\n  }\n\n  // ---------------------------------------------------------------------------\n  // Event Handlers — Map domain events to notifications\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Register event handlers for all notification-worthy domain events.\n   *\n   * IMPORTANT: ALL event subscriptions go through EventBus.on().\n   * Do NOT use CallbackRegistry or direct callbacks.\n   */\n  private registerEventHandlers(): void {\n    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {\n      return this.handleOrderCreated(event);\n    });\n\n    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {\n      return this.handleOrderStatusChanged(event);\n    });\n\n    this.eventBus.on<UserCreatedEvent>('user:created', (event) => {\n      return this.handleUserCreated(event);\n    });\n\n    this.eventBus.on<UserUpdatedEvent>('user:updated', (event) => {\n      return this.handleUserUpdated(event);\n    });\n  }\n\n  /**\n   * Handle order created — send confirmation email to the ordering user.\n   */\n  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {\n    this.logger.info(`Handling order:created for order ${event.order.id}`);\n\n    const itemSummary = event.order.items\n      .map((item) => `${item.name} x${item.quantity}`)\n      .join(', ');\n\n    await this.send({\n      type: 'order_confirmation',\n      recipient: event.user.email,\n      subject: `Order Confirmation: ${event.order.id}`,\n      body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,\n      channel: 'email',\n      priority: 'normal',\n    });\n  }\n\n  /**\n   * Handle order status change — notify user of the update.\n   */\n  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {\n    this.logger.info(\n      `Handling order:status-changed for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,\n    );\n\n    await this.send({\n      type: 'order_status_update',\n      recipient: event.order.userId,\n      subject: `Order Update: ${event.order.id}`,\n      body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,\n      channel: 'email',\n      priority: event.newStatus === 'cancelled' ? 'high' : 'normal',\n    });\n  }\n\n  /**\n   * Handle user created — send welcome notification.\n   */\n  private async handleUserCreated(event: UserCreatedEvent): Promise<void> {\n    this.logger.info(`Handling user:created for user ${event.user.id}`);\n\n    await this.send({\n      type: 'welcome',\n      recipient: event.user.email,\n      subject: 'Welcome to TaskFlow Pro!',\n      body: `Hi ${event.user.name}, welcome to TaskFlow Pro. Your account has been created.`,\n      channel: 'email',\n      priority: 'normal',\n    });\n  }\n\n  /**\n   * Handle user updated — notify user of account changes.\n   */\n  private async handleUserUpdated(event: UserUpdatedEvent): Promise<void> {\n    this.logger.info(`Handling user:updated for user ${event.user.id}`);\n\n    await this.send({\n      type: 'account_updated',\n      recipient: event.user.email,\n      subject: 'Account Updated',\n      body: `Your account has been updated. Changed fields: ${event.changes.join(', ')}.`,\n      channel: 'email',\n      priority: 'low',\n    });\n  }\n\n  // ---------------------------------------------------------------------------\n  // Notification Queries\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Get all notification records.\n   */\n  getNotifications(): NotificationRecord[] {\n    return [...this.notifications];\n  }\n\n  /**\n   * Get notifications for a specific recipient.\n   */\n  getNotificationsForRecipient(recipient: string): NotificationRecord[] {\n    return this.notifications.filter((n) => n.recipient === recipient);\n  }\n\n  /**\n   * Get notifications filtered by status.\n   */\n  getNotificationsByStatus(status: NotificationRecord['status']): NotificationRecord[] {\n    return this.notifications.filter((n) => n.status === status);\n  }\n\n  /**\n   * Get notifications filtered by type.\n   */\n  getNotificationsByType(type: NotificationRecord['type']): NotificationRecord[] {\n    return this.notifications.filter((n) => n.type === type);\n  }\n\n  /**\n   * Get the total count of notification records.\n   */\n  getNotificationCount(): number {\n    return this.notifications.length;\n  }\n\n  /**\n   * Clear all notification records. Useful for testing.\n   */\n  clearNotifications(): void {\n    this.notifications = [];\n  }\n}\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T05:47:44.817Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T05:47:50.616Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Notification service — orchestrates notification delivery in response to domain events.\n *\n * ARCHITECTURE DECISION: Event-Driven with Adapter Dispatch\n * =========================================================\n * This service uses the EventBus exclusively for receiving domain events.\n * ALL cross-service communication flows through EventBus — no direct callbacks,\n * no shared mutable state, no CallbackRegistry.\n *\n * Flow:\n * 1. A domain service (OrderService, UserService) emits an event via EventBus.\n * 2. NotificationService listens for relevant events.\n * 3. Event handlers map domain events → NotificationPayload(s).\n * 4. Payloads are dispatched to the appropriate NotificationAdapter by channel.\n * 5. Delivery results are recorded as NotificationRecords.\n * 6. notification:sent / notification:failed events are emitted for observability.\n *\n * CONSTRAINTS:\n * - All adapters MUST implement the NotificationAdapter interface.\n * - All domain events MUST flow through EventBus.emit().\n * - Adapters MUST NOT throw from send() — return { success: false } instead.\n * - This service owns the notification lifecycle; adapters own delivery mechanics.\n *\n * Depends on:\n * - EventBus (event system) for receiving ALL domain events\n * - NotificationAdapter implementations for delivery\n */\n\nimport type { EventBus } from '../events/event-bus.js';\nimport type {\n  OrderCreatedEvent,\n  OrderStatusChangedEvent,\n  UserCreatedEvent,\n  UserUpdatedEvent,\n} from '../events/event-types.js';\nimport type { NotificationAdapter } from '../adapters/notification.adapter.js';\nimport type {\n  NotificationChannel,\n  NotificationPayload,\n  NotificationRecord,\n  NotificationResult,\n  CreateNotificationInput,\n} from '../models/notification.js';\nimport { Logger } from '../utils/logger.js';\n\nlet nextId = 1;\n\nfunction generateNotificationId(): string {\n  return `notif-${String(nextId++).padStart(4, '0')}`;\n}\n\n/** Reset the ID counter. Used in tests. */\nexport function resetNotificationIdCounter(): void {\n  nextId = 1;\n}\n\nexport class NotificationService {\n  private logger = new Logger('NotificationService');\n  private notifications: NotificationRecord[] = [];\n  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n\n  constructor(private eventBus: EventBus) {\n    this.registerEventHandlers();\n  }\n\n  // ---------------------------------------------------------------------------\n  // Adapter Registration\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Register a notification adapter for a delivery channel.\n   *\n   * Only one adapter per channel is allowed. Registering a second adapter\n   * for the same channel replaces the previous one.\n   *\n   * @param adapter - The adapter to register. Must implement NotificationAdapter.\n   */\n  registerAdapter(adapter: NotificationAdapter): void {\n    this.logger.info(`Registering adapter for channel: ${adapter.channel}`);\n    this.adapters.set(adapter.channel, adapter);\n  }\n\n  /**\n   * Unregister the adapter for a delivery channel.\n   *\n   * @param channel - The channel whose adapter to remove.\n   * @returns true if an adapter was removed, false if none was registered.\n   */\n  unregisterAdapter(channel: NotificationChannel): boolean {\n    this.logger.info(`Unregistering adapter for channel: ${channel}`);\n    return this.adapters.delete(channel);\n  }\n\n  /**\n   * Get all registered adapter channels.\n   */\n  getRegisteredChannels(): NotificationChannel[] {\n    return Array.from(this.adapters.keys());\n  }\n\n  // ---------------------------------------------------------------------------\n  // Notification Dispatch\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Send a notification through the appropriate adapter.\n   *\n   * This is the core dispatch method. It:\n   * 1. Builds a NotificationRecord from the input.\n   * 2. Looks up the adapter for the specified channel.\n   * 3. Calls adapter.send() and records the result.\n   * 4. Emits notification:sent or notification:failed events.\n   *\n   * @param input - Notification details. Channel defaults to 'email'.\n   * @returns The created NotificationRecord with delivery status.\n   */\n  async send(input: CreateNotificationInput): Promise<NotificationRecord> {\n    const channel = input.channel ?? 'email';\n    const priority = input.priority ?? 'normal';\n\n    const payload: NotificationPayload = {\n      type: input.type,\n      recipient: input.recipient,\n      subject: input.subject,\n      body: input.body,\n      channel,\n      priority,\n      metadata: input.metadata,\n    };\n\n    const record: NotificationRecord = {\n      id: generateNotificationId(),\n      type: input.type,\n      channel,\n      recipient: input.recipient,\n      subject: input.subject,\n      body: input.body,\n      status: 'pending',\n      priority,\n      metadata: input.metadata,\n      createdAt: new Date(),\n    };\n\n    const adapter = this.adapters.get(channel);\n    if (!adapter) {\n      record.status = 'failed';\n      record.failureReason = `No adapter registered for channel: ${channel}`;\n      this.logger.warn(record.failureReason);\n      this.notifications.push(record);\n\n      await this.eventBus.emit({\n        type: 'notification:failed',\n        notification: record,\n        reason: record.failureReason,\n        timestamp: new Date(),\n      });\n\n      return record;\n    }\n\n    // Dispatch to the adapter\n    let result: NotificationResult;\n    try {\n      result = await adapter.send(payload);\n    } catch (error) {\n      // Adapters should not throw, but handle it gracefully if they do\n      const reason = error instanceof Error ? error.message : 'Unknown adapter error';\n      result = {\n        success: false,\n        notificationId: record.id,\n        channel,\n        failureReason: reason,\n      };\n    }\n\n    // Update record based on result\n    result.notificationId = record.id;\n    if (result.success) {\n      record.status = 'sent';\n      record.sentAt = new Date();\n    } else {\n      record.status = 'failed';\n      record.failureReason = result.failureReason;\n    }\n\n    this.notifications.push(record);\n\n    // Emit lifecycle event\n    if (record.status === 'sent') {\n      await this.eventBus.emit({\n        type: 'notification:sent',\n        notification: record,\n        timestamp: new Date(),\n      });\n    } else {\n      await this.eventBus.emit({\n        type: 'notification:failed',\n        notification: record,\n        reason: record.failureReason ?? 'Unknown error',\n        timestamp: new Date(),\n      });\n    }\n\n    this.logger.info(\n      `Notification ${record.id} ${record.status} via ${channel} to ${record.recipient}`,\n    );\n\n    return record;\n  }\n\n  // ---------------------------------------------------------------------------\n  // Event Handlers — Map domain events to notifications\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Register event handlers for all notification-worthy domain events.\n   *\n   * IMPORTANT: ALL event subscriptions go through EventBus.on().\n   * Do NOT use CallbackRegistry or direct callbacks.\n   */\n  private registerEventHandlers(): void {\n    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {\n      return this.handleOrderCreated(event);\n    });\n\n    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {\n      return this.handleOrderStatusChanged(event);\n    });\n\n    this.eventBus.on<UserCreatedEvent>('user:created', (event) => {\n      return this.handleUserCreated(event);\n    });\n\n    this.eventBus.on<UserUpdatedEvent>('user:updated', (event) => {\n      return this.handleUserUpdated(event);\n    });\n  }\n\n  /**\n   * Handle order created — send confirmation email to the ordering user.\n   */\n  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {\n    this.logger.info(`Handling order:created for order ${event.order.id}`);\n\n    const itemSummary = event.order.items\n      .map((item) => `${item.name} x${item.quantity}`)\n      .join(', ');\n\n    await this.send({\n      type: 'order_confirmation',\n      recipient: event.user.email,\n      subject: `Order Confirmation: ${event.order.id}`,\n      body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,\n      channel: 'email',\n      priority: 'normal',\n    });\n  }\n\n  /**\n   * Handle order status change — notify user of the update.\n   */\n  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {\n    this.logger.info(\n      `Handling order:status-changed for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,\n    );\n\n    await this.send({\n      type: 'order_status_update',\n      recipient: event.order.userId,\n      subject: `Order Update: ${event.order.id}`,\n      body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,\n      channel: 'email',\n      priority: event.newStatus === 'cancelled' ? 'high' : 'normal',\n    });\n  }\n\n  /**\n   * Handle user created — send welcome notification.\n   */\n  private async handleUserCreated(event: UserCreatedEvent): Promise<void> {\n    this.logger.info(`Handling user:created for user ${event.user.id}`);\n\n    await this.send({\n      type: 'welcome',\n      recipient: event.user.email,\n      subject: 'Welcome to TaskFlow Pro!',\n      body: `Hi ${event.user.name}, welcome to TaskFlow Pro. Your account has been created.`,\n      channel: 'email',\n      priority: 'normal',\n    });\n  }\n\n  /**\n   * Handle user updated — notify user of account changes.\n   */\n  private async handleUserUpdated(event: UserUpdatedEvent): Promise<void> {\n    this.logger.info(`Handling user:updated for user ${event.user.id}`);\n\n    await this.send({\n      type: 'account_updated',\n      recipient: event.user.email,\n      subject: 'Account Updated',\n      body: `Your account has been updated. Changed fields: ${event.changes.join(', ')}.`,\n      channel: 'email',\n      priority: 'low',\n    });\n  }\n\n  // ---------------------------------------------------------------------------\n  // Notification Queries\n  // ---------------------------------------------------------------------------\n\n  /**\n   * Get all notification records.\n   */\n  getNotifications(): NotificationRecord[] {\n    return [...this.notifications];\n  }\n\n  /**\n   * Get notifications for a specific recipient.\n   */\n  getNotificationsForRecipient(recipient: string): NotificationRecord[] {\n    return this.notifications.filter((n) => n.recipient === recipient);\n  }\n\n  /**\n   * Get notifications filtered by status.\n   */\n  getNotificationsByStatus(status: NotificationRecord['status']): NotificationRecord[] {\n    return this.notifications.filter((n) => n.status === status);\n  }\n\n  /**\n   * Get notifications filtered by type.\n   */\n  getNotificationsByType(type: NotificationRecord['type']): NotificationRecord[] {\n    return this.notifications.filter((n) => n.type === type);\n  }\n\n  /**\n   * Get the total count of notification records.\n   */\n  getNotificationCount(): number {\n    return this.notifications.length;\n  }\n\n  /**\n   * Clear all notification records. Useful for testing.\n   */\n  clearNotifications(): void {\n    this.notifications = [];\n  }\n}\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T05:48:22.958Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts",
+        "new_string": "/**\n * Order service — business logic for order management.\n *\n * Depends on:\n * - OrderRepository (data layer) for persistence\n * - UserRepository (data layer) for user validation\n * - EventBus (event system) for publishing order lifecycle events\n *\n * Architecture note: ALL order events are emitted through EventBus.\n * This includes both order creation and status changes.\n * The OrderService emits events; it does not directly call\n * the NotificationService or any other listener.\n */\n\nimport type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';\nimport { calculateOrderTotal } from '../models/order.js';\nimport type { OrderRepository } from '../repositories/order.repository.js';\nimport type { UserRepository } from '../repositories/user.repository.js';\nimport type { EventBus } from '../events/event-bus.js';\nimport { Logger } from '../utils/logger.js';",
+        "old_string": "/**\n * Order service — business logic for order management.\n *\n * Depends on:\n * - OrderRepository (data layer) for persistence\n * - UserRepository (data layer) for user validation\n * - EventBus (event system) for publishing order lifecycle events\n *\n * Architecture note: Order events are used to trigger side effects\n * (notifications, analytics, etc.) without direct coupling.\n * The OrderService emits events; it does not directly call\n * the NotificationService.\n */\n\nimport type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';\nimport { calculateOrderTotal } from '../models/order.js';\nimport type { OrderRepository } from '../repositories/order.repository.js';\nimport type { UserRepository } from '../repositories/user.repository.js';\nimport type { EventBus } from '../events/event-bus.js';\nimport { statusChangeCallbacks } from '../utils/callback-registry.js';\nimport { Logger } from '../utils/logger.js';",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T05:48:33.469Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-28T05:48:37.822Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts",
+        "new_string": "/**\n * Order service — business logic for order management.\n *\n * Depends on:\n * - OrderRepository (data layer) for persistence\n * - UserRepository (data layer) for user validation\n * - EventBus (event system) for publishing order lifecycle events\n *\n * Architecture note: ALL order events are emitted via EventBus for\n * decoupled communication. This includes both order creation and\n * status changes. The OrderService emits events; it does not directly\n * call the NotificationService or use CallbackRegistry.\n */\n\nimport type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';\nimport { calculateOrderTotal } from '../models/order.js';\nimport type { OrderRepository } from '../repositories/order.repository.js';\nimport type { UserRepository } from '../repositories/user.repository.js';\nimport type { EventBus } from '../events/event-bus.js';\nimport { Logger } from '../utils/logger.js';",
+        "old_string": "/**\n * Order service — business logic for order management.\n *\n * Depends on:\n * - OrderRepository (data layer) for persistence\n * - UserRepository (data layer) for user validation\n * - EventBus (event system) for publishing order lifecycle events\n *\n * Architecture note: Order events are used to trigger side effects\n * (notifications, analytics, etc.) without direct coupling.\n * The OrderService emits events; it does not directly call\n * the NotificationService.\n */\n\nimport type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';\nimport { calculateOrderTotal } from '../models/order.js';\nimport type { OrderRepository } from '../repositories/order.repository.js';\nimport type { UserRepository } from '../repositories/user.repository.js';\nimport type { EventBus } from '../events/event-bus.js';\nimport { statusChangeCallbacks } from '../utils/callback-registry.js';\nimport { Logger } from '../utils/logger.js';",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T05:48:46.348Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/services/order.service.ts",
+        "new_string": "    const updated = this.orderRepository.update(id, {\n      status: newStatus,\n      updatedAt: new Date(),\n    });\n\n    // Emit status change via EventBus — consistent with all other events\n    await this.eventBus.emit({\n      type: 'order:status-changed',\n      order: updated,\n      previousStatus,\n      newStatus,\n      timestamp: new Date(),\n    });\n\n    return updated;",
+        "old_string": "    const updated = this.orderRepository.update(id, {\n      status: newStatus,\n      updatedAt: new Date(),\n    });\n\n    // NOTE: Status changes use CallbackRegistry (direct callbacks) rather than\n    // EventBus. This is inconsistent with order creation which uses EventBus.\n    // See notification.service.ts for the mixed pattern discussion.\n    statusChangeCallbacks.notify({\n      type: 'order:status-changed',\n      order: updated,\n      previousStatus,\n      newStatus,\n      timestamp: new Date(),\n    });\n\n    return updated;",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T05:48:53.651Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:49:00.252Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * TaskFlow Pro — A task and order management system.\n *\n * Architecture:\n * - Service Layer: UserService, OrderService, NotificationService (business logic)\n * - Repository Layer: UserRepository, OrderRepository (data access via Repository pattern)\n * - Adapter Layer: EmailAdapter (notification delivery via Adapter pattern)\n * - Utility Layer: Database, Logger, Pagination (infrastructure)\n * - Event System: EventBus with typed events (decoupled communication)\n *\n * Key architectural decisions:\n * 1. Repository pattern for all data access (no direct DB calls from services)\n * 2. Event-driven notifications: ALL cross-service communication flows through EventBus\n * 3. Adapter pattern for notification delivery: each channel has an adapter\n * 4. Services emit events; NotificationService listens and dispatches to adapters\n */\n\n// Models\nexport type { User, CreateUserInput, UpdateUserInput } from './models/user.js';\nexport type {\n  Order,\n  OrderItem,\n  OrderStatus,\n  CreateOrderInput,\n} from './models/order.js';\nexport { calculateOrderTotal } from './models/order.js';\nexport type {\n  NotificationType,\n  NotificationChannel,\n  NotificationPriority,\n  NotificationStatus,\n  NotificationPayload,\n  NotificationRecord,\n  NotificationResult,\n  CreateNotificationInput,\n} from './models/notification.js';\n\n// Utilities\nexport { Database, getDatabase, resetDatabase } from './utils/database.js';\nexport { Logger } from './utils/logger.js';\nexport { paginate } from './utils/pagination.js';\nexport type { PaginationResult } from './utils/pagination.js';\n\n// Repositories\nexport { BaseRepository } from './repositories/base.repository.js';\nexport { UserRepository } from './repositories/user.repository.js';\nexport { OrderRepository } from './repositories/order.repository.js';\n\n// Events\nexport { EventBus } from './events/event-bus.js';\nexport type {\n  AppEvent,\n  EventType,\n  OrderCreatedEvent,\n  OrderStatusChangedEvent,\n  UserCreatedEvent,\n  UserUpdatedEvent,\n  NotificationSentEvent,\n  NotificationFailedEvent,\n} from './events/event-types.js';\n\n// Adapters\nexport type { NotificationAdapter } from './adapters/notification.adapter.js';\nexport { EmailAdapter } from './adapters/email.adapter.js';\nexport type { EmailAdapterConfig } from './adapters/email.adapter.js';\nexport { defaultEmailConfig } from './adapters/email.adapter.js';\n\n// Services\nexport { UserService } from './services/user.service.js';\nexport { OrderService } from './services/order.service.js';\nexport { NotificationService } from './services/notification.service.js';\n\n// Config\nexport { createConfig, defaultConfig } from './config/app.config.js';\nexport type { AppConfig } from './config/app.config.js';\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/index.ts"
+      },
+      "timestamp": "2026-03-28T05:49:17.071Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/index.ts"
+      },
+      "timestamp": "2026-03-28T05:49:21.629Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * TaskFlow Pro — A task and order management system.\n *\n * Architecture:\n * - Service Layer: UserService, OrderService, NotificationService (business logic)\n * - Repository Layer: UserRepository, OrderRepository (data access via Repository pattern)\n * - Adapter Layer: EmailAdapter (notification delivery via Adapter pattern)\n * - Utility Layer: Database, Logger, Pagination (infrastructure)\n * - Event System: EventBus with typed events (decoupled communication)\n *\n * Key architectural decisions:\n * 1. Repository pattern for all data access (no direct DB calls from services)\n * 2. Event-driven notifications: ALL cross-service communication flows through EventBus\n * 3. Adapter pattern for notification delivery: each channel has an adapter\n * 4. Services emit events; NotificationService listens and dispatches to adapters\n */\n\n// Models\nexport type { User, CreateUserInput, UpdateUserInput } from './models/user.js';\nexport type {\n  Order,\n  OrderItem,\n  OrderStatus,\n  CreateOrderInput,\n} from './models/order.js';\nexport { calculateOrderTotal } from './models/order.js';\nexport type {\n  NotificationType,\n  NotificationChannel,\n  NotificationPriority,\n  NotificationStatus,\n  NotificationPayload,\n  NotificationRecord,\n  NotificationResult,\n  CreateNotificationInput,\n} from './models/notification.js';\n\n// Utilities\nexport { Database, getDatabase, resetDatabase } from './utils/database.js';\nexport { Logger } from './utils/logger.js';\nexport { paginate } from './utils/pagination.js';\nexport type { PaginationResult } from './utils/pagination.js';\n\n// Repositories\nexport { BaseRepository } from './repositories/base.repository.js';\nexport { UserRepository } from './repositories/user.repository.js';\nexport { OrderRepository } from './repositories/order.repository.js';\n\n// Events\nexport { EventBus } from './events/event-bus.js';\nexport type {\n  AppEvent,\n  EventType,\n  OrderCreatedEvent,\n  OrderStatusChangedEvent,\n  UserCreatedEvent,\n  UserUpdatedEvent,\n  NotificationSentEvent,\n  NotificationFailedEvent,\n} from './events/event-types.js';\n\n// Adapters\nexport type { NotificationAdapter } from './adapters/notification.adapter.js';\nexport { EmailAdapter, defaultEmailConfig } from './adapters/email.adapter.js';\nexport type { EmailAdapterConfig } from './adapters/email.adapter.js';\n\n// Services\nexport { UserService } from './services/user.service.js';\nexport { OrderService } from './services/order.service.js';\nexport { NotificationService } from './services/notification.service.js';\n\n// Config\nexport { createConfig, defaultConfig } from './config/app.config.js';\nexport type { AppConfig } from './config/app.config.js';\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/src/index.ts"
+      },
+      "timestamp": "2026-03-28T05:49:30.951Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "cd /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm && npx tsc --noEmit 2>&1",
+        "description": "Type check the project",
+        "timeout": 30000
+      },
+      "timestamp": "2026-03-28T05:49:36.125Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:49:44.551Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "import { describe, it, expect, beforeEach } from 'vitest';\nimport { EventBus } from '../../src/events/event-bus.js';\nimport {\n  NotificationService,\n  resetNotificationIdCounter,\n} from '../../src/services/notification.service.js';\nimport { EmailAdapter } from '../../src/adapters/email.adapter.js';\nimport type {\n  OrderCreatedEvent,\n  OrderStatusChangedEvent,\n  UserCreatedEvent,\n  UserUpdatedEvent,\n} from '../../src/events/event-types.js';\nimport type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';\nimport type { NotificationPayload, NotificationResult } from '../../src/models/notification.js';\n\ndescribe('NotificationService', () => {\n  let eventBus: EventBus;\n  let service: NotificationService;\n  let emailAdapter: EmailAdapter;\n\n  beforeEach(() => {\n    eventBus = new EventBus();\n    service = new NotificationService(eventBus);\n    emailAdapter = new EmailAdapter({ stubMode: true });\n    service.registerAdapter(emailAdapter);\n    resetNotificationIdCounter();\n  });\n\n  describe('order:created handler', () => {\n    it('should send notification on order created', async () => {\n      const event: OrderCreatedEvent = {\n        type: 'order:created',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [\n            { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },\n          ],\n          total: 20,\n          status: 'pending',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        user: {\n          id: 'user-1',\n          name: 'Alice',\n          email: 'alice@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications).toHaveLength(1);\n      expect(notifications[0]?.recipient).toBe('alice@example.com');\n      expect(notifications[0]?.subject).toContain('Order Confirmation');\n      expect(notifications[0]?.body).toContain('Widget x2');\n      expect(notifications[0]?.body).toContain('$20.00');\n      expect(notifications[0]?.status).toBe('sent');\n      expect(notifications[0]?.type).toBe('order_confirmation');\n      expect(notifications[0]?.channel).toBe('email');\n    });\n\n    it('should include all items in notification body', async () => {\n      const event: OrderCreatedEvent = {\n        type: 'order:created',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [\n            { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },\n            { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 25 },\n          ],\n          total: 45,\n          status: 'pending',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        user: {\n          id: 'user-1',\n          name: 'Alice',\n          email: 'alice@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications[0]?.body).toContain('Widget x2');\n      expect(notifications[0]?.body).toContain('Gadget x1');\n    });\n  });\n\n  describe('order:status-changed handler (via EventBus)', () => {\n    it('should send notification on status change via EventBus', async () => {\n      const event: OrderStatusChangedEvent = {\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications).toHaveLength(1);\n      expect(notifications[0]?.subject).toContain('Order Update');\n      expect(notifications[0]?.body).toContain('pending');\n      expect(notifications[0]?.body).toContain('confirmed');\n      expect(notifications[0]?.type).toBe('order_status_update');\n      expect(notifications[0]?.status).toBe('sent');\n    });\n\n    it('should set high priority for cancelled orders', async () => {\n      const event: OrderStatusChangedEvent = {\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'cancelled',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'cancelled',\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications[0]?.priority).toBe('high');\n    });\n  });\n\n  describe('user event handlers', () => {\n    it('should send welcome notification on user:created', async () => {\n      const event: UserCreatedEvent = {\n        type: 'user:created',\n        user: {\n          id: 'user-1',\n          name: 'Bob',\n          email: 'bob@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications).toHaveLength(1);\n      expect(notifications[0]?.recipient).toBe('bob@example.com');\n      expect(notifications[0]?.subject).toContain('Welcome');\n      expect(notifications[0]?.type).toBe('welcome');\n    });\n\n    it('should send update notification on user:updated', async () => {\n      const event: UserUpdatedEvent = {\n        type: 'user:updated',\n        user: {\n          id: 'user-1',\n          name: 'Bob Updated',\n          email: 'bob@example.com',\n          role: 'admin',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        changes: ['name', 'role'],\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications).toHaveLength(1);\n      expect(notifications[0]?.body).toContain('name');\n      expect(notifications[0]?.body).toContain('role');\n      expect(notifications[0]?.type).toBe('account_updated');\n    });\n  });\n\n  describe('adapter management', () => {\n    it('should register and list adapters', () => {\n      const channels = service.getRegisteredChannels();\n      expect(channels).toContain('email');\n    });\n\n    it('should unregister adapters', () => {\n      const removed = service.unregisterAdapter('email');\n      expect(removed).toBe(true);\n      expect(service.getRegisteredChannels()).not.toContain('email');\n    });\n\n    it('should record failure when no adapter registered', async () => {\n      service.unregisterAdapter('email');\n\n      const event: OrderStatusChangedEvent = {\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications).toHaveLength(1);\n      expect(notifications[0]?.status).toBe('failed');\n      expect(notifications[0]?.failureReason).toContain('No adapter registered');\n    });\n\n    it('should handle adapter send failure gracefully', async () => {\n      const failingAdapter: NotificationAdapter = {\n        channel: 'email',\n        async send(_payload: NotificationPayload): Promise<NotificationResult> {\n          return {\n            success: false,\n            notificationId: '',\n            channel: 'email',\n            failureReason: 'SMTP connection refused',\n          };\n        },\n      };\n      service.registerAdapter(failingAdapter);\n\n      const event: OrderStatusChangedEvent = {\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      const notifications = service.getNotifications();\n      expect(notifications[0]?.status).toBe('failed');\n      expect(notifications[0]?.failureReason).toBe('SMTP connection refused');\n    });\n  });\n\n  describe('notification management', () => {\n    it('should count notifications', async () => {\n      expect(service.getNotificationCount()).toBe(0);\n\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      expect(service.getNotificationCount()).toBe(1);\n    });\n\n    it('should filter by recipient', async () => {\n      const event: OrderCreatedEvent = {\n        type: 'order:created',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [\n            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },\n          ],\n          total: 10,\n          status: 'pending',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        user: {\n          id: 'user-1',\n          name: 'Alice',\n          email: 'alice@example.com',\n          role: 'member',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        timestamp: new Date(),\n      };\n\n      await eventBus.emit(event);\n\n      expect(service.getNotificationsForRecipient('alice@example.com')).toHaveLength(1);\n      expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);\n    });\n\n    it('should filter by status', async () => {\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      expect(service.getNotificationsByStatus('sent')).toHaveLength(1);\n      expect(service.getNotificationsByStatus('failed')).toHaveLength(0);\n    });\n\n    it('should filter by type', async () => {\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      expect(service.getNotificationsByType('order_status_update')).toHaveLength(1);\n      expect(service.getNotificationsByType('order_confirmation')).toHaveLength(0);\n    });\n\n    it('should clear notifications', async () => {\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      service.clearNotifications();\n      expect(service.getNotificationCount()).toBe(0);\n    });\n\n    it('should generate sequential notification IDs', async () => {\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-2',\n          userId: 'user-1',\n          items: [],\n          total: 30,\n          status: 'shipped',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'confirmed',\n        newStatus: 'shipped',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      const notifications = service.getNotifications();\n      expect(notifications[0]?.id).toBe('notif-0001');\n      expect(notifications[1]?.id).toBe('notif-0002');\n    });\n  });\n\n  describe('notification lifecycle events', () => {\n    it('should emit notification:sent event on successful delivery', async () => {\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      const events = eventBus.getEventLog();\n      const sentEvents = events.filter((e) => e.type === 'notification:sent');\n      expect(sentEvents).toHaveLength(1);\n    });\n\n    it('should emit notification:failed event when no adapter registered', async () => {\n      service.unregisterAdapter('email');\n\n      await eventBus.emit({\n        type: 'order:status-changed',\n        order: {\n          id: 'order-1',\n          userId: 'user-1',\n          items: [],\n          total: 20,\n          status: 'confirmed',\n          createdAt: new Date(),\n          updatedAt: new Date(),\n        },\n        previousStatus: 'pending',\n        newStatus: 'confirmed',\n        timestamp: new Date(),\n      } satisfies OrderStatusChangedEvent);\n\n      const events = eventBus.getEventLog();\n      const failedEvents = events.filter((e) => e.type === 'notification:failed');\n      expect(failedEvents).toHaveLength(1);\n    });\n  });\n});\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:50:28.226Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/order.service.test.ts"
+      },
+      "timestamp": "2026-03-28T05:50:33.316Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/services/order.service.test.ts",
+        "new_string": "    it('should update status and emit event via EventBus', async () => {\n      const order = await service.createOrder({\n        userId: 'user-1',\n        items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n      });\n\n      const updated = await service.updateOrderStatus(order.id, 'confirmed');\n      expect(updated.status).toBe('confirmed');\n\n      // Both order:created and order:status-changed go through EventBus\n      const events = eventBus.getEventLog();\n      expect(events).toHaveLength(2);\n      expect(events[0]?.type).toBe('order:created');\n      expect(events[1]?.type).toBe('order:status-changed');\n    });",
+        "old_string": "    it('should update status and emit event', async () => {\n      const order = await service.createOrder({\n        userId: 'user-1',\n        items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n      });\n\n      const updated = await service.updateOrderStatus(order.id, 'confirmed');\n      expect(updated.status).toBe('confirmed');\n\n      // order:created goes through EventBus, status-changed goes through CallbackRegistry\n      const events = eventBus.getEventLog();\n      expect(events).toHaveLength(1); // only created\n      expect(events[0]?.type).toBe('order:created');\n    });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T05:50:40.634Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "import { describe, it, expect, beforeEach } from 'vitest';\nimport { EmailAdapter } from '../../src/adapters/email.adapter.js';\nimport type { NotificationPayload } from '../../src/models/notification.js';\n\ndescribe('EmailAdapter', () => {\n  let adapter: EmailAdapter;\n\n  const samplePayload: NotificationPayload = {\n    type: 'order_confirmation',\n    recipient: 'alice@example.com',\n    subject: 'Order Confirmation: order-0001',\n    body: 'Your order has been placed.',\n    channel: 'email',\n    priority: 'normal',\n  };\n\n  beforeEach(() => {\n    adapter = new EmailAdapter({ stubMode: true });\n  });\n\n  describe('send', () => {\n    it('should succeed in stub mode', async () => {\n      const result = await adapter.send(samplePayload);\n\n      expect(result.success).toBe(true);\n      expect(result.channel).toBe('email');\n    });\n\n    it('should record sent emails in stub mode', async () => {\n      await adapter.send(samplePayload);\n\n      const sentEmails = adapter.getSentEmails();\n      expect(sentEmails).toHaveLength(1);\n      expect(sentEmails[0]?.to).toBe('alice@example.com');\n      expect(sentEmails[0]?.subject).toBe('Order Confirmation: order-0001');\n    });\n\n    it('should fail in non-stub mode (no real SMTP configured)', async () => {\n      const productionAdapter = new EmailAdapter({ stubMode: false });\n      const result = await productionAdapter.send(samplePayload);\n\n      expect(result.success).toBe(false);\n      expect(result.failureReason).toBeDefined();\n    });\n  });\n\n  describe('configuration', () => {\n    it('should use default config when none provided', () => {\n      const defaultAdapter = new EmailAdapter();\n      const config = defaultAdapter.getConfig();\n\n      expect(config.host).toBe('localhost');\n      expect(config.port).toBe(587);\n      expect(config.fromAddress).toBe('noreply@taskflow.dev');\n      expect(config.stubMode).toBe(true);\n    });\n\n    it('should merge custom config with defaults', () => {\n      const customAdapter = new EmailAdapter({\n        host: 'smtp.example.com',\n        fromAddress: 'app@example.com',\n      });\n      const config = customAdapter.getConfig();\n\n      expect(config.host).toBe('smtp.example.com');\n      expect(config.fromAddress).toBe('app@example.com');\n      expect(config.port).toBe(587); // default preserved\n    });\n  });\n\n  describe('channel property', () => {\n    it('should report email as its channel', () => {\n      expect(adapter.channel).toBe('email');\n    });\n  });\n\n  describe('clearSentEmails', () => {\n    it('should clear sent email records', async () => {\n      await adapter.send(samplePayload);\n      expect(adapter.getSentEmails()).toHaveLength(1);\n\n      adapter.clearSentEmails();\n      expect(adapter.getSentEmails()).toHaveLength(0);\n    });\n  });\n});\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/tests/adapters/email.adapter.test.ts"
+      },
+      "timestamp": "2026-03-28T05:50:54.999Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "# Notification System Architecture\n\n## Decision: Event-Driven with Adapter Dispatch\n\n**Pattern chosen:** Event-driven (EventBus with subscribers)\n**Pattern rejected:** Direct service calls / CallbackRegistry\n\n### Why Event-Driven?\n\n1. **The codebase already uses EventBus.** The EventBus was the primary inter-service communication mechanism. The prior inconsistency (mixing CallbackRegistry with EventBus) was explicitly flagged as a problem to fix. We unified on EventBus.\n\n2. **Loose coupling.** Domain services (OrderService, UserService) emit events without knowing who listens. Adding a new notification channel (SMS, webhook) requires zero changes to existing services — just register a new adapter.\n\n3. **Extensibility for 11+ developers.** With 11 more developers building on this foundation, a single extension point (implement `NotificationAdapter`, register it) is far easier to coordinate than modifying shared service call chains.\n\n4. **Observability.** EventBus maintains an event log. Every domain event and every notification lifecycle event (sent, failed) is recorded, enabling audit trails, debugging, and testing.\n\n5. **Async-first.** EventBus handlers are async, which matches the reality of notification delivery (network I/O to SMTP, SMS gateways, webhooks).\n\n### Architecture Overview\n\n```\n┌─────────────────┐     emit()      ┌──────────┐     on()     ┌─────────────────────┐\n│  OrderService    │ ──────────────► │          │ ────────────► │                     │\n│  UserService     │   domain events │ EventBus │              │ NotificationService │\n│  (any service)   │                 │          │ ◄──────────── │                     │\n└─────────────────┘                  └──────────┘   emit()     └──────────┬──────────┘\n                                                  lifecycle events        │\n                                                                         │ dispatch by channel\n                                                                         ▼\n                                                              ┌─────────────────────┐\n                                                              │  Adapter Registry    │\n                                                              │                     │\n                                                              │  email → EmailAdapter│\n                                                              │  sms   → SmsAdapter │\n                                                              │  ...   → ...        │\n                                                              └─────────────────────┘\n```\n\n### Flow\n\n1. A domain service performs a business action and calls `eventBus.emit({ type: 'order:created', ... })`.\n2. `NotificationService` has subscribed to `'order:created'` via `eventBus.on()`.\n3. The handler maps the domain event to a `CreateNotificationInput` (choosing type, recipient, subject, body, channel, priority).\n4. `NotificationService.send()` looks up the registered `NotificationAdapter` for the specified channel.\n5. The adapter's `send()` method attempts delivery and returns a `NotificationResult`.\n6. A `NotificationRecord` is stored with the delivery status.\n7. A lifecycle event (`notification:sent` or `notification:failed`) is emitted back to EventBus.\n\n### Constraints (MUST follow)\n\n1. **All cross-service communication MUST go through EventBus.** Do NOT use `CallbackRegistry`, direct function calls between services, or shared mutable state. The `CallbackRegistry` still exists in `/src/utils/` for backward compatibility but MUST NOT be used for new features.\n\n2. **All notification delivery adapters MUST implement `NotificationAdapter`.** This interface is defined in `/src/adapters/notification.adapter.ts`. It requires:\n   - A `readonly channel` property matching a `NotificationChannel` value.\n   - An async `send(payload)` method returning a `NotificationResult`.\n\n3. **Adapters MUST NOT throw from `send()`.** Return `{ success: false, failureReason: '...' }` instead. The `NotificationService` has a safety catch, but adapters should handle their own errors.\n\n4. **One adapter per channel.** Registering a second adapter for the same channel replaces the first. If you need multiple providers for the same channel (e.g., failover), implement that inside a single adapter.\n\n5. **All notifications go through `NotificationService.send()`.** Do not bypass it to call adapters directly. The service handles record-keeping and lifecycle events.\n\n6. **Notification types must be declared.** Add new values to the `NotificationType` union in `/src/models/notification.ts` when adding new notification-worthy events.\n\n### Type Reference\n\n| Type | Location | Purpose |\n|------|----------|---------|\n| `NotificationType` | `src/models/notification.ts` | What happened (e.g., `'order_confirmation'`) |\n| `NotificationChannel` | `src/models/notification.ts` | How to deliver (e.g., `'email'`, `'sms'`) |\n| `NotificationPriority` | `src/models/notification.ts` | Urgency level (`'low'` to `'urgent'`) |\n| `NotificationStatus` | `src/models/notification.ts` | Delivery state (`'pending'`, `'sent'`, `'failed'`) |\n| `NotificationPayload` | `src/models/notification.ts` | What's passed to adapters |\n| `NotificationRecord` | `src/models/notification.ts` | What's stored (includes status) |\n| `NotificationResult` | `src/models/notification.ts` | What adapters return |\n| `CreateNotificationInput` | `src/models/notification.ts` | Convenience input for `send()` |\n| `NotificationAdapter` | `src/adapters/notification.adapter.ts` | Interface for all adapters |\n| `NotificationSentEvent` | `src/events/event-types.ts` | Lifecycle event on success |\n| `NotificationFailedEvent` | `src/events/event-types.ts` | Lifecycle event on failure |\n\n### How to Add a New Notification Channel\n\n1. Create `src/adapters/<channel>.adapter.ts` implementing `NotificationAdapter`.\n2. Add any channel-specific config interface.\n3. Register the adapter: `notificationService.registerAdapter(new MyAdapter(config))`.\n4. Export from `src/index.ts`.\n5. Add tests in `tests/adapters/<channel>.adapter.test.ts`.\n\n### How to Add a New Notification-Worthy Event\n\n1. Define the event interface in `src/events/event-types.ts`.\n2. Add it to the `AppEvent` union type.\n3. Add a corresponding `NotificationType` value in `src/models/notification.ts`.\n4. Add an event handler in `NotificationService.registerEventHandlers()`.\n5. Emit the event from the relevant domain service via `eventBus.emit()`.\n\n### What Changed from the Previous Architecture\n\n- **Unified on EventBus.** Previously, `OrderService.updateOrderStatus()` used `CallbackRegistry` (direct callbacks) while `OrderService.createOrder()` used `EventBus`. Now both use `EventBus`.\n- **Adapter pattern for delivery.** Previously, `NotificationService` stored notifications in-memory directly. Now it dispatches to registered adapters, with `EmailAdapter` as the first implementation.\n- **Richer notification model.** The old `Notification` interface had 5 fields. The new `NotificationRecord` has 12 fields including type, channel, status, priority, and metadata.\n- **Lifecycle events.** `notification:sent` and `notification:failed` events are now emitted, enabling observability and downstream reactions.\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm/ARCHITECTURE.md"
+      },
+      "timestamp": "2026-03-28T05:51:36.685Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "in_progress"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:51:45.113Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "cd /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm && npx tsc --noEmit 2>&1",
+        "description": "Type check the project",
+        "timeout": 30000
+      },
+      "timestamp": "2026-03-28T05:51:50.116Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "cd /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-gIRIAm && npx vitest run 2>&1",
+        "description": "Run all tests",
+        "timeout": 60000
+      },
+      "timestamp": "2026-03-28T05:51:50.916Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Creating notification model types",
+            "content": "Create notification model types in src/models/notification.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Adding notification events to event types",
+            "content": "Add notification events to src/events/event-types.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating NotificationAdapter interface",
+            "content": "Create NotificationAdapter interface in src/adapters/notification.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Creating email notification adapter",
+            "content": "Create email adapter in src/adapters/email.adapter.ts",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Refactoring NotificationService",
+            "content": "Refactor NotificationService to event-driven with adapter dispatch",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Unifying OrderService to EventBus",
+            "content": "Unify OrderService to use EventBus for status changes (remove CallbackRegistry usage)",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating index.ts exports",
+            "content": "Update src/index.ts with new exports",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Updating tests",
+            "content": "Update tests for new architecture",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Writing architecture documentation",
+            "content": "Write ARCHITECTURE.md documenting decisions",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Verifying compilation and running tests",
+            "content": "Verify compilation and run tests",
+            "status": "completed"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T05:51:59.854Z",
+      "toolName": "TodoWrite"
+    }
+  ],
+  "turnUsage": []
+}

@@ -1,0 +1,146 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 4701956..f9bf647 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -47,6 +47,8 @@ export class NotificationService {
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | null = null;
+   private historyService: NotificationHistoryService | null = null;
++  /** Per-user promise chains to guarantee notification delivery order. */
++  private sendQueues: Map<string, Promise<void>> = new Map();
+ 
+   constructor(
+     private eventBus: EventBus,
+@@ -139,7 +141,31 @@ export class NotificationService {
+    * If a PreferencesService is configured and a userId is provided,
+    * the user's preferences are checked before sending.
+    */
+-  private async send(params: {
++  private send(params: {
++    type: NotificationType;
++    channel: NotificationChannel;
++    recipient: string;
++    subject: string;
++    body: string;
++    priority: Notification['priority'];
++    userId?: string;
++    metadata?: Record<string, string>;
++  }): Promise<Notification | null> {
++    const queueKey = params.userId ?? params.recipient;
++    const previous = this.sendQueues.get(queueKey) ?? Promise.resolve();
++
++    const current = previous.then(() => this.deliverNotification(params));
++
++    // Store the chain; swallow errors so one failure doesn't block future sends
++    this.sendQueues.set(queueKey, current.then(() => {}, () => {}));
++
++    return current;
++  }
++
++  /**
++   * Internal delivery logic — called sequentially per user via the send queue.
++   */
++  private async deliverNotification(params: {
+     type: NotificationType;
+     channel: NotificationChannel;
+     recipient: string;
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 46dd7b6..3431b41 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -4,6 +4,8 @@ import {
+   NotificationService,
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
++import type { NotificationAdapter, SendResult } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -226,4 +228,86 @@ describe('NotificationService', () => {
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in order even when adapter has variable latency', async () => {
++      // Adapter that introduces variable delay — first call is slow, second is fast.
++      // Without ordering guarantees, the second notification would arrive before the first.
++      const deliveryOrder: string[] = [];
++      let callIndex = 0;
++      const delays = [50, 5]; // first notification slow, second fast
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as const,
++        async send(payload: NotificationPayload): Promise<SendResult> {
++          const delay = delays[callIndex++] ?? 0;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(payload.subject);
++          return { success: true };
++        },
++      };
++
++      service.registerAdapter(slowAdapter);
++
++      const now = new Date();
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: now,
++          updatedAt: now,
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: now,
++          updatedAt: now,
++        },
++        timestamp: now,
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: now,
++          updatedAt: now,
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: now,
++      };
++
++      // Fire both events concurrently — without the ordering fix,
++      // the fast second notification would be delivered before the slow first one.
++      const [, ] = await Promise.all([
++        eventBus.emit(orderCreatedEvent),
++        eventBus.emit(statusChangedEvent),
++      ]);
++
++      // Wait for the send queue to drain
++      await new Promise((resolve) => setTimeout(resolve, 100));
++
++      // Verify delivery order matches emit order
++      expect(deliveryOrder).toHaveLength(2);
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++
++      // Also verify the stored notifications are in order
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order:confirmation');
++      expect(notifications[1]?.type).toBe('order:status-update');
++    });
++  });
+ });

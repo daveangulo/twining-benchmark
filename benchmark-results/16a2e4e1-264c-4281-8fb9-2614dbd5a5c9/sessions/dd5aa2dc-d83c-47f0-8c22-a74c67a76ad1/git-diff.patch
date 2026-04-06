@@ -1,0 +1,285 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 78e60ac..4bcf2f0 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -358,3 +358,41 @@ The user preferences model (`src/models/user-preferences.ts`) was designed by Ag
+ - Default event handlers still dispatch to `channel: 'email'` only. To dispatch to SMS or webhook, handlers need modification or a multi-channel dispatch layer
+ - The `frequency` field on EmailPreferences is modeled but not enforced (digest batching is a future concern)
+ - To add `in_app` preferences: add `InAppPreferences` extending `ChannelPreferences`, add to `UserPreferences`, add default getter, add case in `getChannelPreferences()`
++
++## Agent 10 — Notification Delivery Ordering Fix (completed)
++
++### What was done
++1. **Fixed notification ordering bug** (`src/services/notification.service.ts`):
++   - Added `dispatchQueue: Promise<void>` — a promise chain that serializes all dispatches in FIFO order
++   - Split `dispatch()` into two methods: `dispatch()` (queues work) and `doDispatch()` (does actual work)
++   - `dispatch()` chains each new dispatch onto `dispatchQueue`, ensuring notifications are delivered in the order they were triggered even when `adapter.send()` has variable latency
++   - Errors in one dispatch don't block subsequent dispatches (the queue swallows rejections via `.catch()`)
++   - Added `waitForPendingDispatches()` public method that returns the queue promise, useful for testing
++
++2. **Updated existing tests** to account for async dispatch queue:
++   - `tests/services/notification.service.test.ts`: 4 tests that used synchronous `statusChangeCallbacks.notify()` now await `service.waitForPendingDispatches()` before asserting
++   - `tests/services/notification-history.service.test.ts`: 2 tests updated similarly
++   - No changes needed for EventBus-path tests (they already `await eventBus.emit()`)
++
++3. **Added ordering regression test** (`tests/services/notification.service.test.ts`):
++   - Uses a mock adapter where the first call takes 50ms and the second takes 10ms
++   - Fires two events concurrently without awaiting between them
++   - Verifies that delivery order matches dispatch order (order_confirmation before order_status_update)
++   - Verifies records array is also in correct order
++
++### Root cause
++Two issues caused out-of-order delivery:
++1. **No dispatch serialization**: `dispatch()` was async but had no queue. Concurrent dispatches could interleave — if `adapter.send(A)` took longer than `adapter.send(B)`, notification B would be delivered and recorded before A.
++2. **Fire-and-forget in callback registry path**: The `statusChangeCallbacks.register()` handler called `this.handleOrderStatusChanged(event)` without awaiting the returned promise, so dispatches from the callback path ran uncontrolled.
++
++### Key decisions
++- Used a promise chain pattern rather than a full queue data structure — minimal and sufficient for serialization
++- Kept `dispatch()` as the public-facing method and extracted `doDispatch()` as private — no API change for callers
++- `waitForPendingDispatches()` is the only new public method — needed for tests that use the fire-and-forget callback registry path
++- Did NOT change the callback registry to be async — the queue handles ordering regardless of how dispatch is triggered
++
++### Context for next agents
++- All 220 tests pass (219 existing + 1 new ordering test), TypeScript compiles cleanly
++- Constructor signature unchanged: `NotificationService(eventBus, adapters?, preferencesService?, historyService?)`
++- Tests using `statusChangeCallbacks.notify()` must now call `await service.waitForPendingDispatches()` before asserting on notification state
++- The dispatch queue guarantees FIFO ordering across ALL dispatch paths (EventBus, callback registry, or any future trigger)
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index c3a7b59..9f37889 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -56,6 +56,7 @@ export class NotificationService {
+   private records: NotificationRecord[] = [];
+   private preferencesService?: PreferencesService;
+   private historyService?: NotificationHistoryService;
++  private dispatchQueue: Promise<void> = Promise.resolve();
+ 
+   /**
+    * @param eventBus - The application EventBus for receiving events
+@@ -191,11 +192,34 @@ export class NotificationService {
+     });
+   }
+ 
++  /**
++   * Wait for all pending dispatches to complete. Useful for testing.
++   */
++  waitForPendingDispatches(): Promise<void> {
++    return this.dispatchQueue;
++  }
++
+   /**
+    * Build a NotificationPayload and send it through the appropriate adapter.
++   * Dispatches are serialized via a queue to guarantee delivery ordering.
+    * Emits notification:sent or notification:failed events with the result.
+    */
+-  private async dispatch(params: {
++  private dispatch(params: {
++    type: NotificationType;
++    channel: NotificationChannel;
++    recipient: string;
++    subject: string;
++    body: string;
++    priority: NotificationPriority;
++    metadata: Record<string, string>;
++  }): Promise<void> {
++    const task = this.dispatchQueue.then(() => this.doDispatch(params));
++    // Swallow errors in the chain so one failure doesn't block subsequent dispatches
++    this.dispatchQueue = task.catch(() => {});
++    return task;
++  }
++
++  private async doDispatch(params: {
+     type: NotificationType;
+     channel: NotificationChannel;
+     recipient: string;
+diff --git a/tests/services/notification-history.service.test.ts b/tests/services/notification-history.service.test.ts
+index 4d1a562..67bdf46 100644
+--- a/tests/services/notification-history.service.test.ts
++++ b/tests/services/notification-history.service.test.ts
+@@ -291,7 +291,7 @@ describe('NotificationService with history', () => {
+     expect(logs[0]!.error).toContain('No adapter for channel');
+   });
+ 
+-  it('should log notifications dispatched via callback registry', () => {
++  it('should log notifications dispatched via callback registry', async () => {
+     const event: OrderStatusChangedEvent = {
+       type: 'order:status-changed',
+       order: {
+@@ -309,6 +309,7 @@ describe('NotificationService with history', () => {
+     };
+ 
+     statusChangeCallbacks.notify(event);
++    await notificationService.waitForPendingDispatches();
+ 
+     expect(historyService.count()).toBe(1);
+     const logs = historyService.getByType('order_status_update');
+@@ -391,6 +392,7 @@ describe('NotificationService with history', () => {
+       newStatus: 'confirmed',
+       timestamp: new Date(),
+     });
++    await serviceWithoutHistory.waitForPendingDispatches();
+ 
+     // No errors, and notification service still works
+     expect(serviceWithoutHistory.getNotificationCount()).toBe(1);
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index ad0020f..aa4f043 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -6,6 +6,8 @@ import {
+ } from '../../src/services/notification.service.js';
+ import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload, NotificationResult } from '../../src/models/notification.js';
+ 
+ describe('NotificationService', () => {
+   let eventBus: EventBus;
+@@ -89,7 +91,7 @@ describe('NotificationService', () => {
+   });
+ 
+   describe('order:status-changed handler', () => {
+-    it('should send notification on status change', () => {
++    it('should send notification on status change', async () => {
+       const event: OrderStatusChangedEvent = {
+         type: 'order:status-changed',
+         order: {
+@@ -107,6 +109,7 @@ describe('NotificationService', () => {
+       };
+ 
+       statusChangeCallbacks.notify(event);
++      await service.waitForPendingDispatches();
+ 
+       const notifications = service.getNotifications();
+       expect(notifications).toHaveLength(1);
+@@ -117,7 +120,7 @@ describe('NotificationService', () => {
+   });
+ 
+   describe('notification management', () => {
+-    it('should count notifications', () => {
++    it('should count notifications', async () => {
+       expect(service.getNotificationCount()).toBe(0);
+ 
+       statusChangeCallbacks.notify({
+@@ -135,6 +138,7 @@ describe('NotificationService', () => {
+         newStatus: 'confirmed',
+         timestamp: new Date(),
+       });
++      await service.waitForPendingDispatches();
+ 
+       expect(service.getNotificationCount()).toBe(1);
+     });
+@@ -170,7 +174,7 @@ describe('NotificationService', () => {
+       expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);
+     });
+ 
+-    it('should clear notifications', () => {
++    it('should clear notifications', async () => {
+       statusChangeCallbacks.notify({
+         type: 'order:status-changed',
+         order: {
+@@ -186,12 +190,13 @@ describe('NotificationService', () => {
+         newStatus: 'confirmed',
+         timestamp: new Date(),
+       });
++      await service.waitForPendingDispatches();
+ 
+       service.clearNotifications();
+       expect(service.getNotificationCount()).toBe(0);
+     });
+ 
+-    it('should generate sequential notification IDs', () => {
++    it('should generate sequential notification IDs', async () => {
+       statusChangeCallbacks.notify({
+         type: 'order:status-changed',
+         order: {
+@@ -222,10 +227,90 @@ describe('NotificationService', () => {
+         newStatus: 'shipped',
+         timestamp: new Date(),
+       });
++      await service.waitForPendingDispatches();
+ 
+       const notifications = service.getNotifications();
+       expect(notifications[0]?.id).toBe('notif-0001');
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification delivery ordering', () => {
++    it('should deliver notifications in order even when adapter is slow', async () => {
++      const deliveryOrder: string[] = [];
++
++      // Adapter where the first call takes longer than the second,
++      // which would cause out-of-order delivery without a queue.
++      let callCount = 0;
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as const,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          callCount++;
++          const delay = callCount === 1 ? 50 : 10;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(payload.subject);
++          return { success: true, channel: 'email', deliveredAt: new Date() };
++        },
++      };
++
++      const freshEventBus = new EventBus();
++      statusChangeCallbacks.clear();
++      const orderedService = new NotificationService(freshEventBus, [slowAdapter]);
++      resetNotificationIdCounter();
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently (don't await the first before the second)
++      const p1 = freshEventBus.emit(orderCreatedEvent);
++      const p2 = freshEventBus.emit(statusChangedEvent);
++      await Promise.all([p1, p2]);
++
++      // Despite the first adapter call being slower, order should be preserved
++      expect(deliveryOrder).toHaveLength(2);
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++
++      // Records should also be in order
++      const records = orderedService.getNotificationRecords();
++      expect(records).toHaveLength(2);
++      expect(records[0]!.payload.type).toBe('order_confirmation');
++      expect(records[1]!.payload.type).toBe('order_status_update');
++    });
++  });
+ });

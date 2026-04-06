@@ -1,0 +1,754 @@
+diff --git a/src/index.ts b/src/index.ts
+index 3e5f976..5065007 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -33,6 +33,7 @@ export { BaseRepository } from './repositories/base.repository.js';
+ export { UserRepository } from './repositories/user.repository.js';
+ export { OrderRepository } from './repositories/order.repository.js';
+ export { PreferencesRepository } from './repositories/preferences.repository.js';
++export { NotificationLogRepository } from './repositories/notification-log.repository.js';
+ 
+ // Events
+ export { EventBus } from './events/event-bus.js';
+@@ -50,6 +51,7 @@ export { UserService } from './services/user.service.js';
+ export { OrderService } from './services/order.service.js';
+ export { NotificationService } from './services/notification.service.js';
+ export { PreferencesService } from './services/preferences.service.js';
++export { NotificationHistoryService, resetLogIdCounter } from './services/notification-history.service.js';
+ 
+ // User Preferences Models
+ export type {
+@@ -70,6 +72,13 @@ export type {
+   NotificationResult,
+ } from './models/notification.js';
+ 
++// Notification Log Models
++export type {
++  NotificationLog,
++  NotificationHistoryQuery,
++  DeliveryStatus,
++} from './models/notification-log.js';
++
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter } from './adapters/email.adapter.js';
+diff --git a/src/models/notification-log.ts b/src/models/notification-log.ts
+new file mode 100644
+index 0000000..338aa82
+--- /dev/null
++++ b/src/models/notification-log.ts
+@@ -0,0 +1,32 @@
++/**
++ * Notification log model — tracks sent notifications for history/auditing.
++ *
++ * Each log entry captures: recipient, channel, type, timestamp, and delivery status.
++ */
++
++import type { NotificationChannel, NotificationType } from './notification.js';
++
++export type DeliveryStatus = 'delivered' | 'failed' | 'suppressed';
++
++export interface NotificationLog {
++  id: string;
++  notificationId: string;
++  recipient: string;
++  userId?: string;
++  channel: NotificationChannel;
++  type: NotificationType;
++  subject: string;
++  status: DeliveryStatus;
++  error?: string;
++  timestamp: Date;
++}
++
++export interface NotificationHistoryQuery {
++  userId?: string;
++  recipient?: string;
++  type?: NotificationType;
++  channel?: NotificationChannel;
++  status?: DeliveryStatus;
++  from?: Date;
++  to?: Date;
++}
+diff --git a/src/repositories/notification-log.repository.ts b/src/repositories/notification-log.repository.ts
+new file mode 100644
+index 0000000..54f2349
+--- /dev/null
++++ b/src/repositories/notification-log.repository.ts
+@@ -0,0 +1,69 @@
++/**
++ * Repository for NotificationLog data access.
++ *
++ * Extends BaseRepository with notification-log-specific queries.
++ */
++
++import type { DatabaseRecord } from '../utils/database.js';
++import type { Database } from '../utils/database.js';
++import type { NotificationLog, DeliveryStatus } from '../models/notification-log.js';
++import type { NotificationChannel, NotificationType } from '../models/notification.js';
++import { BaseRepository } from './base.repository.js';
++
++export class NotificationLogRepository extends BaseRepository<NotificationLog> {
++  constructor(db: Database) {
++    super(db, 'notification_logs');
++  }
++
++  protected toDomain(record: DatabaseRecord): NotificationLog {
++    return {
++      id: record['id'] as string,
++      notificationId: record['notificationId'] as string,
++      recipient: record['recipient'] as string,
++      userId: (record['userId'] as string) || undefined,
++      channel: record['channel'] as NotificationChannel,
++      type: record['type'] as NotificationType,
++      subject: record['subject'] as string,
++      status: record['status'] as DeliveryStatus,
++      error: (record['error'] as string) || undefined,
++      timestamp: new Date(record['timestamp'] as string),
++    };
++  }
++
++  protected toRecord(entity: NotificationLog): DatabaseRecord {
++    return {
++      id: entity.id,
++      notificationId: entity.notificationId,
++      recipient: entity.recipient,
++      userId: entity.userId ?? '',
++      channel: entity.channel,
++      type: entity.type,
++      subject: entity.subject,
++      status: entity.status,
++      error: entity.error ?? '',
++      timestamp: entity.timestamp.toISOString(),
++    };
++  }
++
++  findByUserId(userId: string): NotificationLog[] {
++    return this.findAll((log) => log.userId === userId);
++  }
++
++  findByRecipient(recipient: string): NotificationLog[] {
++    return this.findAll((log) => log.recipient === recipient);
++  }
++
++  findByType(type: NotificationType): NotificationLog[] {
++    return this.findAll((log) => log.type === type);
++  }
++
++  findByChannel(channel: NotificationChannel): NotificationLog[] {
++    return this.findAll((log) => log.channel === channel);
++  }
++
++  findByDateRange(from: Date, to: Date): NotificationLog[] {
++    return this.findAll(
++      (log) => log.timestamp >= from && log.timestamp <= to,
++    );
++  }
++}
+diff --git a/src/services/notification-history.service.ts b/src/services/notification-history.service.ts
+new file mode 100644
+index 0000000..f635d2a
+--- /dev/null
++++ b/src/services/notification-history.service.ts
+@@ -0,0 +1,117 @@
++/**
++ * Notification history service — logs and queries sent notifications.
++ *
++ * Integrates with NotificationService via setter injection.
++ * Every notification (delivered, failed, or suppressed) is logged.
++ */
++
++import type { NotificationLogRepository } from '../repositories/notification-log.repository.js';
++import type {
++  NotificationLog,
++  NotificationHistoryQuery,
++  DeliveryStatus,
++} from '../models/notification-log.js';
++import type { NotificationChannel, NotificationType } from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++let nextLogId = 1;
++
++function generateLogId(): string {
++  return `log-${String(nextLogId++).padStart(4, '0')}`;
++}
++
++/** Reset the log ID counter. Useful for testing. */
++export function resetLogIdCounter(): void {
++  nextLogId = 1;
++}
++
++export class NotificationHistoryService {
++  private logger = new Logger('NotificationHistoryService');
++
++  constructor(private repository: NotificationLogRepository) {}
++
++  /**
++   * Record a notification in the history log.
++   */
++  log(params: {
++    notificationId: string;
++    recipient: string;
++    userId?: string;
++    channel: NotificationChannel;
++    type: NotificationType;
++    subject: string;
++    status: DeliveryStatus;
++    error?: string;
++    timestamp?: Date;
++  }): NotificationLog {
++    const entry: NotificationLog = {
++      id: generateLogId(),
++      notificationId: params.notificationId,
++      recipient: params.recipient,
++      userId: params.userId,
++      channel: params.channel,
++      type: params.type,
++      subject: params.subject,
++      status: params.status,
++      error: params.error,
++      timestamp: params.timestamp ?? new Date(),
++    };
++
++    this.repository.save(entry);
++    this.logger.info(
++      `Logged notification ${params.notificationId} [${params.type}] ${params.status}`,
++    );
++    return entry;
++  }
++
++  /**
++   * Query notification history with flexible filters.
++   */
++  query(filters: NotificationHistoryQuery): NotificationLog[] {
++    return this.repository.findAll((log) => {
++      if (filters.userId && log.userId !== filters.userId) return false;
++      if (filters.recipient && log.recipient !== filters.recipient) return false;
++      if (filters.type && log.type !== filters.type) return false;
++      if (filters.channel && log.channel !== filters.channel) return false;
++      if (filters.status && log.status !== filters.status) return false;
++      if (filters.from && log.timestamp < filters.from) return false;
++      if (filters.to && log.timestamp > filters.to) return false;
++      return true;
++    });
++  }
++
++  /**
++   * Get all log entries for a specific user.
++   */
++  getByUserId(userId: string): NotificationLog[] {
++    return this.repository.findByUserId(userId);
++  }
++
++  /**
++   * Get all log entries for a specific recipient.
++   */
++  getByRecipient(recipient: string): NotificationLog[] {
++    return this.repository.findByRecipient(recipient);
++  }
++
++  /**
++   * Get all log entries for a specific notification type.
++   */
++  getByType(type: NotificationType): NotificationLog[] {
++    return this.repository.findByType(type);
++  }
++
++  /**
++   * Get all log entries within a date range.
++   */
++  getByDateRange(from: Date, to: Date): NotificationLog[] {
++    return this.repository.findByDateRange(from, to);
++  }
++
++  /**
++   * Get the total count of logged notifications.
++   */
++  count(): number {
++    return this.repository.count();
++  }
++}
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 7ae3a54..174d5b6 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -32,6 +32,8 @@ import type {
+   NotificationType,
+ } from '../models/notification.js';
+ import type { PreferencesService } from './preferences.service.js';
++import type { NotificationHistoryService } from './notification-history.service.js';
++import type { DeliveryStatus } from '../models/notification-log.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ let nextId = 1;
+@@ -50,6 +52,7 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | null = null;
++  private historyService: NotificationHistoryService | null = null;
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+@@ -65,6 +68,15 @@ export class NotificationService {
+     this.logger.info('Preferences service registered');
+   }
+ 
++  /**
++   * Set the notification history service for logging all sent notifications.
++   * When set, every notification (delivered, failed, suppressed) is logged.
++   */
++  setHistoryService(historyService: NotificationHistoryService): void {
++    this.historyService = historyService;
++    this.logger.info('History service registered');
++  }
++
+   /**
+    * Register a notification adapter for a delivery channel.
+    * Only one adapter per channel is allowed; later registrations replace earlier ones.
+@@ -170,12 +182,23 @@ export class NotificationService {
+     // Check user preferences before sending
+     if (this.preferencesService && params.userId && params.channel === 'email') {
+       if (!this.preferencesService.shouldSendEmail(params.userId, params.type)) {
++        const suppressedId = generateNotificationId();
+         this.logger.info(
+           `Notification [${params.type}] suppressed for user ${params.userId} by preferences`,
+         );
++        this.logToHistory({
++          notificationId: suppressedId,
++          recipient: params.recipient,
++          userId: params.userId,
++          channel: params.channel,
++          type: params.type,
++          subject: params.subject,
++          status: 'suppressed',
++          error: 'Suppressed by user preferences',
++        });
+         return {
+           success: false,
+-          notificationId: generateNotificationId(),
++          notificationId: suppressedId,
+           channel: params.channel,
+           error: 'Suppressed by user preferences',
+           timestamp: new Date(),
+@@ -224,6 +247,18 @@ export class NotificationService {
+     };
+     this.notifications.push(notification);
+ 
++    const deliveryStatus: DeliveryStatus = result.success ? 'delivered' : 'failed';
++    this.logToHistory({
++      notificationId: payload.id,
++      recipient: params.recipient,
++      userId: params.userId,
++      channel: params.channel,
++      type: params.type,
++      subject: params.subject,
++      status: deliveryStatus,
++      error: result.error,
++    });
++
+     this.logger.info(
+       `Notification ${payload.id} [${params.type}] via ${params.channel} to ${params.recipient}: ${result.success ? 'delivered' : 'failed'}`,
+     );
+@@ -258,4 +293,22 @@ export class NotificationService {
+   clearNotifications(): void {
+     this.notifications = [];
+   }
++
++  /**
++   * Log a notification to the history service if one is registered.
++   */
++  private logToHistory(params: {
++    notificationId: string;
++    recipient: string;
++    userId?: string;
++    channel: NotificationChannel;
++    type: NotificationType;
++    subject: string;
++    status: DeliveryStatus;
++    error?: string;
++  }): void {
++    if (this.historyService) {
++      this.historyService.log(params);
++    }
++  }
+ }
+diff --git a/tests/services/notification-history.service.test.ts b/tests/services/notification-history.service.test.ts
+new file mode 100644
+index 0000000..405f8bd
+--- /dev/null
++++ b/tests/services/notification-history.service.test.ts
+@@ -0,0 +1,374 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database } from '../../src/utils/database.js';
++import { EventBus } from '../../src/events/event-bus.js';
++import { NotificationLogRepository } from '../../src/repositories/notification-log.repository.js';
++import {
++  NotificationHistoryService,
++  resetLogIdCounter,
++} from '../../src/services/notification-history.service.js';
++import {
++  NotificationService,
++  resetNotificationIdCounter,
++} from '../../src/services/notification.service.js';
++import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type { OrderCreatedEvent, UserCreatedEvent } from '../../src/events/event-types.js';
++
++describe('NotificationHistoryService', () => {
++  let db: Database;
++  let repository: NotificationLogRepository;
++  let historyService: NotificationHistoryService;
++
++  beforeEach(() => {
++    db = new Database();
++    repository = new NotificationLogRepository(db);
++    historyService = new NotificationHistoryService(repository);
++    resetLogIdCounter();
++  });
++
++  describe('log()', () => {
++    it('should log a notification entry', () => {
++      const entry = historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        userId: 'user-1',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'delivered',
++      });
++
++      expect(entry.id).toBe('log-0001');
++      expect(entry.notificationId).toBe('notif-0001');
++      expect(entry.recipient).toBe('alice@example.com');
++      expect(entry.userId).toBe('user-1');
++      expect(entry.channel).toBe('email');
++      expect(entry.type).toBe('welcome');
++      expect(entry.status).toBe('delivered');
++      expect(entry.timestamp).toBeInstanceOf(Date);
++    });
++
++    it('should generate sequential log IDs', () => {
++      const entry1 = historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'delivered',
++      });
++      const entry2 = historyService.log({
++        notificationId: 'notif-0002',
++        recipient: 'bob@example.com',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'delivered',
++      });
++
++      expect(entry1.id).toBe('log-0001');
++      expect(entry2.id).toBe('log-0002');
++    });
++
++    it('should log failed notifications with error', () => {
++      const entry = historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'failed',
++        error: 'No adapter registered',
++      });
++
++      expect(entry.status).toBe('failed');
++      expect(entry.error).toBe('No adapter registered');
++    });
++
++    it('should log suppressed notifications', () => {
++      const entry = historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        userId: 'user-1',
++        channel: 'email',
++        type: 'order-confirmation',
++        subject: 'Order Confirmation',
++        status: 'suppressed',
++        error: 'Suppressed by user preferences',
++      });
++
++      expect(entry.status).toBe('suppressed');
++      expect(entry.error).toBe('Suppressed by user preferences');
++    });
++  });
++
++  describe('query()', () => {
++    beforeEach(() => {
++      historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        userId: 'user-1',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'delivered',
++        timestamp: new Date('2026-01-15T10:00:00Z'),
++      });
++      historyService.log({
++        notificationId: 'notif-0002',
++        recipient: 'bob@example.com',
++        userId: 'user-2',
++        channel: 'email',
++        type: 'order-confirmation',
++        subject: 'Order Confirmed',
++        status: 'delivered',
++        timestamp: new Date('2026-01-16T10:00:00Z'),
++      });
++      historyService.log({
++        notificationId: 'notif-0003',
++        recipient: 'alice@example.com',
++        userId: 'user-1',
++        channel: 'email',
++        type: 'order-status-update',
++        subject: 'Order Update',
++        status: 'failed',
++        error: 'Delivery failed',
++        timestamp: new Date('2026-01-17T10:00:00Z'),
++      });
++    });
++
++    it('should query by userId', () => {
++      const results = historyService.query({ userId: 'user-1' });
++      expect(results).toHaveLength(2);
++      expect(results.every((r) => r.userId === 'user-1')).toBe(true);
++    });
++
++    it('should query by recipient', () => {
++      const results = historyService.query({ recipient: 'bob@example.com' });
++      expect(results).toHaveLength(1);
++      expect(results[0]?.recipient).toBe('bob@example.com');
++    });
++
++    it('should query by type', () => {
++      const results = historyService.query({ type: 'welcome' });
++      expect(results).toHaveLength(1);
++      expect(results[0]?.type).toBe('welcome');
++    });
++
++    it('should query by status', () => {
++      const results = historyService.query({ status: 'failed' });
++      expect(results).toHaveLength(1);
++      expect(results[0]?.status).toBe('failed');
++    });
++
++    it('should query by date range', () => {
++      const results = historyService.query({
++        from: new Date('2026-01-16T00:00:00Z'),
++        to: new Date('2026-01-17T00:00:00Z'),
++      });
++      expect(results).toHaveLength(1);
++      expect(results[0]?.notificationId).toBe('notif-0002');
++    });
++
++    it('should combine multiple filters', () => {
++      const results = historyService.query({
++        userId: 'user-1',
++        status: 'delivered',
++      });
++      expect(results).toHaveLength(1);
++      expect(results[0]?.type).toBe('welcome');
++    });
++
++    it('should return empty array when no matches', () => {
++      const results = historyService.query({ userId: 'user-999' });
++      expect(results).toHaveLength(0);
++    });
++
++    it('should return all entries with empty filter', () => {
++      const results = historyService.query({});
++      expect(results).toHaveLength(3);
++    });
++  });
++
++  describe('convenience getters', () => {
++    beforeEach(() => {
++      historyService.log({
++        notificationId: 'notif-0001',
++        recipient: 'alice@example.com',
++        userId: 'user-1',
++        channel: 'email',
++        type: 'welcome',
++        subject: 'Welcome!',
++        status: 'delivered',
++        timestamp: new Date('2026-01-15T10:00:00Z'),
++      });
++      historyService.log({
++        notificationId: 'notif-0002',
++        recipient: 'bob@example.com',
++        userId: 'user-2',
++        channel: 'email',
++        type: 'order-confirmation',
++        subject: 'Order Confirmed',
++        status: 'delivered',
++        timestamp: new Date('2026-01-16T10:00:00Z'),
++      });
++    });
++
++    it('should get by userId', () => {
++      expect(historyService.getByUserId('user-1')).toHaveLength(1);
++    });
++
++    it('should get by recipient', () => {
++      expect(historyService.getByRecipient('alice@example.com')).toHaveLength(1);
++    });
++
++    it('should get by type', () => {
++      expect(historyService.getByType('welcome')).toHaveLength(1);
++    });
++
++    it('should get by date range', () => {
++      const results = historyService.getByDateRange(
++        new Date('2026-01-15T00:00:00Z'),
++        new Date('2026-01-15T23:59:59Z'),
++      );
++      expect(results).toHaveLength(1);
++    });
++
++    it('should count logged entries', () => {
++      expect(historyService.count()).toBe(2);
++    });
++  });
++
++  describe('integration with NotificationService', () => {
++    let eventBus: EventBus;
++    let notificationService: NotificationService;
++
++    beforeEach(() => {
++      eventBus = new EventBus();
++      notificationService = new NotificationService(eventBus);
++      notificationService.setHistoryService(historyService);
++      resetNotificationIdCounter();
++    });
++
++    it('should log notifications when sent via event bus', async () => {
++      const emailAdapter = new EmailAdapter({ defaultFrom: 'test@example.com' });
++      notificationService.registerAdapter(emailAdapter);
++
++      const event: UserCreatedEvent = {
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      expect(historyService.count()).toBe(1);
++      const logs = historyService.getByUserId('user-1');
++      expect(logs).toHaveLength(1);
++      expect(logs[0]?.type).toBe('welcome');
++      expect(logs[0]?.status).toBe('delivered');
++      expect(logs[0]?.recipient).toBe('alice@example.com');
++      expect(logs[0]?.channel).toBe('email');
++    });
++
++    it('should log failed notifications when no adapter registered', async () => {
++      const event: UserCreatedEvent = {
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(event);
++
++      expect(historyService.count()).toBe(1);
++      const logs = historyService.query({ status: 'failed' });
++      expect(logs).toHaveLength(1);
++      expect(logs[0]?.error).toContain('No adapter registered');
++    });
++
++    it('should log multiple notifications from different events', async () => {
++      const emailAdapter = new EmailAdapter({ defaultFrom: 'test@example.com' });
++      notificationService.registerAdapter(emailAdapter);
++
++      await eventBus.emit({
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      } as UserCreatedEvent);
++
++      await eventBus.emit({
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [
++            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++          ],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      } as OrderCreatedEvent);
++
++      expect(historyService.count()).toBe(2);
++      const logs = historyService.getByUserId('user-1');
++      expect(logs).toHaveLength(2);
++      const types = logs.map((l) => l.type).sort();
++      expect(types).toEqual(['order-confirmation', 'welcome']);
++    });
++
++    it('should not log when history service is not set', async () => {
++      const freshEventBus = new EventBus();
++      const freshService = new NotificationService(freshEventBus);
++      // No setHistoryService call
++
++      await freshEventBus.emit({
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      } as UserCreatedEvent);
++
++      // The notification service still works
++      expect(freshService.getNotificationCount()).toBe(1);
++      // But nothing was logged to our history service
++      expect(historyService.count()).toBe(0);
++    });
++  });
++});

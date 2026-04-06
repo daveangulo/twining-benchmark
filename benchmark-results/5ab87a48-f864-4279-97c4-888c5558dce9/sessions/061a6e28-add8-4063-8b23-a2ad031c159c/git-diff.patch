@@ -1,0 +1,543 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index f2bfe87..fd00468 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -5,6 +5,32 @@ Write your updates below. There is no enforced format — use whatever structure
+ 
+ ---
+ 
++## Agent 3 — Analytics Service Unit Tests (Complete)
++
++### What I did
++Added comprehensive unit tests for `AnalyticsService` and the `bucketTimestamp` utility. All 33 new tests pass, full suite (103 tests) passes, and `tsc --noEmit` is clean.
++
++### Files created
++- `tests/services/analytics.service.test.ts` — 33 tests covering the analytics service
++
++### Test coverage
++- **recordMetric**: id generation, auto-timestamp, default metadata, sequential ids
++- **registerEventListeners**: order:created records orders_count + revenue; user:created records new_users
++- **getMetricSummary**: sum aggregation, change percent (positive, negative, null when prev=0), average_order_value derivation, time series bucketing with default and explicit granularity
++- **Edge cases**: empty data, single data point, 500-record dataset, out-of-range records, cross-metric isolation
++- **getTimeSeries**: bucketed output, default granularity, empty results
++- **getDashboard**: all metric types by default, filtered metric types, aggregated data correctness
++- **bucketTimestamp**: hour/day/week/month truncation, Sunday→Monday week handling, Monday passthrough, boundary inputs
++
++### Bugs found
++None — the implementation from Agent 2 is correct. All aggregation math, period comparison, time bucketing, and event handlers work as designed.
++
++### Key decisions
++- Used real Database/AnalyticsRepository/EventBus instances (no mocking), matching the existing test patterns in the codebase
++- Used `resetMetricIdCounter()` in `beforeEach` for deterministic id assertions
++
++---
++
+ ## Agent 2 — Data Aggregation Service (Complete)
+ 
+ ### What I did
+diff --git a/tests/services/analytics.service.test.ts b/tests/services/analytics.service.test.ts
+new file mode 100644
+index 0000000..e90d2d6
+--- /dev/null
++++ b/tests/services/analytics.service.test.ts
+@@ -0,0 +1,500 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database } from '../../src/utils/database.js';
++import { AnalyticsRepository } from '../../src/repositories/analytics.repository.js';
++import { EventBus } from '../../src/events/event-bus.js';
++import {
++  AnalyticsService,
++  bucketTimestamp,
++  resetMetricIdCounter,
++} from '../../src/services/analytics.service.js';
++import type {
++  AnalyticsQuery,
++  MetricRecord,
++} from '../../src/models/analytics.js';
++import type { OrderCreatedEvent, UserCreatedEvent } from '../../src/events/event-types.js';
++
++function makeRecord(
++  service: AnalyticsService,
++  overrides: {
++    metricType: MetricRecord['metricType'];
++    value: number;
++    timestamp: string;
++    metadata?: Record<string, string>;
++  },
++): MetricRecord {
++  return service.recordMetric({
++    metricType: overrides.metricType,
++    value: overrides.value,
++    timestamp: overrides.timestamp,
++    metadata: overrides.metadata,
++  });
++}
++
++describe('AnalyticsService', () => {
++  let db: Database;
++  let repo: AnalyticsRepository;
++  let eventBus: EventBus;
++  let service: AnalyticsService;
++
++  beforeEach(() => {
++    db = new Database();
++    repo = new AnalyticsRepository(db);
++    eventBus = new EventBus();
++    service = new AnalyticsService(repo, eventBus);
++    resetMetricIdCounter();
++  });
++
++  // -------------------------------------------------------------------------
++  // recordMetric
++  // -------------------------------------------------------------------------
++  describe('recordMetric', () => {
++    it('should store a metric and return it with an id', () => {
++      const record = service.recordMetric({
++        metricType: 'revenue',
++        value: 42.5,
++        timestamp: '2026-01-15T10:00:00.000Z',
++        metadata: { orderId: 'o1' },
++      });
++
++      expect(record.id).toBe('metric-000001');
++      expect(record.metricType).toBe('revenue');
++      expect(record.value).toBe(42.5);
++      expect(record.timestamp).toBe('2026-01-15T10:00:00.000Z');
++      expect(record.metadata).toEqual({ orderId: 'o1' });
++
++      // Persisted in repo
++      const found = repo.findByMetricType('revenue');
++      expect(found).toHaveLength(1);
++    });
++
++    it('should auto-generate a timestamp when omitted', () => {
++      const before = new Date().toISOString();
++      const record = service.recordMetric({
++        metricType: 'new_users',
++        value: 1,
++      });
++      const after = new Date().toISOString();
++
++      expect(record.timestamp >= before).toBe(true);
++      expect(record.timestamp <= after).toBe(true);
++    });
++
++    it('should default metadata to empty object when omitted', () => {
++      const record = service.recordMetric({
++        metricType: 'new_users',
++        value: 1,
++        timestamp: '2026-01-15T10:00:00.000Z',
++      });
++      expect(record.metadata).toEqual({});
++    });
++
++    it('should generate sequential ids', () => {
++      const r1 = service.recordMetric({ metricType: 'revenue', value: 1, timestamp: '2026-01-01T00:00:00.000Z' });
++      const r2 = service.recordMetric({ metricType: 'revenue', value: 2, timestamp: '2026-01-01T00:00:00.000Z' });
++      expect(r1.id).toBe('metric-000001');
++      expect(r2.id).toBe('metric-000002');
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // registerEventListeners
++  // -------------------------------------------------------------------------
++  describe('registerEventListeners', () => {
++    it('should record orders_count and revenue on order:created', async () => {
++      service.registerEventListeners();
++
++      await eventBus.emit<OrderCreatedEvent>({
++        type: 'order:created',
++        order: { id: 'o1', userId: 'u1', items: [], total: 99.99, status: 'pending', createdAt: new Date(), updatedAt: new Date() },
++        user: { id: 'u1', name: 'Alice', email: 'a@b.com', role: 'member', createdAt: new Date(), updatedAt: new Date() },
++        timestamp: new Date('2026-03-01T12:00:00.000Z'),
++      });
++
++      const orderCounts = repo.findByMetricType('orders_count');
++      expect(orderCounts).toHaveLength(1);
++      expect(orderCounts[0]!.value).toBe(1);
++
++      const revenues = repo.findByMetricType('revenue');
++      expect(revenues).toHaveLength(1);
++      expect(revenues[0]!.value).toBe(99.99);
++    });
++
++    it('should record new_users on user:created', async () => {
++      service.registerEventListeners();
++
++      await eventBus.emit<UserCreatedEvent>({
++        type: 'user:created',
++        user: { id: 'u2', name: 'Bob', email: 'b@b.com', role: 'member', createdAt: new Date(), updatedAt: new Date() },
++        timestamp: new Date('2026-03-01T14:00:00.000Z'),
++      });
++
++      const newUsers = repo.findByMetricType('new_users');
++      expect(newUsers).toHaveLength(1);
++      expect(newUsers[0]!.value).toBe(1);
++      expect(newUsers[0]!.metadata).toEqual({ userId: 'u2' });
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // getMetricSummary — normal operation
++  // -------------------------------------------------------------------------
++  describe('getMetricSummary', () => {
++    const currentStart = '2026-01-08T00:00:00.000Z';
++    const currentEnd = '2026-01-14T23:59:59.999Z';
++    const prevStart = '2026-01-01T00:00:00.000Z'; // 7 days before currentStart
++
++    it('should sum values for a simple metric', () => {
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2026-01-09T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 200, timestamp: '2026-01-10T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.metricType).toBe('revenue');
++      expect(summary.currentValue).toBe(300);
++    });
++
++    it('should compute change percent compared to previous period', () => {
++      // Previous period: Jan 1-7
++      makeRecord(service, { metricType: 'orders_count', value: 5, timestamp: '2026-01-02T10:00:00.000Z' });
++      // Current period: Jan 8-14
++      makeRecord(service, { metricType: 'orders_count', value: 10, timestamp: '2026-01-09T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('orders_count', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.currentValue).toBe(10);
++      expect(summary.previousValue).toBe(5);
++      expect(summary.changePercent).toBe(100); // +100%
++    });
++
++    it('should return null changePercent when previous value is 0', () => {
++      makeRecord(service, { metricType: 'new_users', value: 3, timestamp: '2026-01-10T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('new_users', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.currentValue).toBe(3);
++      expect(summary.previousValue).toBe(0);
++      expect(summary.changePercent).toBeNull();
++    });
++
++    it('should compute average_order_value from revenue and orders_count', () => {
++      // Current period
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2026-01-09T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 200, timestamp: '2026-01-10T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'orders_count', value: 1, timestamp: '2026-01-09T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'orders_count', value: 1, timestamp: '2026-01-10T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('average_order_value', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.currentValue).toBe(150); // 300/2
++    });
++
++    it('should return 0 for average_order_value when no orders exist', () => {
++      const summary = service.getMetricSummary('average_order_value', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.currentValue).toBe(0);
++    });
++
++    it('should build time series bucketed by day (default granularity)', () => {
++      makeRecord(service, { metricType: 'revenue', value: 50, timestamp: '2026-01-09T08:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 30, timestamp: '2026-01-09T16:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 20, timestamp: '2026-01-10T12:00:00.000Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.timeSeries).toHaveLength(2);
++      expect(summary.timeSeries[0]).toEqual({
++        timestamp: '2026-01-09T00:00:00.000Z',
++        value: 80,
++      });
++      expect(summary.timeSeries[1]).toEqual({
++        timestamp: '2026-01-10T00:00:00.000Z',
++        value: 20,
++      });
++    });
++
++    it('should use specified granularity for time series', () => {
++      makeRecord(service, { metricType: 'revenue', value: 10, timestamp: '2026-01-09T08:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 20, timestamp: '2026-01-09T08:30:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 30, timestamp: '2026-01-09T09:15:00.000Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: currentStart,
++        endDate: currentEnd,
++        granularity: 'hour',
++      });
++
++      expect(summary.timeSeries).toHaveLength(2);
++      expect(summary.timeSeries[0]).toEqual({
++        timestamp: '2026-01-09T08:00:00.000Z',
++        value: 30,
++      });
++      expect(summary.timeSeries[1]).toEqual({
++        timestamp: '2026-01-09T09:00:00.000Z',
++        value: 30,
++      });
++    });
++
++    it('should handle negative change percent', () => {
++      // Previous period: higher
++      makeRecord(service, { metricType: 'revenue', value: 200, timestamp: '2026-01-02T10:00:00.000Z' });
++      // Current period: lower
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2026-01-09T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: currentStart,
++        endDate: currentEnd,
++      });
++
++      expect(summary.changePercent).toBe(-50);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // Edge cases
++  // -------------------------------------------------------------------------
++  describe('edge cases', () => {
++    it('should handle empty data — no records at all', () => {
++      const summary = service.getMetricSummary('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      });
++
++      expect(summary.currentValue).toBe(0);
++      expect(summary.previousValue).toBe(0);
++      expect(summary.changePercent).toBeNull();
++      expect(summary.timeSeries).toEqual([]);
++    });
++
++    it('should handle a single data point', () => {
++      makeRecord(service, { metricType: 'orders_count', value: 1, timestamp: '2026-01-05T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('orders_count', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      });
++
++      expect(summary.currentValue).toBe(1);
++      expect(summary.timeSeries).toHaveLength(1);
++    });
++
++    it('should handle a large number of records', () => {
++      // Insert 500 records
++      for (let i = 0; i < 500; i++) {
++        const day = String((i % 28) + 1).padStart(2, '0');
++        makeRecord(service, {
++          metricType: 'revenue',
++          value: 10,
++          timestamp: `2026-01-${day}T12:00:00.000Z`,
++        });
++      }
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-31T23:59:59.999Z',
++      });
++
++      expect(summary.currentValue).toBe(5000);
++      expect(summary.timeSeries.length).toBeGreaterThan(0);
++    });
++
++    it('should not include records outside the date range', () => {
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2025-12-31T23:59:59.999Z' });
++      makeRecord(service, { metricType: 'revenue', value: 50, timestamp: '2026-01-05T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 200, timestamp: '2026-02-01T00:00:00.001Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-31T23:59:59.999Z',
++      });
++
++      expect(summary.currentValue).toBe(50);
++    });
++
++    it('should not mix different metric types', () => {
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2026-01-05T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'orders_count', value: 5, timestamp: '2026-01-05T10:00:00.000Z' });
++
++      const summary = service.getMetricSummary('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      });
++
++      expect(summary.currentValue).toBe(100);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // getTimeSeries
++  // -------------------------------------------------------------------------
++  describe('getTimeSeries', () => {
++    it('should return bucketed time series data', () => {
++      makeRecord(service, { metricType: 'revenue', value: 10, timestamp: '2026-01-05T08:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 20, timestamp: '2026-01-05T16:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 30, timestamp: '2026-01-06T10:00:00.000Z' });
++
++      const series = service.getTimeSeries('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++        granularity: 'day',
++      });
++
++      expect(series).toHaveLength(2);
++      expect(series[0]).toEqual({ timestamp: '2026-01-05T00:00:00.000Z', value: 30 });
++      expect(series[1]).toEqual({ timestamp: '2026-01-06T00:00:00.000Z', value: 30 });
++    });
++
++    it('should default to day granularity', () => {
++      makeRecord(service, { metricType: 'revenue', value: 10, timestamp: '2026-01-05T08:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 20, timestamp: '2026-01-05T20:00:00.000Z' });
++
++      const series = service.getTimeSeries('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      });
++
++      expect(series).toHaveLength(1);
++      expect(series[0]!.value).toBe(30);
++    });
++
++    it('should return empty array when no records match', () => {
++      const series = service.getTimeSeries('revenue', {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      });
++      expect(series).toEqual([]);
++    });
++  });
++
++  // -------------------------------------------------------------------------
++  // getDashboard
++  // -------------------------------------------------------------------------
++  describe('getDashboard', () => {
++    it('should return summaries for all metric types by default', () => {
++      const query: AnalyticsQuery = {
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++      };
++
++      const dashboard = service.getDashboard(query);
++
++      expect(dashboard.query).toBe(query);
++      expect(dashboard.metrics).toHaveLength(5); // all metric types
++      expect(dashboard.generatedAt).toBeDefined();
++
++      const metricTypes = dashboard.metrics.map((m) => m.metricType);
++      expect(metricTypes).toContain('orders_count');
++      expect(metricTypes).toContain('revenue');
++      expect(metricTypes).toContain('average_order_value');
++      expect(metricTypes).toContain('active_users');
++      expect(metricTypes).toContain('new_users');
++    });
++
++    it('should return only requested metric types', () => {
++      const dashboard = service.getDashboard({
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++        metricTypes: ['revenue', 'orders_count'],
++      });
++
++      expect(dashboard.metrics).toHaveLength(2);
++      expect(dashboard.metrics[0]!.metricType).toBe('revenue');
++      expect(dashboard.metrics[1]!.metricType).toBe('orders_count');
++    });
++
++    it('should correctly aggregate data in dashboard summaries', () => {
++      makeRecord(service, { metricType: 'revenue', value: 100, timestamp: '2026-01-03T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'revenue', value: 200, timestamp: '2026-01-04T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'orders_count', value: 1, timestamp: '2026-01-03T10:00:00.000Z' });
++      makeRecord(service, { metricType: 'orders_count', value: 1, timestamp: '2026-01-04T10:00:00.000Z' });
++
++      const dashboard = service.getDashboard({
++        startDate: '2026-01-01T00:00:00.000Z',
++        endDate: '2026-01-07T23:59:59.999Z',
++        metricTypes: ['revenue', 'orders_count', 'average_order_value'],
++      });
++
++      const revenueMetric = dashboard.metrics.find((m) => m.metricType === 'revenue')!;
++      expect(revenueMetric.currentValue).toBe(300);
++
++      const ordersMetric = dashboard.metrics.find((m) => m.metricType === 'orders_count')!;
++      expect(ordersMetric.currentValue).toBe(2);
++
++      const aovMetric = dashboard.metrics.find((m) => m.metricType === 'average_order_value')!;
++      expect(aovMetric.currentValue).toBe(150);
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------
++// bucketTimestamp (exported utility)
++// ---------------------------------------------------------------------------
++describe('bucketTimestamp', () => {
++  it('should truncate to hour', () => {
++    expect(bucketTimestamp('2026-01-15T14:37:22.123Z', 'hour')).toBe(
++      '2026-01-15T14:00:00.000Z',
++    );
++  });
++
++  it('should truncate to day', () => {
++    expect(bucketTimestamp('2026-01-15T14:37:22.123Z', 'day')).toBe(
++      '2026-01-15T00:00:00.000Z',
++    );
++  });
++
++  it('should truncate to Monday for week granularity', () => {
++    // 2026-01-15 is a Thursday → Monday is 2026-01-12
++    expect(bucketTimestamp('2026-01-15T14:37:22.123Z', 'week')).toBe(
++      '2026-01-12T00:00:00.000Z',
++    );
++  });
++
++  it('should handle Sunday correctly for week (map to previous Monday)', () => {
++    // 2026-01-18 is a Sunday → Monday is 2026-01-12
++    expect(bucketTimestamp('2026-01-18T10:00:00.000Z', 'week')).toBe(
++      '2026-01-12T00:00:00.000Z',
++    );
++  });
++
++  it('should keep Monday as-is for week', () => {
++    // 2026-01-12 is a Monday
++    expect(bucketTimestamp('2026-01-12T10:00:00.000Z', 'week')).toBe(
++      '2026-01-12T00:00:00.000Z',
++    );
++  });
++
++  it('should truncate to first of month', () => {
++    expect(bucketTimestamp('2026-01-15T14:37:22.123Z', 'month')).toBe(
++      '2026-01-01T00:00:00.000Z',
++    );
++  });
++
++  it('should handle first of month input', () => {
++    expect(bucketTimestamp('2026-03-01T00:00:00.000Z', 'month')).toBe(
++      '2026-03-01T00:00:00.000Z',
++    );
++  });
++
++  it('should handle midnight input for day', () => {
++    expect(bucketTimestamp('2026-01-15T00:00:00.000Z', 'day')).toBe(
++      '2026-01-15T00:00:00.000Z',
++    );
++  });
++});

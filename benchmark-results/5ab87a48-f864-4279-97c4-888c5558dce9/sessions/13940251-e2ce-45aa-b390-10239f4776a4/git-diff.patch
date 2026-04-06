@@ -1,0 +1,746 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index b7257e4..f213f82 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -150,3 +150,55 @@ Replaced all stub implementations in `src/services/analytics.service.ts` with re
+ - Route handlers are at `src/routes/analytics.routes.ts`, tests at `tests/routes/analytics.routes.test.ts`.
+ - To add an HTTP server, wrap the `AnalyticsRouteHandler` methods — parse query params from the URL into the request objects, then send `response.status` and `JSON.stringify(response.body)`.
+ 
++---
++
++## Agent 5 — Integration Tests & Final Verification
++
++### What I did
++1. **Created `tests/integration/analytics.integration.test.ts`** — 29 integration tests covering the full pipeline (route handler → service → repositories → database):
++
++   **Dashboard endpoint (3 tests):**
++   - Full dashboard with all 4 metrics verified (total-orders=5, total-revenue=800, active-users=3, order-completion-rate=40%)
++   - Empty data returns zero values and flat trends
++   - userId filtering (verifies u1's 2 orders, $150 revenue, 50% completion rate)
++
++   **Single metric endpoint (4 tests):**
++   - Upward trend with correct changePercent calculation (previous=200, current=500, change=150%)
++   - Downward trend detection
++   - Flat trend with no data in either period
++   - Order-completion-rate correctness (3/4 = 75%)
++
++   **Time series endpoint (4 tests):**
++   - Daily bucketing with multiple orders per day and empty days
++   - Hourly bucketing
++   - Monthly bucketing across 3 months
++   - Active-users per week (distinct userId counting per bucket)
++
++   **Order status endpoint (3 tests):**
++   - Full breakdown with percentages summing to 100%
++   - Empty breakdown with no orders
++   - userId-filtered breakdown
++
++   **Validation errors (9 tests):**
++   - Missing startDate, endDate, granularity, metric
++   - Invalid date format, invalid granularity, invalid metric type
++   - startDate after endDate
++   - Missing metric on getTimeSeries
++
++   **Cross-layer consistency (2 tests):**
++   - Dashboard metrics match individual getMetric calls for all 4 metrics
++   - Dashboard ordersByStatus matches getOrderStatus endpoint
++   - getMetric timeSeries matches getTimeSeries for same params
++
++   **Edge cases (4 tests):**
++   - Order at start boundary, order at end boundary
++   - 100 orders with 10 users
++   - Same-day date range
++
++2. **No integration issues found** — all layers connect correctly. No fixes needed.
++
++### Final State
++- **All 154 tests pass** (125 existing + 29 new integration tests)
++- **`tsc --noEmit` succeeds** with no errors
++- No code changes were needed to the source files — the full analytics pipeline works end-to-end as built by Agents 1–4.
++
+diff --git a/tests/integration/analytics.integration.test.ts b/tests/integration/analytics.integration.test.ts
+new file mode 100644
+index 0000000..88d3bcb
+--- /dev/null
++++ b/tests/integration/analytics.integration.test.ts
+@@ -0,0 +1,680 @@
++/**
++ * Integration tests for the analytics pipeline.
++ *
++ * Tests the full flow: HTTP-like request → AnalyticsRouteHandler → AnalyticsService → Repositories → Database
++ * Each test creates real data in the in-memory database and verifies the end-to-end response.
++ */
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database, resetDatabase } from '../../src/utils/database.js';
++import { UserRepository } from '../../src/repositories/user.repository.js';
++import { OrderRepository } from '../../src/repositories/order.repository.js';
++import { AnalyticsService } from '../../src/services/analytics.service.js';
++import {
++  AnalyticsRouteHandler,
++  type SerializedDashboardData,
++  type SerializedMetricSummary,
++  type SerializedTimeSeriesPoint,
++} from '../../src/routes/analytics.routes.js';
++import type { Order, OrderStatus } from '../../src/models/order.js';
++import type { OrderStatusBreakdown } from '../../src/models/analytics.js';
++
++// ─── Helpers ───
++
++function makeOrder(
++  repo: OrderRepository,
++  overrides: Partial<Order> & { id: string; userId: string },
++): Order {
++  const order: Order = {
++    items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++    total: 10,
++    status: 'pending',
++    createdAt: new Date('2024-01-15'),
++    updatedAt: new Date('2024-01-15'),
++    ...overrides,
++  };
++  repo.save(order);
++  return order;
++}
++
++function seedOrders(repo: OrderRepository): void {
++  // 5 orders across Jan 2024, different users, statuses, and totals
++  makeOrder(repo, { id: 'o1', userId: 'u1', total: 100, status: 'delivered', createdAt: new Date('2024-01-05T10:00:00Z') });
++  makeOrder(repo, { id: 'o2', userId: 'u2', total: 200, status: 'delivered', createdAt: new Date('2024-01-10T14:00:00Z') });
++  makeOrder(repo, { id: 'o3', userId: 'u1', total: 50, status: 'pending', createdAt: new Date('2024-01-15T08:00:00Z') });
++  makeOrder(repo, { id: 'o4', userId: 'u3', total: 300, status: 'shipped', createdAt: new Date('2024-01-20T16:00:00Z') });
++  makeOrder(repo, { id: 'o5', userId: 'u2', total: 150, status: 'cancelled', createdAt: new Date('2024-01-25T12:00:00Z') });
++}
++
++// ─── Test suite ───
++
++describe('Analytics Integration Tests', () => {
++  let db: Database;
++  let userRepo: UserRepository;
++  let orderRepo: OrderRepository;
++  let service: AnalyticsService;
++  let handler: AnalyticsRouteHandler;
++
++  beforeEach(() => {
++    resetDatabase();
++    db = new Database();
++    userRepo = new UserRepository(db);
++    orderRepo = new OrderRepository(db);
++    service = new AnalyticsService(orderRepo, userRepo);
++    handler = new AnalyticsRouteHandler(service);
++  });
++
++  // ─── Dashboard endpoint (full pipeline) ───
++
++  describe('GET /analytics/dashboard', () => {
++    it('should return full dashboard with all metrics and order breakdown', () => {
++      seedOrders(orderRepo);
++
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'week',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++
++      // Should have 4 metric summaries
++      expect(body.summaries).toHaveLength(4);
++      const metricNames = body.summaries.map(s => s.metric);
++      expect(metricNames).toContain('total-orders');
++      expect(metricNames).toContain('total-revenue');
++      expect(metricNames).toContain('active-users');
++      expect(metricNames).toContain('order-completion-rate');
++
++      // Verify total-orders = 5
++      const totalOrders = body.summaries.find(s => s.metric === 'total-orders')!;
++      expect(totalOrders.currentValue).toBe(5);
++
++      // Verify total-revenue = 100 + 200 + 50 + 300 + 150 = 800
++      const totalRevenue = body.summaries.find(s => s.metric === 'total-revenue')!;
++      expect(totalRevenue.currentValue).toBe(800);
++
++      // Verify active-users = 3 (u1, u2, u3)
++      const activeUsers = body.summaries.find(s => s.metric === 'active-users')!;
++      expect(activeUsers.currentValue).toBe(3);
++
++      // Verify order-completion-rate = 2/5 * 100 = 40%
++      const completionRate = body.summaries.find(s => s.metric === 'order-completion-rate')!;
++      expect(completionRate.currentValue).toBe(40);
++
++      // Should have order status breakdown
++      expect(body.ordersByStatus.length).toBeGreaterThan(0);
++      const totalCount = body.ordersByStatus.reduce((sum, b) => sum + b.count, 0);
++      expect(totalCount).toBe(5);
++
++      // Verify dates are serialized as ISO strings
++      expect(typeof body.generatedAt).toBe('string');
++      expect(typeof body.query.startDate).toBe('string');
++      expect(typeof body.query.endDate).toBe('string');
++      expect(body.query.granularity).toBe('week');
++    });
++
++    it('should return zero values when no orders exist in range', () => {
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++      expect(body.summaries).toHaveLength(4);
++
++      for (const summary of body.summaries) {
++        expect(summary.currentValue).toBe(0);
++        expect(summary.previousValue).toBe(0);
++        expect(summary.trend).toBe('flat');
++      }
++
++      expect(body.ordersByStatus).toHaveLength(0);
++    });
++
++    it('should filter by userId when provided', () => {
++      seedOrders(orderRepo);
++
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++        userId: 'u1',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++
++      // u1 has 2 orders (o1: $100 delivered, o3: $50 pending)
++      const totalOrders = body.summaries.find(s => s.metric === 'total-orders')!;
++      expect(totalOrders.currentValue).toBe(2);
++
++      const totalRevenue = body.summaries.find(s => s.metric === 'total-revenue')!;
++      expect(totalRevenue.currentValue).toBe(150);
++
++      const activeUsers = body.summaries.find(s => s.metric === 'active-users')!;
++      expect(activeUsers.currentValue).toBe(1);
++
++      // 1 of 2 orders is delivered = 50%
++      const completionRate = body.summaries.find(s => s.metric === 'order-completion-rate')!;
++      expect(completionRate.currentValue).toBe(50);
++
++      // userId should be passed through in query
++      expect(body.query.userId).toBe('u1');
++    });
++  });
++
++  // ─── Single metric endpoint ───
++
++  describe('GET /analytics/metrics/:metric', () => {
++    it('should return total-revenue with trend information', () => {
++      // Previous period orders (Dec 2023)
++      makeOrder(orderRepo, { id: 'prev1', userId: 'u1', total: 100, createdAt: new Date('2023-12-10T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'prev2', userId: 'u1', total: 100, createdAt: new Date('2023-12-20T00:00:00Z') });
++
++      // Current period orders (Jan 2024) — higher revenue
++      makeOrder(orderRepo, { id: 'cur1', userId: 'u1', total: 300, createdAt: new Date('2024-01-10T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'cur2', userId: 'u2', total: 200, createdAt: new Date('2024-01-20T00:00:00Z') });
++
++      const response = handler.getMetric({
++        metric: 'total-revenue',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'week',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedMetricSummary;
++      expect(body.metric).toBe('total-revenue');
++      expect(body.currentValue).toBe(500);
++      expect(body.previousValue).toBe(200);
++      expect(body.trend).toBe('up');
++      expect(body.changePercent).toBe(150); // (500-200)/200 * 100
++      expect(body.timeSeries.length).toBeGreaterThan(0);
++    });
++
++    it('should return downward trend when current period is lower', () => {
++      // Previous period: high revenue
++      makeOrder(orderRepo, { id: 'prev1', userId: 'u1', total: 500, createdAt: new Date('2023-12-15T00:00:00Z') });
++
++      // Current period: low revenue
++      makeOrder(orderRepo, { id: 'cur1', userId: 'u1', total: 100, createdAt: new Date('2024-01-15T00:00:00Z') });
++
++      const response = handler.getMetric({
++        metric: 'total-revenue',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedMetricSummary;
++      expect(body.trend).toBe('down');
++      expect(body.currentValue).toBe(100);
++      expect(body.previousValue).toBe(500);
++    });
++
++    it('should return flat trend when no data in either period', () => {
++      const response = handler.getMetric({
++        metric: 'total-orders',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedMetricSummary;
++      expect(body.trend).toBe('flat');
++      expect(body.currentValue).toBe(0);
++      expect(body.previousValue).toBe(0);
++      expect(body.changePercent).toBe(0);
++    });
++
++    it('should compute order-completion-rate correctly', () => {
++      makeOrder(orderRepo, { id: 'o1', userId: 'u1', status: 'delivered', createdAt: new Date('2024-01-10T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o2', userId: 'u1', status: 'delivered', createdAt: new Date('2024-01-12T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o3', userId: 'u1', status: 'delivered', createdAt: new Date('2024-01-14T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o4', userId: 'u1', status: 'pending', createdAt: new Date('2024-01-16T00:00:00Z') });
++
++      const response = handler.getMetric({
++        metric: 'order-completion-rate',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedMetricSummary;
++      expect(body.currentValue).toBe(75); // 3 out of 4
++    });
++  });
++
++  // ─── Time series endpoint ───
++
++  describe('GET /analytics/time-series/:metric', () => {
++    it('should return daily time series with correct bucketing', () => {
++      makeOrder(orderRepo, { id: 'o1', userId: 'u1', total: 100, createdAt: new Date('2024-01-01T10:00:00Z') });
++      makeOrder(orderRepo, { id: 'o2', userId: 'u1', total: 200, createdAt: new Date('2024-01-01T15:00:00Z') });
++      makeOrder(orderRepo, { id: 'o3', userId: 'u2', total: 300, createdAt: new Date('2024-01-03T08:00:00Z') });
++
++      const response = handler.getTimeSeries({
++        metric: 'total-revenue',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-03T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedTimeSeriesPoint[];
++      expect(body.length).toBe(3); // 3 days
++
++      // Day 1: $100 + $200 = $300
++      expect(body[0].value).toBe(300);
++      // Day 2: $0
++      expect(body[1].value).toBe(0);
++      // Day 3: $300
++      expect(body[2].value).toBe(300);
++
++      // Timestamps should be ISO strings
++      for (const point of body) {
++        expect(typeof point.timestamp).toBe('string');
++        expect(new Date(point.timestamp).getTime()).not.toBeNaN();
++      }
++    });
++
++    it('should return hourly time series', () => {
++      makeOrder(orderRepo, { id: 'o1', userId: 'u1', createdAt: new Date('2024-01-15T10:30:00Z') });
++      makeOrder(orderRepo, { id: 'o2', userId: 'u1', createdAt: new Date('2024-01-15T10:45:00Z') });
++      makeOrder(orderRepo, { id: 'o3', userId: 'u1', createdAt: new Date('2024-01-15T12:00:00Z') });
++
++      const response = handler.getTimeSeries({
++        metric: 'total-orders',
++        startDate: '2024-01-15T10:00:00Z',
++        endDate: '2024-01-15T12:59:59Z',
++        granularity: 'hour',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedTimeSeriesPoint[];
++      expect(body.length).toBe(3); // 3 hours: 10, 11, 12
++
++      expect(body[0].value).toBe(2); // 10:xx — two orders
++      expect(body[1].value).toBe(0); // 11:xx — no orders
++      expect(body[2].value).toBe(1); // 12:xx — one order
++    });
++
++    it('should return monthly time series', () => {
++      makeOrder(orderRepo, { id: 'o1', userId: 'u1', total: 100, createdAt: new Date('2024-01-15T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o2', userId: 'u1', total: 200, createdAt: new Date('2024-02-15T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o3', userId: 'u1', total: 300, createdAt: new Date('2024-03-15T00:00:00Z') });
++
++      const response = handler.getTimeSeries({
++        metric: 'total-revenue',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-03-31T23:59:59Z',
++        granularity: 'month',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedTimeSeriesPoint[];
++      expect(body.length).toBe(3); // Jan, Feb, Mar
++
++      expect(body[0].value).toBe(100);
++      expect(body[1].value).toBe(200);
++      expect(body[2].value).toBe(300);
++    });
++
++    it('should count active users per time bucket', () => {
++      makeOrder(orderRepo, { id: 'o1', userId: 'u1', createdAt: new Date('2024-01-05T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o2', userId: 'u2', createdAt: new Date('2024-01-05T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o3', userId: 'u1', createdAt: new Date('2024-01-05T00:00:00Z') });
++      makeOrder(orderRepo, { id: 'o4', userId: 'u3', createdAt: new Date('2024-01-12T00:00:00Z') });
++
++      const response = handler.getTimeSeries({
++        metric: 'active-users',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-14T23:59:59Z',
++        granularity: 'week',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedTimeSeriesPoint[];
++      expect(body.length).toBe(2); // 2 weeks
++
++      // Week 1: u1 and u2 = 2 unique users
++      expect(body[0].value).toBe(2);
++      // Week 2: u3 = 1 unique user
++      expect(body[1].value).toBe(1);
++    });
++  });
++
++  // ─── Order status endpoint ───
++
++  describe('GET /analytics/order-status', () => {
++    it('should return correct breakdown with percentages', () => {
++      seedOrders(orderRepo);
++
++      const response = handler.getOrderStatus({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as OrderStatusBreakdown[];
++
++      // 5 orders: 2 delivered, 1 pending, 1 shipped, 1 cancelled
++      const delivered = body.find(b => b.status === 'delivered')!;
++      expect(delivered.count).toBe(2);
++      expect(delivered.percent).toBe(40);
++
++      const pending = body.find(b => b.status === 'pending')!;
++      expect(pending.count).toBe(1);
++      expect(pending.percent).toBe(20);
++
++      const shipped = body.find(b => b.status === 'shipped')!;
++      expect(shipped.count).toBe(1);
++      expect(shipped.percent).toBe(20);
++
++      const cancelled = body.find(b => b.status === 'cancelled')!;
++      expect(cancelled.count).toBe(1);
++      expect(cancelled.percent).toBe(20);
++
++      // Percentages should sum to 100
++      const totalPercent = body.reduce((sum, b) => sum + b.percent, 0);
++      expect(totalPercent).toBe(100);
++    });
++
++    it('should return empty breakdown when no orders exist', () => {
++      const response = handler.getOrderStatus({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as OrderStatusBreakdown[];
++      expect(body).toHaveLength(0);
++    });
++
++    it('should filter order status breakdown by userId', () => {
++      seedOrders(orderRepo);
++
++      const response = handler.getOrderStatus({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++        userId: 'u2',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as OrderStatusBreakdown[];
++
++      // u2 has 2 orders: o2 (delivered) and o5 (cancelled)
++      const totalCount = body.reduce((sum, b) => sum + b.count, 0);
++      expect(totalCount).toBe(2);
++
++      const delivered = body.find(b => b.status === 'delivered')!;
++      expect(delivered.count).toBe(1);
++      expect(delivered.percent).toBe(50);
++    });
++  });
++
++  // ─── Validation error scenarios ───
++
++  describe('Validation errors', () => {
++    it('should return 400 for missing startDate', () => {
++      const response = handler.getDashboard({
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/startDate/);
++    });
++
++    it('should return 400 for missing endDate', () => {
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/endDate/);
++    });
++
++    it('should return 400 for missing granularity', () => {
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/granularity/);
++    });
++
++    it('should return 400 for invalid date format', () => {
++      const response = handler.getDashboard({
++        startDate: 'not-a-date',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/startDate/);
++    });
++
++    it('should return 400 when startDate is after endDate', () => {
++      const response = handler.getDashboard({
++        startDate: '2024-02-01T00:00:00Z',
++        endDate: '2024-01-01T00:00:00Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/before/);
++    });
++
++    it('should return 400 for invalid granularity', () => {
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'minute',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/granularity/);
++    });
++
++    it('should return 400 for missing metric on getMetric', () => {
++      const response = handler.getMetric({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/metric/);
++    });
++
++    it('should return 400 for invalid metric type', () => {
++      const response = handler.getMetric({
++        metric: 'invalid-metric',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/Invalid metric/);
++    });
++
++    it('should return 400 for missing metric on getTimeSeries', () => {
++      const response = handler.getTimeSeries({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day',
++      });
++
++      expect(response.status).toBe(400);
++      expect((response.body as { error: string }).error).toMatch(/metric/);
++    });
++  });
++
++  // ─── Cross-layer data consistency ───
++
++  describe('Cross-layer data consistency', () => {
++    it('should produce consistent results between dashboard and individual endpoints', () => {
++      seedOrders(orderRepo);
++
++      const params = {
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day' as const,
++      };
++
++      // Get full dashboard
++      const dashResponse = handler.getDashboard(params);
++      expect(dashResponse.status).toBe(200);
++      const dashboard = dashResponse.body as SerializedDashboardData;
++
++      // Get individual metrics and compare
++      for (const dashSummary of dashboard.summaries) {
++        const metricResponse = handler.getMetric({ ...params, metric: dashSummary.metric });
++        expect(metricResponse.status).toBe(200);
++        const individual = metricResponse.body as SerializedMetricSummary;
++
++        expect(individual.currentValue).toBe(dashSummary.currentValue);
++        expect(individual.previousValue).toBe(dashSummary.previousValue);
++        expect(individual.trend).toBe(dashSummary.trend);
++        expect(individual.changePercent).toBe(dashSummary.changePercent);
++      }
++
++      // Compare order status from dashboard vs direct endpoint
++      const statusResponse = handler.getOrderStatus(params);
++      expect(statusResponse.status).toBe(200);
++      const statusBreakdown = statusResponse.body as OrderStatusBreakdown[];
++
++      expect(statusBreakdown).toEqual(dashboard.ordersByStatus);
++    });
++
++    it('should produce consistent results between getMetric and getTimeSeries', () => {
++      seedOrders(orderRepo);
++
++      const params = {
++        metric: 'total-orders',
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'day' as const,
++      };
++
++      const metricResponse = handler.getMetric(params);
++      const timeSeriesResponse = handler.getTimeSeries(params);
++
++      expect(metricResponse.status).toBe(200);
++      expect(timeSeriesResponse.status).toBe(200);
++
++      const metric = metricResponse.body as SerializedMetricSummary;
++      const timeSeries = timeSeriesResponse.body as SerializedTimeSeriesPoint[];
++
++      // The time series from getMetric should match getTimeSeries
++      expect(metric.timeSeries).toEqual(timeSeries);
++    });
++  });
++
++  // ─── Edge cases ───
++
++  describe('Edge cases', () => {
++    it('should handle a single order at the start boundary of the range', () => {
++      makeOrder(orderRepo, {
++        id: 'o1',
++        userId: 'u1',
++        total: 42,
++        createdAt: new Date('2024-01-01T00:00:00Z'),
++      });
++
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'month',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++      const totalOrders = body.summaries.find(s => s.metric === 'total-orders')!;
++      expect(totalOrders.currentValue).toBe(1);
++    });
++
++    it('should handle a single order at the end boundary of the range', () => {
++      makeOrder(orderRepo, {
++        id: 'o1',
++        userId: 'u1',
++        total: 42,
++        createdAt: new Date('2024-01-31T23:59:59Z'),
++      });
++
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'month',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++      const totalOrders = body.summaries.find(s => s.metric === 'total-orders')!;
++      expect(totalOrders.currentValue).toBe(1);
++    });
++
++    it('should handle large number of orders', () => {
++      for (let i = 0; i < 100; i++) {
++        makeOrder(orderRepo, {
++          id: `o${i}`,
++          userId: `u${i % 10}`,
++          total: 10,
++          status: i % 3 === 0 ? 'delivered' : 'pending',
++          createdAt: new Date(`2024-01-${String(Math.floor(i / 4) + 1).padStart(2, '0')}T12:00:00Z`),
++        });
++      }
++
++      const response = handler.getDashboard({
++        startDate: '2024-01-01T00:00:00Z',
++        endDate: '2024-01-31T23:59:59Z',
++        granularity: 'week',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedDashboardData;
++
++      const totalOrders = body.summaries.find(s => s.metric === 'total-orders')!;
++      expect(totalOrders.currentValue).toBe(100);
++
++      const totalRevenue = body.summaries.find(s => s.metric === 'total-revenue')!;
++      expect(totalRevenue.currentValue).toBe(1000);
++
++      const activeUsers = body.summaries.find(s => s.metric === 'active-users')!;
++      expect(activeUsers.currentValue).toBe(10);
++    });
++
++    it('should handle same startDate and endDate', () => {
++      makeOrder(orderRepo, {
++        id: 'o1',
++        userId: 'u1',
++        total: 50,
++        createdAt: new Date('2024-01-15T12:00:00Z'),
++      });
++
++      const response = handler.getMetric({
++        metric: 'total-orders',
++        startDate: '2024-01-15T00:00:00Z',
++        endDate: '2024-01-15T23:59:59Z',
++        granularity: 'hour',
++      });
++
++      expect(response.status).toBe(200);
++      const body = response.body as SerializedMetricSummary;
++      expect(body.currentValue).toBe(1);
++    });
++  });
++});

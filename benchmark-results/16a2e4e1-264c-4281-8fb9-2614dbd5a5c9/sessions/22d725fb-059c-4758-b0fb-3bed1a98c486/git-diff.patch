@@ -1,0 +1,939 @@
+diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts
+index dcef588..c380c08 100644
+--- a/src/adapters/email.adapter.ts
++++ b/src/adapters/email.adapter.ts
+@@ -1,14 +1,23 @@
+ /**
+  * Email notification adapter — delivers notifications via email.
+  *
+- * This is a stub implementation that simulates email delivery by logging
+- * the operation. The interface is real and production-ready; only the
+- * transport layer is stubbed.
++ * Features:
++ * - Template rendering with {{variable}} placeholder substitution
++ * - Recipient validation and resolution (user ID → email mapping)
++ * - Priority-based email headers (X-Priority)
++ * - Configurable sender information
++ * - Built-in templates for common notification types
+  *
+- * To integrate a real email provider:
+- * 1. Add the provider SDK to package.json dependencies.
+- * 2. Replace the send() implementation with actual API calls.
+- * 3. Update isAvailable() to check provider connectivity.
++ * Template Usage:
++ * To use a template, include a `template` key in the payload's metadata:
++ *   metadata: { template: 'order-confirmation', orderId: 'ORD-001', customerName: 'Alice' }
++ * Template variables are pulled from the metadata object. The `senderName`
++ * variable is automatically populated from the adapter's config.
++ *
++ * Recipient Resolution:
++ * The adapter can resolve non-email identifiers (e.g., user IDs) to email
++ * addresses via a mapping registered with registerRecipient(). If no mapping
++ * exists, the recipient is used as-is and must be a valid email address.
+  *
+  * Implements: NotificationAdapter (channel: 'email')
+  */
+@@ -49,27 +58,129 @@ export interface EmailMessage {
+   subject: string;
+   /** Plain text body */
+   body: string;
++  /** Optional HTML body (populated when a template with htmlBody is used) */
++  htmlBody?: string;
+   /** Priority flag for email headers */
+   priority: string;
+   /** Optional additional headers */
+   headers?: Record<string, string>;
+ }
+ 
++/**
++ * Email template with placeholder support.
++ * Placeholders use the {{variableName}} syntax and are replaced
++ * with values from the template variables at render time.
++ */
++export interface EmailTemplate {
++  /** Unique template identifier */
++  id: string;
++  /** Subject line template with {{placeholder}} support */
++  subject: string;
++  /** Plain-text body template with {{placeholder}} support */
++  body: string;
++  /** Optional HTML body template with {{placeholder}} support */
++  htmlBody?: string;
++}
++
++/**
++ * Maps notification priority levels to standard X-Priority email header values.
++ * 1 = Highest, 3 = Normal, 5 = Lowest
++ */
++const PRIORITY_HEADERS: Record<string, string> = {
++  low: '5',
++  normal: '3',
++  high: '2',
++  urgent: '1',
++};
++
++/** Basic email address validation pattern. */
++const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++/**
++ * Creates the set of built-in email templates for common notification types.
++ */
++function createBuiltInTemplates(): EmailTemplate[] {
++  return [
++    {
++      id: 'order-confirmation',
++      subject: 'Order Confirmation: {{orderId}}',
++      body: [
++        'Dear {{customerName}},',
++        '',
++        'Thank you for your order! Here are your order details:',
++        '',
++        'Order ID: {{orderId}}',
++        'Items: {{itemSummary}}',
++        'Total: ${{total}}',
++        '',
++        'We will notify you when your order status changes.',
++        '',
++        'Best regards,',
++        'The {{senderName}} Team',
++      ].join('\n'),
++    },
++    {
++      id: 'order-status-update',
++      subject: 'Order Update: {{orderId}}',
++      body: [
++        'Dear {{customerName}},',
++        '',
++        'Your order {{orderId}} has been updated.',
++        '',
++        'Previous Status: {{previousStatus}}',
++        'New Status: {{newStatus}}',
++        '',
++        'Thank you for your patience!',
++        '',
++        'Best regards,',
++        'The {{senderName}} Team',
++      ].join('\n'),
++    },
++    {
++      id: 'welcome',
++      subject: 'Welcome to {{senderName}}, {{customerName}}!',
++      body: [
++        'Dear {{customerName}},',
++        '',
++        'Welcome to {{senderName}}! We are excited to have you on board.',
++        '',
++        'If you have any questions, please do not hesitate to reach out.',
++        '',
++        'Best regards,',
++        'The {{senderName}} Team',
++      ].join('\n'),
++    },
++  ];
++}
++
+ export class EmailAdapter implements NotificationAdapter {
+   readonly channel = 'email' as const;
+   private logger = new Logger('EmailAdapter');
+   private config: EmailAdapterConfig;
+   private sentEmails: EmailMessage[] = [];
++  private templates: Map<string, EmailTemplate> = new Map();
++  private recipientMap: Map<string, string> = new Map();
+ 
+   constructor(config?: Partial<EmailAdapterConfig>) {
+     this.config = { ...defaultEmailConfig, ...config };
++    this.loadBuiltInTemplates();
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // NotificationAdapter Interface
++  // ---------------------------------------------------------------------------
++
+   /**
+    * Send an email notification.
+    *
+-   * Stub implementation: composes the email message and logs it.
+-   * In production, this would call an SMTP server or email API (SendGrid, SES, etc.).
++   * Processing pipeline:
++   * 1. Check adapter availability.
++   * 2. Resolve recipient (map user IDs to emails if registered).
++   * 3. Validate the resolved email address.
++   * 4. Apply template rendering if `metadata.template` is specified.
++   * 5. Compose the email message with headers.
++   * 6. Deliver (currently in-memory; replace with SMTP/API for production).
++   * 7. Return delivery result.
+    *
+    * @param payload - The notification to deliver via email.
+    * @returns Result indicating delivery success or failure.
+@@ -83,14 +194,40 @@ export class EmailAdapter implements NotificationAdapter {
+     }
+ 
+     try {
+-      const email = this.composeEmail(payload);
++      // Step 1: Resolve recipient (user ID → email, or passthrough)
++      const resolvedRecipient = this.resolveRecipient(payload.recipient);
++
++      // Step 2: Validate the resolved email address
++      if (!this.validateEmail(resolvedRecipient)) {
++        this.logger.warn(`Invalid recipient email: ${resolvedRecipient}`);
++        return {
++          success: false,
++          errorMessage: `Invalid recipient email address: ${resolvedRecipient}`,
++        };
++      }
+ 
+-      // --- STUB: In production, replace this block with real email sending ---
++      // Step 3: Apply template rendering if specified in metadata
++      const rendered = this.applyTemplate(payload);
++
++      // Step 4: Compose the email with resolved data
++      const resolvedPayload: NotificationPayload = {
++        ...payload,
++        recipient: resolvedRecipient,
++        subject: rendered.subject,
++        body: rendered.body,
++      };
++      const email = this.composeEmail(resolvedPayload);
++
++      // Add HTML body if template provided one
++      if (rendered.htmlBody) {
++        email.htmlBody = rendered.htmlBody;
++      }
++
++      // Step 5: Deliver (in-memory store; replace with real transport in production)
+       this.logger.info(
+         `Email sent: to=${email.to}, subject="${email.subject}", from=${email.from}`,
+       );
+       this.sentEmails.push(email);
+-      // --- END STUB ---
+ 
+       return {
+         success: true,
+@@ -117,6 +254,120 @@ export class EmailAdapter implements NotificationAdapter {
+     return this.config.enabled;
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // Template Management
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register a custom email template.
++   * If a template with the same ID already exists, it is replaced.
++   *
++   * @param template - The template to register.
++   */
++  registerTemplate(template: EmailTemplate): void {
++    this.templates.set(template.id, template);
++    this.logger.info(`Template registered: ${template.id}`);
++  }
++
++  /**
++   * Get a registered template by ID.
++   *
++   * @param id - The template identifier.
++   * @returns The template, or undefined if not found.
++   */
++  getTemplate(id: string): EmailTemplate | undefined {
++    return this.templates.get(id);
++  }
++
++  /**
++   * Get all registered template IDs.
++   */
++  getTemplateIds(): string[] {
++    return [...this.templates.keys()];
++  }
++
++  /**
++   * Render a template with the given variables.
++   * Replaces {{variableName}} placeholders with values from the vars object.
++   * The `senderName` variable is automatically populated from the adapter config
++   * unless explicitly provided in vars.
++   *
++   * Unresolved placeholders are left as-is in the output.
++   *
++   * @param templateId - The ID of the template to render.
++   * @param vars - Key-value pairs for placeholder substitution.
++   * @returns The rendered subject, body, and optional htmlBody.
++   * @throws Error if the template ID is not registered.
++   */
++  renderTemplate(
++    templateId: string,
++    vars: Record<string, string>,
++  ): { subject: string; body: string; htmlBody?: string } {
++    const template = this.templates.get(templateId);
++    if (!template) {
++      throw new Error(`Email template not found: ${templateId}`);
++    }
++
++    const allVars: Record<string, string> = {
++      senderName: this.config.fromName,
++      ...vars,
++    };
++
++    return {
++      subject: this.interpolate(template.subject, allVars),
++      body: this.interpolate(template.body, allVars),
++      htmlBody: template.htmlBody
++        ? this.interpolate(template.htmlBody, allVars)
++        : undefined,
++    };
++  }
++
++  // ---------------------------------------------------------------------------
++  // Recipient Resolution
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Register a mapping from a non-email identifier to an email address.
++   * This allows the adapter to resolve user IDs, usernames, etc. to
++   * deliverable email addresses.
++   *
++   * @param identifier - The non-email identifier (e.g., user ID).
++   * @param email - The email address to map it to.
++   */
++  registerRecipient(identifier: string, email: string): void {
++    this.recipientMap.set(identifier, email);
++  }
++
++  /**
++   * Resolve a recipient identifier to an email address.
++   * If a mapping is registered for the identifier, returns the mapped email.
++   * Otherwise returns the recipient as-is (trimmed and lowercased).
++   *
++   * @param recipient - The recipient identifier or email address.
++   * @returns The resolved email address.
++   */
++  resolveRecipient(recipient: string): string {
++    const mapped = this.recipientMap.get(recipient);
++    if (mapped) {
++      return mapped;
++    }
++    return recipient.trim().toLowerCase();
++  }
++
++  /**
++   * Validate that a string is a well-formed email address.
++   *
++   * @param email - The string to validate.
++   * @returns true if the string is a valid email format.
++   */
++  validateEmail(email: string): boolean {
++    return EMAIL_REGEX.test(email);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Test Helpers
++  // ---------------------------------------------------------------------------
++
+   /**
+    * Get all emails sent by this adapter (useful for testing).
+    */
+@@ -138,8 +389,70 @@ export class EmailAdapter implements NotificationAdapter {
+     return { ...this.config };
+   }
+ 
++  // ---------------------------------------------------------------------------
++  // Private Methods
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Load built-in templates into the template registry.
++   */
++  private loadBuiltInTemplates(): void {
++    for (const template of createBuiltInTemplates()) {
++      this.templates.set(template.id, template);
++    }
++  }
++
++  /**
++   * Apply template rendering if a template is specified in the payload metadata.
++   * If no template is specified (or the template is not found), returns the
++   * raw subject and body from the payload unchanged.
++   *
++   * @param payload - The notification payload.
++   * @returns Rendered subject, body, and optional htmlBody.
++   */
++  private applyTemplate(payload: NotificationPayload): {
++    subject: string;
++    body: string;
++    htmlBody?: string;
++  } {
++    const templateId = payload.metadata?.['template'];
++    if (!templateId || !this.templates.has(templateId)) {
++      return { subject: payload.subject, body: payload.body };
++    }
++
++    // Build template variables from metadata (excluding the 'template' key)
++    const vars: Record<string, string> = {};
++    if (payload.metadata) {
++      for (const [key, value] of Object.entries(payload.metadata)) {
++        if (key !== 'template') {
++          vars[key] = value;
++        }
++      }
++    }
++
++    return this.renderTemplate(templateId, vars);
++  }
++
++  /**
++   * Interpolate {{placeholder}} variables in a template string.
++   * Unresolved placeholders are left as-is.
++   *
++   * @param text - The template string.
++   * @param vars - Key-value pairs for substitution.
++   * @returns The interpolated string.
++   */
++  private interpolate(text: string, vars: Record<string, string>): string {
++    return text.replace(/\{\{(\w+)\}\}/g, (match, key: string) => {
++      return vars[key] !== undefined ? vars[key] : match;
++    });
++  }
++
+   /**
+    * Compose an EmailMessage from a NotificationPayload.
++   * Adds priority headers and merges metadata as email headers.
++   *
++   * @param payload - The notification payload (with resolved recipient).
++   * @returns The composed email message.
+    */
+   private composeEmail(payload: NotificationPayload): EmailMessage {
+     const email: EmailMessage = {
+@@ -150,11 +463,22 @@ export class EmailAdapter implements NotificationAdapter {
+       priority: payload.priority,
+     };
+ 
+-    // Merge any adapter-specific metadata as email headers
++    // Start with priority header
++    const headers: Record<string, string> = {
++      'X-Priority': PRIORITY_HEADERS[payload.priority] ?? '3',
++    };
++
++    // Merge adapter-specific metadata as email headers (excluding 'template' key)
+     if (payload.metadata) {
+-      email.headers = { ...payload.metadata };
++      for (const [key, value] of Object.entries(payload.metadata)) {
++        if (key !== 'template') {
++          headers[key] = value;
++        }
++      }
+     }
+ 
++    email.headers = headers;
++
+     return email;
+   }
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 4731ee1..39476c3 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -63,7 +63,7 @@ export type {
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter } from './adapters/email.adapter.js';
+-export type { EmailAdapterConfig, EmailMessage } from './adapters/email.adapter.js';
++export type { EmailAdapterConfig, EmailMessage, EmailTemplate } from './adapters/email.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts
+index 5441f66..347e142 100644
+--- a/tests/adapters/email.adapter.test.ts
++++ b/tests/adapters/email.adapter.test.ts
+@@ -106,4 +106,493 @@ describe('EmailAdapter', () => {
+       expect(config.enabled).toBe(true);
+     });
+   });
++
++  // =========================================================================
++  // Template Rendering Tests
++  // =========================================================================
++
++  describe('template rendering', () => {
++    it('should load built-in templates on construction', () => {
++      const ids = adapter.getTemplateIds();
++      expect(ids).toContain('order-confirmation');
++      expect(ids).toContain('order-status-update');
++      expect(ids).toContain('welcome');
++    });
++
++    it('should retrieve a built-in template by ID', () => {
++      const template = adapter.getTemplate('order-confirmation');
++      expect(template).toBeDefined();
++      expect(template?.id).toBe('order-confirmation');
++      expect(template?.subject).toContain('{{orderId}}');
++      expect(template?.body).toContain('{{customerName}}');
++    });
++
++    it('should return undefined for non-existent template', () => {
++      expect(adapter.getTemplate('non-existent')).toBeUndefined();
++    });
++
++    it('should register a custom template', () => {
++      adapter.registerTemplate({
++        id: 'custom-alert',
++        subject: 'Alert: {{alertType}}',
++        body: 'An alert of type {{alertType}} was triggered for {{target}}.',
++      });
++
++      const template = adapter.getTemplate('custom-alert');
++      expect(template).toBeDefined();
++      expect(template?.id).toBe('custom-alert');
++    });
++
++    it('should replace an existing template on re-registration', () => {
++      adapter.registerTemplate({
++        id: 'order-confirmation',
++        subject: 'New Confirmation: {{orderId}}',
++        body: 'Updated template body for {{orderId}}.',
++      });
++
++      const template = adapter.getTemplate('order-confirmation');
++      expect(template?.subject).toBe('New Confirmation: {{orderId}}');
++    });
++
++    it('should render a template with variables', () => {
++      const rendered = adapter.renderTemplate('order-confirmation', {
++        orderId: 'ORD-001',
++        customerName: 'Alice',
++        itemSummary: 'Widget x2, Gadget x1',
++        total: '45.00',
++      });
++
++      expect(rendered.subject).toBe('Order Confirmation: ORD-001');
++      expect(rendered.body).toContain('Dear Alice,');
++      expect(rendered.body).toContain('Order ID: ORD-001');
++      expect(rendered.body).toContain('Items: Widget x2, Gadget x1');
++      expect(rendered.body).toContain('Total: $45.00');
++    });
++
++    it('should inject senderName from config automatically', () => {
++      const rendered = adapter.renderTemplate('welcome', {
++        customerName: 'Bob',
++      });
++
++      expect(rendered.subject).toContain('TaskFlow Pro');
++      expect(rendered.body).toContain('The TaskFlow Pro Team');
++    });
++
++    it('should allow overriding senderName in variables', () => {
++      const rendered = adapter.renderTemplate('welcome', {
++        customerName: 'Bob',
++        senderName: 'Custom App',
++      });
++
++      expect(rendered.subject).toContain('Custom App');
++      expect(rendered.body).toContain('The Custom App Team');
++    });
++
++    it('should leave unresolved placeholders as-is', () => {
++      const rendered = adapter.renderTemplate('order-confirmation', {
++        orderId: 'ORD-001',
++        // customerName intentionally omitted
++      });
++
++      expect(rendered.subject).toBe('Order Confirmation: ORD-001');
++      expect(rendered.body).toContain('Dear {{customerName}},');
++    });
++
++    it('should throw error for non-existent template in renderTemplate', () => {
++      expect(() => adapter.renderTemplate('non-existent', {})).toThrow(
++        'Email template not found: non-existent',
++      );
++    });
++
++    it('should render HTML body when template has one', () => {
++      adapter.registerTemplate({
++        id: 'html-template',
++        subject: 'HTML Email: {{title}}',
++        body: 'Plain text for {{title}}',
++        htmlBody: '<h1>{{title}}</h1><p>Hello {{name}}</p>',
++      });
++
++      const rendered = adapter.renderTemplate('html-template', {
++        title: 'Welcome',
++        name: 'Alice',
++      });
++
++      expect(rendered.htmlBody).toBe('<h1>Welcome</h1><p>Hello Alice</p>');
++      expect(rendered.body).toBe('Plain text for Welcome');
++    });
++
++    it('should not include htmlBody when template has none', () => {
++      const rendered = adapter.renderTemplate('order-confirmation', {
++        orderId: 'ORD-001',
++      });
++
++      expect(rendered.htmlBody).toBeUndefined();
++    });
++  });
++
++  describe('template-based sending', () => {
++    it('should use template when metadata.template is specified', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'ignored when template is used',
++        body: 'ignored when template is used',
++        channel: 'email',
++        priority: 'normal',
++        metadata: {
++          template: 'order-confirmation',
++          orderId: 'ORD-042',
++          customerName: 'Alice',
++          itemSummary: 'Widget x3',
++          total: '30.00',
++        },
++      };
++
++      const result = await adapter.send(payload);
++      expect(result.success).toBe(true);
++
++      const sent = adapter.getSentEmails();
++      expect(sent).toHaveLength(1);
++      expect(sent[0]?.subject).toBe('Order Confirmation: ORD-042');
++      expect(sent[0]?.body).toContain('Dear Alice,');
++      expect(sent[0]?.body).toContain('Items: Widget x3');
++      expect(sent[0]?.body).toContain('Total: $30.00');
++    });
++
++    it('should fall back to raw payload when template is not found', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'Raw Subject',
++        body: 'Raw body content',
++        channel: 'email',
++        priority: 'normal',
++        metadata: {
++          template: 'non-existent-template',
++        },
++      };
++
++      const result = await adapter.send(payload);
++      expect(result.success).toBe(true);
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.subject).toBe('Raw Subject');
++      expect(sent[0]?.body).toBe('Raw body content');
++    });
++
++    it('should fall back to raw payload when no template is specified', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'Direct Subject',
++        body: 'Direct body content',
++        channel: 'email',
++        priority: 'high',
++      };
++
++      const result = await adapter.send(payload);
++      expect(result.success).toBe(true);
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.subject).toBe('Direct Subject');
++      expect(sent[0]?.body).toBe('Direct body content');
++    });
++
++    it('should not include template key in email headers', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'Test',
++        body: 'Body',
++        channel: 'email',
++        priority: 'normal',
++        metadata: {
++          template: 'order-confirmation',
++          orderId: 'ORD-001',
++        },
++      };
++
++      await adapter.send(payload);
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.headers?.['template']).toBeUndefined();
++      // Template-specific metadata like orderId should be in headers
++      expect(sent[0]?.headers?.['orderId']).toBe('ORD-001');
++    });
++
++    it('should set htmlBody on sent email when template has one', async () => {
++      adapter.registerTemplate({
++        id: 'html-email',
++        subject: '{{title}}',
++        body: 'Plain: {{title}}',
++        htmlBody: '<h1>{{title}}</h1>',
++      });
++
++      const payload: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'Fallback',
++        body: 'Fallback',
++        channel: 'email',
++        priority: 'normal',
++        metadata: { template: 'html-email', title: 'Hello World' },
++      };
++
++      await adapter.send(payload);
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.htmlBody).toBe('<h1>Hello World</h1>');
++      expect(sent[0]?.body).toBe('Plain: Hello World');
++    });
++  });
++
++  // =========================================================================
++  // Recipient Validation & Resolution Tests
++  // =========================================================================
++
++  describe('recipient validation', () => {
++    it('should accept valid email addresses', () => {
++      expect(adapter.validateEmail('alice@example.com')).toBe(true);
++      expect(adapter.validateEmail('user.name+tag@domain.co')).toBe(true);
++      expect(adapter.validateEmail('admin@sub.domain.org')).toBe(true);
++    });
++
++    it('should reject invalid email addresses', () => {
++      expect(adapter.validateEmail('')).toBe(false);
++      expect(adapter.validateEmail('not-an-email')).toBe(false);
++      expect(adapter.validateEmail('@domain.com')).toBe(false);
++      expect(adapter.validateEmail('user@')).toBe(false);
++      expect(adapter.validateEmail('user@domain')).toBe(false);
++      expect(adapter.validateEmail('user name@domain.com')).toBe(false);
++    });
++
++    it('should fail send for invalid recipient email', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'not-a-valid-email',
++        subject: 'Test',
++        body: 'Body',
++        channel: 'email',
++        priority: 'normal',
++      };
++
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.errorMessage).toContain('Invalid recipient email address');
++    });
++  });
++
++  describe('recipient resolution', () => {
++    it('should resolve registered user ID to email', () => {
++      adapter.registerRecipient('user-1', 'alice@example.com');
++      expect(adapter.resolveRecipient('user-1')).toBe('alice@example.com');
++    });
++
++    it('should return trimmed lowercase email for unregistered recipients', () => {
++      expect(adapter.resolveRecipient('  Alice@Example.COM  ')).toBe('alice@example.com');
++    });
++
++    it('should send to resolved email when recipient is a registered ID', async () => {
++      adapter.registerRecipient('user-42', 'bob@example.com');
++
++      const payload: NotificationPayload = {
++        recipient: 'user-42',
++        subject: 'Resolved',
++        body: 'This goes to bob',
++        channel: 'email',
++        priority: 'normal',
++      };
++
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.adapterResponse?.to).toBe('bob@example.com');
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.to).toBe('bob@example.com');
++    });
++
++    it('should fail send when recipient ID is not registered and is not a valid email', async () => {
++      const payload: NotificationPayload = {
++        recipient: 'user-unknown',
++        subject: 'Test',
++        body: 'Body',
++        channel: 'email',
++        priority: 'normal',
++      };
++
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.errorMessage).toContain('Invalid recipient email address');
++    });
++  });
++
++  // =========================================================================
++  // Priority Header Tests
++  // =========================================================================
++
++  describe('priority headers', () => {
++    it('should set X-Priority header for normal priority', async () => {
++      await adapter.send({
++        recipient: 'alice@example.com',
++        subject: 'Test',
++        body: 'Body',
++        channel: 'email',
++        priority: 'normal',
++      });
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.headers?.['X-Priority']).toBe('3');
++    });
++
++    it('should set X-Priority header for high priority', async () => {
++      await adapter.send({
++        recipient: 'alice@example.com',
++        subject: 'Urgent',
++        body: 'High priority body',
++        channel: 'email',
++        priority: 'high',
++      });
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.headers?.['X-Priority']).toBe('2');
++    });
++
++    it('should set X-Priority header for urgent priority', async () => {
++      await adapter.send({
++        recipient: 'alice@example.com',
++        subject: 'Critical',
++        body: 'Urgent body',
++        channel: 'email',
++        priority: 'urgent',
++      });
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.headers?.['X-Priority']).toBe('1');
++    });
++
++    it('should set X-Priority header for low priority', async () => {
++      await adapter.send({
++        recipient: 'alice@example.com',
++        subject: 'Low',
++        body: 'Low priority body',
++        channel: 'email',
++        priority: 'low',
++      });
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.headers?.['X-Priority']).toBe('5');
++    });
++
++    it('should preserve the raw priority string on the email message', async () => {
++      await adapter.send({
++        recipient: 'alice@example.com',
++        subject: 'Test',
++        body: 'Body',
++        channel: 'email',
++        priority: 'high',
++      });
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]?.priority).toBe('high');
++    });
++  });
++
++  // =========================================================================
++  // Integration: Template + Recipient Resolution + Priority
++  // =========================================================================
++
++  describe('integration', () => {
++    it('should combine template rendering with recipient resolution and priority', async () => {
++      adapter.registerRecipient('user-alice', 'alice@company.com');
++
++      const payload: NotificationPayload = {
++        recipient: 'user-alice',
++        subject: 'Fallback subject',
++        body: 'Fallback body',
++        channel: 'email',
++        priority: 'high',
++        metadata: {
++          template: 'order-status-update',
++          orderId: 'ORD-100',
++          customerName: 'Alice',
++          previousStatus: 'confirmed',
++          newStatus: 'shipped',
++        },
++      };
++
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.adapterResponse?.to).toBe('alice@company.com');
++
++      const sent = adapter.getSentEmails();
++      expect(sent).toHaveLength(1);
++
++      const email = sent[0]!;
++      // Recipient resolved
++      expect(email.to).toBe('alice@company.com');
++      // Template rendered
++      expect(email.subject).toBe('Order Update: ORD-100');
++      expect(email.body).toContain('Dear Alice,');
++      expect(email.body).toContain('Previous Status: confirmed');
++      expect(email.body).toContain('New Status: shipped');
++      // Priority header set
++      expect(email.headers?.['X-Priority']).toBe('2');
++      // From address from config
++      expect(email.from).toBe('TaskFlow Pro <noreply@taskflow.example.com>');
++    });
++
++    it('should handle multiple sends independently', async () => {
++      const payload1: NotificationPayload = {
++        recipient: 'alice@example.com',
++        subject: 'First',
++        body: 'First body',
++        channel: 'email',
++        priority: 'normal',
++      };
++
++      const payload2: NotificationPayload = {
++        recipient: 'bob@example.com',
++        subject: 'Second',
++        body: 'Second body',
++        channel: 'email',
++        priority: 'high',
++      };
++
++      await adapter.send(payload1);
++      await adapter.send(payload2);
++
++      const sent = adapter.getSentEmails();
++      expect(sent).toHaveLength(2);
++      expect(sent[0]?.to).toBe('alice@example.com');
++      expect(sent[0]?.subject).toBe('First');
++      expect(sent[1]?.to).toBe('bob@example.com');
++      expect(sent[1]?.subject).toBe('Second');
++    });
++
++    it('should work with welcome template and custom config', async () => {
++      const customAdapter = new EmailAdapter({
++        fromAddress: 'hello@myapp.io',
++        fromName: 'MyApp',
++      });
++
++      const payload: NotificationPayload = {
++        recipient: 'newuser@example.com',
++        subject: 'Fallback',
++        body: 'Fallback',
++        channel: 'email',
++        priority: 'normal',
++        metadata: {
++          template: 'welcome',
++          customerName: 'Charlie',
++        },
++      };
++
++      const result = await customAdapter.send(payload);
++      expect(result.success).toBe(true);
++
++      const sent = customAdapter.getSentEmails();
++      expect(sent[0]?.subject).toBe('Welcome to MyApp, Charlie!');
++      expect(sent[0]?.body).toContain('Welcome to MyApp!');
++      expect(sent[0]?.body).toContain('The MyApp Team');
++      expect(sent[0]?.from).toBe('MyApp <hello@myapp.io>');
++    });
++  });
+ });

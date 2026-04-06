@@ -1,0 +1,355 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 250ab7f..56cd4ff 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -50,3 +50,43 @@ GET /api/analytics/users/top         — Top users by revenue
+ - **Start with `computeMetric()`** in `analytics.service.ts` — it's the core aggregation logic. Then `buildTimeSeries()`, `computeOrderStatusBreakdown()`, and `computeTopUsers()`.
+ - **Tests should go in** `tests/services/analytics.service.test.ts` and `tests/routes/analytics.routes.test.ts`.
+ - Read `DESIGN.md` for the full design rationale and implementation guide.
++
++---
++
++## Agent 2 — Analytics Data Aggregation Service Implementation
++
++### Status: COMPLETE
++
++### What I did
++Implemented all stub/placeholder methods in `src/services/analytics.service.ts` with real aggregation logic:
++
++1. **`computeMetric()`** — Calculates current-period value + previous-period comparison:
++   - `revenue`: sums `order.total`
++   - `orders`: counts orders
++   - `users`: counts distinct `order.userId` values
++   - `conversion`: `orders / uniqueUsers` ratio
++   - Previous period is computed by shifting the time range back by its own duration
++   - Trend (`up`/`down`/`flat`) and `changePercent` are derived from the comparison
++
++2. **`aggregateMetricValue()`** — New private helper that extracts the raw numeric value for any metric type from a set of orders. Used by both `computeMetric` and `buildTimeSeries`.
++
++3. **`buildTimeSeries()`** — Now accepts `(query, type, orders, users)` and produces bucketed time-series data:
++   - `generateBucketBoundaries()` divides the time range into intervals based on granularity (hour/day/week/month)
++   - Each bucket filters orders to `[bucketStart, bucketEnd)` and aggregates via `aggregateMetricValue`
++   - `formatBucketLabel()` produces human-readable labels (e.g., "Mon 5", "Jan 2026", "14:00")
++
++4. **`computeOrderStatusBreakdown()`** — Groups orders by status, counts each, calculates percentage of total, sorts by count descending.
++
++5. **`computeTopUsers()`** — Groups orders by userId, sums revenue per user, looks up user names via the user array, sorts by revenue descending, slices to limit.
++
++### Key decisions
++- **Added `aggregateMetricValue` helper**: Extracted from `computeMetric` to reuse in `buildTimeSeries` bucketing — avoids duplicating the switch logic.
++- **Percentage rounding**: `changePercent` rounded to 2 decimal places; `OrderStatusBreakdown.percentage` rounded to 2 decimal places; `totalRevenue` rounded to 2 decimal places for currency precision.
++- **Previous period uses same user set**: Since users don't have a "created within range" semantic for analytics, the full user list is used for both periods.
++- **Bucket boundaries are `[start, end)`**: Half-open intervals so orders aren't double-counted.
++
++### For the next agent
++- **All code compiles cleanly** (`tsc --noEmit` passes).
++- **No tests written yet** — tests should go in `tests/services/analytics.service.test.ts`.
++- The `buildTimeSeries` signature changed from `(query)` to `(query, type, orders, users)` — the public API is unchanged.
++- `getOrdersInRange` was already implemented by Agent 1 with proper date filtering — I left the stale TODO comment but the logic was correct.
+diff --git a/src/services/analytics.service.ts b/src/services/analytics.service.ts
+index cf8f73f..b59a9a6 100644
+--- a/src/services/analytics.service.ts
++++ b/src/services/analytics.service.ts
+@@ -30,6 +30,7 @@ import type {
+   MetricType,
+   OrderStatusBreakdown,
+   OrderStatusResponse,
++  TimeGranularity,
+   TimeSeriesPoint,
+   TopUser,
+   TopUsersResponse,
+@@ -170,74 +171,252 @@ export class AnalyticsService {
+   /**
+    * Compute a MetricSummary for the given metric type.
+    *
+-   * TODO (Agent 2/3): Implement real aggregation per metric type.
+-   * - revenue: sum of order.total
+-   * - orders: count of orders
+-   * - users: count of distinct userIds in orders
+-   * - conversion: orders / users ratio
+-   *
+-   * Also implement previous-period comparison by shifting the time range
+-   * back by its own duration and computing the same metric.
++   * Calculates the current value, previous-period value (for trend comparison),
++   * and a time-series breakdown based on the query granularity.
+    */
+   private computeMetric(
+     type: MetricType,
+-    _orders: Order[],
+-    _users: User[],
+-    _query: AnalyticsQuery,
++    orders: Order[],
++    users: User[],
++    query: AnalyticsQuery,
+   ): MetricSummary {
+-    // Placeholder — return zeroed metric with empty time series
++    const currentValue = this.aggregateMetricValue(type, orders, users);
++
++    // Compute previous-period value by shifting the time range back by its own duration
++    const durationMs =
++      query.timeRange.end.getTime() - query.timeRange.start.getTime();
++    const previousStart = new Date(
++      query.timeRange.start.getTime() - durationMs,
++    );
++    const previousEnd = new Date(query.timeRange.end.getTime() - durationMs);
++    const previousOrders = this.orderRepository.findAll(
++      (order) =>
++        order.createdAt >= previousStart && order.createdAt <= previousEnd,
++    );
++    const previousUsers = this.userRepository.findAll();
++    const previousValue = this.aggregateMetricValue(
++      type,
++      previousOrders,
++      previousUsers,
++    );
++
++    // Compute trend
++    let changePercent = 0;
++    let trend: 'up' | 'down' | 'flat' = 'flat';
++    if (previousValue !== 0) {
++      changePercent = ((currentValue - previousValue) / previousValue) * 100;
++      trend =
++        changePercent > 0 ? 'up' : changePercent < 0 ? 'down' : 'flat';
++    } else if (currentValue > 0) {
++      changePercent = 100;
++      trend = 'up';
++    }
++
+     return {
+       type,
+-      currentValue: 0,
+-      previousValue: 0,
+-      changePercent: 0,
+-      trend: 'flat',
+-      timeSeries: this.buildTimeSeries(_query),
++      currentValue,
++      previousValue,
++      changePercent: Math.round(changePercent * 100) / 100,
++      trend,
++      timeSeries: this.buildTimeSeries(query, type, orders, users),
+     };
+   }
+ 
++  /**
++   * Compute the raw numeric value for a metric type from a set of orders/users.
++   */
++  private aggregateMetricValue(
++    type: MetricType,
++    orders: Order[],
++    _users: User[],
++  ): number {
++    switch (type) {
++      case 'revenue':
++        return orders.reduce((sum, order) => sum + order.total, 0);
++      case 'orders':
++        return orders.length;
++      case 'users': {
++        const distinctUserIds = new Set(orders.map((o) => o.userId));
++        return distinctUserIds.size;
++      }
++      case 'conversion': {
++        const uniqueUsers = new Set(orders.map((o) => o.userId)).size;
++        return uniqueUsers === 0
++          ? 0
++          : Math.round((orders.length / uniqueUsers) * 100) / 100;
++      }
++    }
++  }
++
+   /**
+    * Build time-series data points for the query's time range and granularity.
+    *
+-   * TODO (Agent 2/3): Implement bucketing logic.
+-   * - Divide the time range into buckets based on query.granularity
+-   * - For each bucket, compute the aggregate value
+-   * - Generate human-readable labels (e.g., "Mon", "Jan 5")
++   * Divides the time range into buckets based on granularity, aggregates the
++   * metric value within each bucket, and generates human-readable labels.
+    */
+-  private buildTimeSeries(_query: AnalyticsQuery): TimeSeriesPoint[] {
+-    // Placeholder — return empty series
+-    return [];
++  private buildTimeSeries(
++    query: AnalyticsQuery,
++    type: MetricType,
++    orders: Order[],
++    users: User[],
++  ): TimeSeriesPoint[] {
++    const buckets = this.generateBucketBoundaries(
++      query.timeRange.start,
++      query.timeRange.end,
++      query.granularity,
++    );
++    const points: TimeSeriesPoint[] = [];
++
++    for (let i = 0; i < buckets.length - 1; i++) {
++      const bucketStart = buckets[i];
++      const bucketEnd = buckets[i + 1];
++      const bucketOrders = orders.filter(
++        (o) => o.createdAt >= bucketStart && o.createdAt < bucketEnd,
++      );
++      const value = this.aggregateMetricValue(type, bucketOrders, users);
++      points.push({
++        timestamp: bucketStart,
++        value,
++        label: this.formatBucketLabel(bucketStart, query.granularity),
++      });
++    }
++
++    return points;
++  }
++
++  /**
++   * Generate bucket boundary timestamps from start to end using the given granularity.
++   * Returns an array of timestamps where each adjacent pair defines one bucket [start, end).
++   */
++  private generateBucketBoundaries(
++    start: Date,
++    end: Date,
++    granularity: TimeGranularity,
++  ): Date[] {
++    const boundaries: Date[] = [];
++    let current = new Date(start);
++
++    while (current < end) {
++      boundaries.push(new Date(current));
++      switch (granularity) {
++        case 'hour':
++          current = new Date(current.getTime() + 60 * 60 * 1000);
++          break;
++        case 'day':
++          current = new Date(current.getTime() + 24 * 60 * 60 * 1000);
++          break;
++        case 'week':
++          current = new Date(current.getTime() + 7 * 24 * 60 * 60 * 1000);
++          break;
++        case 'month': {
++          const next = new Date(current);
++          next.setMonth(next.getMonth() + 1);
++          current = next;
++          break;
++        }
++      }
++    }
++    // Add the end boundary
++    boundaries.push(new Date(end));
++    return boundaries;
++  }
++
++  /**
++   * Format a bucket start timestamp into a human-readable label.
++   */
++  private formatBucketLabel(
++    date: Date,
++    granularity: TimeGranularity,
++  ): string {
++    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
++    const months = [
++      'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
++      'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
++    ];
++    switch (granularity) {
++      case 'hour':
++        return `${date.getHours().toString().padStart(2, '0')}:00`;
++      case 'day':
++        return `${days[date.getDay()]} ${date.getDate()}`;
++      case 'week':
++        return `${months[date.getMonth()]} ${date.getDate()}`;
++      case 'month':
++        return `${months[date.getMonth()]} ${date.getFullYear()}`;
++    }
+   }
+ 
+   /**
+    * Compute the breakdown of orders by status.
+-   *
+-   * TODO (Agent 2/3): Implement by grouping orders by status and
+-   * calculating count + percentage.
++   * Groups orders by status, counts each group, and calculates percentages.
+    */
+   private computeOrderStatusBreakdown(
+-    _orders: Order[],
++    orders: Order[],
+   ): OrderStatusBreakdown[] {
+-    // Placeholder — return empty breakdown
+-    return [];
++    const total = orders.length;
++    if (total === 0) return [];
++
++    const counts = new Map<Order['status'], number>();
++    for (const order of orders) {
++      counts.set(order.status, (counts.get(order.status) ?? 0) + 1);
++    }
++
++    const breakdown: OrderStatusBreakdown[] = [];
++    for (const [status, count] of counts) {
++      breakdown.push({
++        status,
++        count,
++        percentage: Math.round((count / total) * 10000) / 100,
++      });
++    }
++
++    // Sort by count descending for consistent output
++    breakdown.sort((a, b) => b.count - a.count);
++    return breakdown;
+   }
+ 
+   /**
+    * Compute the top users ranked by total revenue.
+-   *
+-   * TODO (Agent 2/3): Implement by:
+-   * 1. Grouping orders by userId
+-   * 2. Summing revenue per user
+-   * 3. Looking up user names from UserRepository
+-   * 4. Sorting by revenue descending
+-   * 5. Slicing to the requested limit
++   * Groups orders by userId, sums revenue, joins with user names,
++   * sorts descending by revenue, and slices to the requested limit.
+    */
+   private computeTopUsers(
+-    _orders: Order[],
+-    _users: User[],
+-    _limit: number,
++    orders: Order[],
++    users: User[],
++    limit: number,
+   ): TopUser[] {
+-    // Placeholder — return empty list
+-    return [];
++    // Group orders by userId
++    const userStats = new Map<
++      string,
++      { orderCount: number; totalRevenue: number }
++    >();
++    for (const order of orders) {
++      const stats = userStats.get(order.userId) ?? {
++        orderCount: 0,
++        totalRevenue: 0,
++      };
++      stats.orderCount++;
++      stats.totalRevenue += order.total;
++      userStats.set(order.userId, stats);
++    }
++
++    // Build a lookup for user names
++    const userNameMap = new Map<string, string>();
++    for (const user of users) {
++      userNameMap.set(user.id, user.name);
++    }
++
++    // Build TopUser array, sort by revenue descending, and limit
++    const topUsers: TopUser[] = [];
++    for (const [userId, stats] of userStats) {
++      topUsers.push({
++        userId,
++        userName: userNameMap.get(userId) ?? 'Unknown',
++        orderCount: stats.orderCount,
++        totalRevenue: Math.round(stats.totalRevenue * 100) / 100,
++      });
++    }
++
++    topUsers.sort((a, b) => b.totalRevenue - a.totalRevenue);
++    return topUsers.slice(0, limit);
+   }
+ }

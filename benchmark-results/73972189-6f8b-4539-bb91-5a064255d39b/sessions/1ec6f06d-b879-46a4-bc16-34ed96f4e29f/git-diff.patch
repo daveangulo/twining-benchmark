@@ -1,0 +1,400 @@
+diff --git a/src/adapters/webhook.adapter.ts b/src/adapters/webhook.adapter.ts
+new file mode 100644
+index 0000000..3ee737b
+--- /dev/null
++++ b/src/adapters/webhook.adapter.ts
+@@ -0,0 +1,172 @@
++/**
++ * Webhook notification adapter.
++ *
++ * Delivers notifications by POSTing a JSON payload to a configured URL.
++ * Uses a pluggable transport for actual HTTP delivery, enabling real
++ * HTTP calls in production and in-memory capture in tests.
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type { NotificationPayload, NotificationResult } from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++/**
++ * The JSON body sent to the webhook endpoint.
++ */
++export interface WebhookBody {
++  recipient: string;
++  subject: string;
++  body: string;
++  channel: string;
++  priority: string;
++  metadata?: Record<string, string>;
++  timestamp: string;
++}
++
++/**
++ * Transport interface for sending webhook HTTP requests.
++ * Implement this for fetch, axios, node:http, etc.
++ */
++export interface WebhookTransport {
++  post(url: string, body: WebhookBody): Promise<{ success: boolean; statusCode?: number; error?: string }>;
++}
++
++/**
++ * Configuration for the WebhookAdapter.
++ */
++export interface WebhookAdapterConfig {
++  /** The URL to POST notifications to */
++  url: string;
++  /** Optional transport — defaults to in-memory capture transport */
++  transport?: WebhookTransport;
++}
++
++/**
++ * Validates that a string is a plausible HTTP(S) URL.
++ */
++function isValidUrl(url: string): boolean {
++  return /^https?:\/\/[^\s]+$/.test(url);
++}
++
++/**
++ * Default in-memory transport that captures posted webhooks for inspection.
++ */
++export class InMemoryWebhookTransport implements WebhookTransport {
++  private posted: Array<{ url: string; body: WebhookBody }> = [];
++
++  async post(url: string, body: WebhookBody): Promise<{ success: boolean; statusCode?: number; error?: string }> {
++    this.posted.push({ url, body });
++    return { success: true, statusCode: 200 };
++  }
++
++  getPostedWebhooks(): Array<{ url: string; body: WebhookBody }> {
++    return [...this.posted];
++  }
++
++  clear(): void {
++    this.posted = [];
++  }
++}
++
++export class WebhookAdapter implements NotificationAdapter {
++  readonly channel = 'webhook' as const;
++  private logger = new Logger('WebhookAdapter');
++  private url: string;
++  private transport: WebhookTransport;
++  private sentWebhooks: Array<{ payload: NotificationPayload; body: WebhookBody; sentAt: Date }> = [];
++
++  constructor(config: WebhookAdapterConfig) {
++    this.url = config.url;
++    this.transport = config.transport ?? new InMemoryWebhookTransport();
++  }
++
++  /**
++   * Validate the configured webhook URL.
++   * Returns the URL if valid, or null if invalid.
++   */
++  validateUrl(): string | null {
++    if (!isValidUrl(this.url)) {
++      this.logger.warn(`Invalid webhook URL: ${this.url}`);
++      return null;
++    }
++    return this.url;
++  }
++
++  /**
++   * Format the notification payload as a webhook JSON body.
++   */
++  formatBody(payload: NotificationPayload): WebhookBody {
++    return {
++      recipient: payload.recipient,
++      subject: payload.subject,
++      body: payload.body,
++      channel: payload.channel,
++      priority: payload.priority,
++      metadata: payload.metadata,
++      timestamp: new Date().toISOString(),
++    };
++  }
++
++  /**
++   * Send a notification via webhook.
++   *
++   * 1. Validates the configured URL
++   * 2. Formats the notification as a JSON body
++   * 3. POSTs via the configured transport
++   */
++  async send(payload: NotificationPayload): Promise<NotificationResult> {
++    const validatedUrl = this.validateUrl();
++    if (!validatedUrl) {
++      return {
++        success: false,
++        channel: 'webhook',
++        error: `Invalid webhook URL: ${this.url}`,
++      };
++    }
++
++    const body = this.formatBody(payload);
++
++    try {
++      const result = await this.transport.post(validatedUrl, body);
++
++      if (result.success) {
++        this.sentWebhooks.push({ payload, body, sentAt: new Date() });
++        this.logger.info(`Webhook delivered to ${validatedUrl} (status: ${result.statusCode})`);
++        return {
++          success: true,
++          channel: 'webhook',
++          deliveredAt: new Date(),
++        };
++      }
++
++      this.logger.error(`Webhook delivery failed for ${validatedUrl}: ${result.error}`);
++      return {
++        success: false,
++        channel: 'webhook',
++        error: result.error ?? 'Webhook delivery failed',
++      };
++    } catch (err) {
++      const message = err instanceof Error ? err.message : String(err);
++      this.logger.error(`Webhook transport error for ${validatedUrl}: ${message}`);
++      return {
++        success: false,
++        channel: 'webhook',
++        error: `Transport error: ${message}`,
++      };
++    }
++  }
++
++  /**
++   * Get all successfully sent webhooks. Useful for testing.
++   */
++  getSentWebhooks(): Array<{ payload: NotificationPayload; body: WebhookBody; sentAt: Date }> {
++    return [...this.sentWebhooks];
++  }
++
++  /**
++   * Clear sent webhook history. Useful for testing.
++   */
++  clearSentWebhooks(): void {
++    this.sentWebhooks = [];
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index a36dd12..8e5681f 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -62,6 +62,7 @@ export type {
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter } from './adapters/email.adapter.js';
++export { WebhookAdapter } from './adapters/webhook.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/tests/adapters/webhook.adapter.test.ts b/tests/adapters/webhook.adapter.test.ts
+new file mode 100644
+index 0000000..baffa89
+--- /dev/null
++++ b/tests/adapters/webhook.adapter.test.ts
+@@ -0,0 +1,204 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  WebhookAdapter,
++  InMemoryWebhookTransport,
++} from '../../src/adapters/webhook.adapter.js';
++import type {
++  WebhookTransport,
++  WebhookBody,
++} from '../../src/adapters/webhook.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {
++  return {
++    recipient: 'user-123',
++    subject: 'Order Update',
++    body: 'Your order has shipped.',
++    channel: 'webhook',
++    priority: 'normal',
++    ...overrides,
++  };
++}
++
++const VALID_URL = 'https://hooks.example.com/notify';
++
++describe('WebhookAdapter', () => {
++  let transport: InMemoryWebhookTransport;
++  let adapter: WebhookAdapter;
++
++  beforeEach(() => {
++    transport = new InMemoryWebhookTransport();
++    adapter = new WebhookAdapter({
++      url: VALID_URL,
++      transport,
++    });
++  });
++
++  describe('validateUrl', () => {
++    it('should accept a valid https URL', () => {
++      expect(adapter.validateUrl()).toBe(VALID_URL);
++    });
++
++    it('should accept a valid http URL', () => {
++      const httpAdapter = new WebhookAdapter({ url: 'http://localhost:3000/webhook', transport });
++      expect(httpAdapter.validateUrl()).toBe('http://localhost:3000/webhook');
++    });
++
++    it('should reject an invalid URL', () => {
++      const badAdapter = new WebhookAdapter({ url: 'not-a-url', transport });
++      expect(badAdapter.validateUrl()).toBeNull();
++    });
++
++    it('should reject an empty string', () => {
++      const emptyAdapter = new WebhookAdapter({ url: '', transport });
++      expect(emptyAdapter.validateUrl()).toBeNull();
++    });
++
++    it('should reject a URL without protocol', () => {
++      const noProtoAdapter = new WebhookAdapter({ url: 'hooks.example.com/notify', transport });
++      expect(noProtoAdapter.validateUrl()).toBeNull();
++    });
++  });
++
++  describe('formatBody', () => {
++    it('should format payload fields into webhook body', () => {
++      const payload = makePayload();
++      const body = adapter.formatBody(payload);
++
++      expect(body.recipient).toBe('user-123');
++      expect(body.subject).toBe('Order Update');
++      expect(body.body).toBe('Your order has shipped.');
++      expect(body.channel).toBe('webhook');
++      expect(body.priority).toBe('normal');
++      expect(body.timestamp).toBeDefined();
++    });
++
++    it('should include metadata when present', () => {
++      const payload = makePayload({ metadata: { orderId: 'order-42' } });
++      const body = adapter.formatBody(payload);
++
++      expect(body.metadata).toEqual({ orderId: 'order-42' });
++    });
++
++    it('should omit metadata when not present', () => {
++      const payload = makePayload();
++      const body = adapter.formatBody(payload);
++
++      expect(body.metadata).toBeUndefined();
++    });
++
++    it('should include a valid ISO timestamp', () => {
++      const payload = makePayload();
++      const body = adapter.formatBody(payload);
++
++      expect(() => new Date(body.timestamp)).not.toThrow();
++      expect(new Date(body.timestamp).toISOString()).toBe(body.timestamp);
++    });
++  });
++
++  describe('send', () => {
++    it('should post a valid webhook successfully', async () => {
++      const payload = makePayload();
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.channel).toBe('webhook');
++      expect(result.deliveredAt).toBeInstanceOf(Date);
++
++      const posted = transport.getPostedWebhooks();
++      expect(posted).toHaveLength(1);
++      expect(posted[0]?.url).toBe(VALID_URL);
++      expect(posted[0]?.body.recipient).toBe('user-123');
++    });
++
++    it('should fail for an invalid URL', async () => {
++      const badAdapter = new WebhookAdapter({ url: 'bad-url', transport });
++      const result = await badAdapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid webhook URL');
++      expect(transport.getPostedWebhooks()).toHaveLength(0);
++    });
++
++    it('should handle transport failure', async () => {
++      const failTransport: WebhookTransport = {
++        async post() {
++          return { success: false, statusCode: 500, error: 'Internal Server Error' };
++        },
++      };
++      const failAdapter = new WebhookAdapter({
++        url: VALID_URL,
++        transport: failTransport,
++      });
++
++      const result = await failAdapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('Internal Server Error');
++    });
++
++    it('should handle transport exception', async () => {
++      const throwTransport: WebhookTransport = {
++        async post() {
++          throw new Error('Connection refused');
++        },
++      };
++      const throwAdapter = new WebhookAdapter({
++        url: VALID_URL,
++        transport: throwTransport,
++      });
++
++      const result = await throwAdapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Transport error: Connection refused');
++    });
++
++    it('should record sent webhooks for inspection', async () => {
++      await adapter.send(makePayload());
++      await adapter.send(makePayload({ subject: 'Second' }));
++
++      const sent = adapter.getSentWebhooks();
++      expect(sent).toHaveLength(2);
++      expect(sent[0]?.payload.subject).toBe('Order Update');
++      expect(sent[1]?.payload.subject).toBe('Second');
++    });
++
++    it('should clear sent webhooks', async () => {
++      await adapter.send(makePayload());
++      adapter.clearSentWebhooks();
++      expect(adapter.getSentWebhooks()).toHaveLength(0);
++    });
++  });
++
++  describe('defaults', () => {
++    it('should use in-memory transport by default', async () => {
++      const defaultAdapter = new WebhookAdapter({ url: VALID_URL });
++      const result = await defaultAdapter.send(makePayload());
++
++      expect(result.success).toBe(true);
++      const sent = defaultAdapter.getSentWebhooks();
++      expect(sent).toHaveLength(1);
++    });
++  });
++});
++
++describe('InMemoryWebhookTransport', () => {
++  it('should capture and clear posted webhooks', async () => {
++    const transport = new InMemoryWebhookTransport();
++    const body: WebhookBody = {
++      recipient: 'user-1',
++      subject: 'hi',
++      body: 'hello',
++      channel: 'webhook',
++      priority: 'normal',
++      timestamp: new Date().toISOString(),
++    };
++
++    await transport.post('https://example.com/hook', body);
++    expect(transport.getPostedWebhooks()).toHaveLength(1);
++
++    transport.clear();
++    expect(transport.getPostedWebhooks()).toHaveLength(0);
++  });
++});

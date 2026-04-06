@@ -1,0 +1,606 @@
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+index 23c034e..20ffe93 100644
+--- a/src/models/user-preferences.ts
++++ b/src/models/user-preferences.ts
+@@ -1,13 +1,15 @@
+ /**
+  * User notification preferences model.
+  *
+- * Controls how and when a user receives notifications via email.
++ * Controls how and when a user receives notifications across all channels
++ * (email, SMS, webhook).
+  *
+- * TODO(sms-preferences): This model was designed assuming email-only notifications.
+- * Now that an SMS channel has been added (see src/adapters/sms.adapter.ts), this model
+- * needs to be extended with SMS preferences (e.g., sms?: SmsPreferences). Until then,
+- * SMS notifications bypass user preference checks entirely. See docs/SMS_CHANNEL_ADDITION.md
+- * for the full list of required changes.
++ * DECISION CHANGE (Session 9): This model was originally designed for email-only
++ * notifications (Session 3). With SMS support added in Session 8, the email-only
++ * assumption is no longer valid. The model now supports per-channel preferences
++ * for email, SMS, and webhook. Existing email-only preferences remain backward
++ * compatible — the sms and webhook fields are optional and default to enabled
++ * with all categories when absent (opt-out model).
+  */
+ 
+ import type { NotificationType } from './notification.js';
+@@ -29,13 +31,35 @@ export interface EmailPreferences {
+   subscribedCategories: NotificationType[];
+ }
+ 
++/**
++ * SMS-specific notification settings.
++ */
++export interface SmsPreferences {
++  enabled: boolean;
++  subscribedCategories: NotificationType[];
++}
++
++/**
++ * Webhook-specific notification settings.
++ */
++export interface WebhookPreferences {
++  enabled: boolean;
++  subscribedCategories: NotificationType[];
++}
++
+ /**
+  * Full notification preferences for a user.
++ *
++ * The email field is always present (backward compatible with original model).
++ * The sms and webhook fields are optional — when absent, those channels are
++ * treated as enabled with all categories (opt-out model).
+  */
+ export interface UserPreferences {
+   id: string;
+   userId: string;
+   email: EmailPreferences;
++  sms?: SmsPreferences;
++  webhook?: WebhookPreferences;
+   createdAt: Date;
+   updatedAt: Date;
+ }
+@@ -45,6 +69,8 @@ export interface UserPreferences {
+  */
+ export interface CreatePreferencesInput {
+   email?: Partial<EmailPreferences>;
++  sms?: Partial<SmsPreferences>;
++  webhook?: Partial<WebhookPreferences>;
+ }
+ 
+ /**
+@@ -52,6 +78,8 @@ export interface CreatePreferencesInput {
+  */
+ export interface UpdatePreferencesInput {
+   email?: Partial<EmailPreferences>;
++  sms?: Partial<SmsPreferences>;
++  webhook?: Partial<WebhookPreferences>;
+ }
+ 
+ /**
+@@ -72,3 +100,19 @@ export const DEFAULT_EMAIL_PREFERENCES: EmailPreferences = {
+   frequency: 'immediate',
+   subscribedCategories: [...ALL_NOTIFICATION_CATEGORIES],
+ };
++
++/**
++ * Default SMS preferences for new users.
++ */
++export const DEFAULT_SMS_PREFERENCES: SmsPreferences = {
++  enabled: true,
++  subscribedCategories: [...ALL_NOTIFICATION_CATEGORIES],
++};
++
++/**
++ * Default webhook preferences for new users.
++ */
++export const DEFAULT_WEBHOOK_PREFERENCES: WebhookPreferences = {
++  enabled: true,
++  subscribedCategories: [...ALL_NOTIFICATION_CATEGORIES],
++};
+diff --git a/src/repositories/preferences.repository.ts b/src/repositories/preferences.repository.ts
+index a315bd8..8b8d6d2 100644
+--- a/src/repositories/preferences.repository.ts
++++ b/src/repositories/preferences.repository.ts
+@@ -18,7 +18,7 @@ export class PreferencesRepository extends BaseRepository<UserPreferences> {
+   }
+ 
+   protected toDomain(record: DatabaseRecord): UserPreferences {
+-    return {
++    const prefs: UserPreferences = {
+       id: record['id'] as string,
+       userId: record['userId'] as string,
+       email: {
+@@ -31,10 +31,30 @@ export class PreferencesRepository extends BaseRepository<UserPreferences> {
+       createdAt: new Date(record['createdAt'] as string),
+       updatedAt: new Date(record['updatedAt'] as string),
+     };
++
++    if (record['smsEnabled'] !== undefined) {
++      prefs.sms = {
++        enabled: record['smsEnabled'] as boolean,
++        subscribedCategories: JSON.parse(
++          record['smsSubscribedCategories'] as string,
++        ) as NotificationType[],
++      };
++    }
++
++    if (record['webhookEnabled'] !== undefined) {
++      prefs.webhook = {
++        enabled: record['webhookEnabled'] as boolean,
++        subscribedCategories: JSON.parse(
++          record['webhookSubscribedCategories'] as string,
++        ) as NotificationType[],
++      };
++    }
++
++    return prefs;
+   }
+ 
+   protected toRecord(entity: UserPreferences): DatabaseRecord {
+-    return {
++    const record: DatabaseRecord = {
+       id: entity.id,
+       userId: entity.userId,
+       emailEnabled: entity.email.enabled,
+@@ -43,6 +63,18 @@ export class PreferencesRepository extends BaseRepository<UserPreferences> {
+       createdAt: entity.createdAt.toISOString(),
+       updatedAt: entity.updatedAt.toISOString(),
+     };
++
++    if (entity.sms) {
++      record['smsEnabled'] = entity.sms.enabled;
++      record['smsSubscribedCategories'] = JSON.stringify(entity.sms.subscribedCategories);
++    }
++
++    if (entity.webhook) {
++      record['webhookEnabled'] = entity.webhook.enabled;
++      record['webhookSubscribedCategories'] = JSON.stringify(entity.webhook.subscribedCategories);
++    }
++
++    return record;
+   }
+ 
+   /**
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 4437f7b..e11095e 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -176,14 +176,11 @@ export class NotificationService {
+    * checked before dispatching. Blocked notifications are not persisted.
+    */
+   private dispatchNotification(payload: NotificationPayload): void {
+-    // TODO(sms-preferences): This preference check is email-only. SMS (and future channels)
+-    // bypass preferences entirely. Update to check preferences for all opt-out channels.
+-    // See docs/SMS_CHANNEL_ADDITION.md for details.
+-    if (this.preferencesService && payload.channel === 'email') {
++    if (this.preferencesService) {
+       const userId = payload.metadata?.['userId'] as string | undefined;
+-      if (userId && !this.preferencesService.isEmailAllowed(userId, payload.notificationType)) {
++      if (userId && !this.preferencesService.isChannelAllowed(userId, payload.channel, payload.notificationType)) {
+         this.logger.info(
+-          `Notification suppressed by user preferences: ${payload.notificationType} for user ${userId}`,
++          `Notification suppressed by user preferences: ${payload.notificationType} on ${payload.channel} for user ${userId}`,
+         );
+         return;
+       }
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+index 02866ec..85feefd 100644
+--- a/src/services/preferences.service.ts
++++ b/src/services/preferences.service.ts
+@@ -16,8 +16,11 @@ import type {
+   UpdatePreferencesInput,
+ } from '../models/user-preferences.js';
+ import type { NotificationType } from '../models/notification.js';
++import type { NotificationChannel } from '../models/notification.js';
+ import {
+   DEFAULT_EMAIL_PREFERENCES,
++  DEFAULT_SMS_PREFERENCES,
++  DEFAULT_WEBHOOK_PREFERENCES,
+ } from '../models/user-preferences.js';
+ import { validateCategories as _validateCategories } from '../validators/preferences.validator.js';
+ import { Logger } from '../utils/logger.js';
+@@ -62,6 +65,24 @@ export class PreferencesService {
+       updatedAt: new Date(),
+     };
+ 
++    if (input?.sms) {
++      const smsInput = input.sms;
++      preferences.sms = {
++        enabled: smsInput.enabled ?? DEFAULT_SMS_PREFERENCES.enabled,
++        subscribedCategories:
++          smsInput.subscribedCategories ?? [...DEFAULT_SMS_PREFERENCES.subscribedCategories],
++      };
++    }
++
++    if (input?.webhook) {
++      const webhookInput = input.webhook;
++      preferences.webhook = {
++        enabled: webhookInput.enabled ?? DEFAULT_WEBHOOK_PREFERENCES.enabled,
++        subscribedCategories:
++          webhookInput.subscribedCategories ?? [...DEFAULT_WEBHOOK_PREFERENCES.subscribedCategories],
++      };
++    }
++
+     this.preferencesRepo.save(preferences);
+     this.logger.info(`Created preferences ${preferences.id} for user ${userId}`);
+     return preferences;
+@@ -95,6 +116,28 @@ export class PreferencesService {
+       updatedAt: new Date(),
+     };
+ 
++    if (input.sms) {
++      const existingSms = existing.sms ?? DEFAULT_SMS_PREFERENCES;
++      updated.sms = {
++        enabled: input.sms.enabled ?? existingSms.enabled,
++        subscribedCategories:
++          input.sms.subscribedCategories ?? existingSms.subscribedCategories,
++      };
++    } else if (existing.sms) {
++      updated.sms = existing.sms;
++    }
++
++    if (input.webhook) {
++      const existingWebhook = existing.webhook ?? DEFAULT_WEBHOOK_PREFERENCES;
++      updated.webhook = {
++        enabled: input.webhook.enabled ?? existingWebhook.enabled,
++        subscribedCategories:
++          input.webhook.subscribedCategories ?? existingWebhook.subscribedCategories,
++      };
++    } else if (existing.webhook) {
++      updated.webhook = existing.webhook;
++    }
++
+     this.preferencesRepo.update(existing.id, updated);
+     this.logger.info(`Updated preferences for user ${userId}`);
+     return updated;
+@@ -103,16 +146,44 @@ export class PreferencesService {
+   /**
+    * Check whether email notifications are allowed for a user and notification type.
+    * If no preferences exist, notifications are allowed by default (opt-out model).
++   *
++   * @deprecated Use isChannelAllowed(userId, 'email', notificationType) instead.
+    */
+   isEmailAllowed(userId: string, notificationType: NotificationType): boolean {
++    return this.isChannelAllowed(userId, 'email', notificationType);
++  }
++
++  /**
++   * Check whether notifications on a given channel are allowed for a user.
++   * If no preferences exist, notifications are allowed by default (opt-out model).
++   * If preferences exist but the specific channel has no settings, that channel
++   * is allowed by default (backward compatible — existing email-only preferences
++   * don't block SMS/webhook).
++   */
++  isChannelAllowed(userId: string, channel: NotificationChannel, notificationType: NotificationType): boolean {
+     const prefs = this.preferencesRepo.findByUserId(userId);
+     if (!prefs) {
+       return true;
+     }
+-    if (!prefs.email.enabled) {
+-      return false;
++
++    switch (channel) {
++      case 'email': {
++        if (!prefs.email.enabled) return false;
++        return prefs.email.subscribedCategories.includes(notificationType);
++      }
++      case 'sms': {
++        if (!prefs.sms) return true;
++        if (!prefs.sms.enabled) return false;
++        return prefs.sms.subscribedCategories.includes(notificationType);
++      }
++      case 'webhook': {
++        if (!prefs.webhook) return true;
++        if (!prefs.webhook.enabled) return false;
++        return prefs.webhook.subscribedCategories.includes(notificationType);
++      }
++      default:
++        return true;
+     }
+-    return prefs.email.subscribedCategories.includes(notificationType);
+   }
+ 
+   /**
+diff --git a/tests/repositories/preferences.repository.test.ts b/tests/repositories/preferences.repository.test.ts
+index 54222b9..cad3d59 100644
+--- a/tests/repositories/preferences.repository.test.ts
++++ b/tests/repositories/preferences.repository.test.ts
+@@ -74,4 +74,64 @@ describe('PreferencesRepository', () => {
+     expect(found!.email.subscribedCategories).toEqual(['user_welcome']);
+     expect(found!.email.frequency).toBe('weekly');
+   });
++
++  it('should save and retrieve preferences with SMS settings', () => {
++    const prefs = makePrefs({
++      sms: {
++        enabled: true,
++        subscribedCategories: ['order_confirmation', 'order_status_update'],
++      },
++    });
++    repo.save(prefs);
++
++    const found = repo.findById('pref-0001');
++    expect(found!.sms).toBeDefined();
++    expect(found!.sms!.enabled).toBe(true);
++    expect(found!.sms!.subscribedCategories).toEqual(['order_confirmation', 'order_status_update']);
++  });
++
++  it('should save and retrieve preferences with webhook settings', () => {
++    const prefs = makePrefs({
++      webhook: {
++        enabled: false,
++        subscribedCategories: ['user_welcome'],
++      },
++    });
++    repo.save(prefs);
++
++    const found = repo.findById('pref-0001');
++    expect(found!.webhook).toBeDefined();
++    expect(found!.webhook!.enabled).toBe(false);
++    expect(found!.webhook!.subscribedCategories).toEqual(['user_welcome']);
++  });
++
++  it('should preserve undefined sms/webhook when not set', () => {
++    const prefs = makePrefs();
++    repo.save(prefs);
++
++    const found = repo.findById('pref-0001');
++    expect(found!.sms).toBeUndefined();
++    expect(found!.webhook).toBeUndefined();
++  });
++
++  it('should round-trip preferences with all channels set', () => {
++    const prefs = makePrefs({
++      sms: {
++        enabled: true,
++        subscribedCategories: ['order_confirmation'],
++      },
++      webhook: {
++        enabled: true,
++        subscribedCategories: ['order_status_update', 'user_updated'],
++      },
++    });
++    repo.save(prefs);
++
++    const found = repo.findById('pref-0001');
++    expect(found!.email.enabled).toBe(true);
++    expect(found!.sms!.enabled).toBe(true);
++    expect(found!.sms!.subscribedCategories).toEqual(['order_confirmation']);
++    expect(found!.webhook!.enabled).toBe(true);
++    expect(found!.webhook!.subscribedCategories).toEqual(['order_status_update', 'user_updated']);
++  });
+ });
+diff --git a/tests/services/notification-preferences.test.ts b/tests/services/notification-preferences.test.ts
+index 5c0fec2..0ccb48d 100644
+--- a/tests/services/notification-preferences.test.ts
++++ b/tests/services/notification-preferences.test.ts
+@@ -201,4 +201,64 @@ describe('NotificationService with preferences', () => {
+     // bareService has no preferences service, so all notifications go through
+     expect(bareService.getNotificationCount()).toBe(1);
+   });
++
++  it('should allow SMS when user has email-only preferences (backward compatible)', async () => {
++    // User has email-only preferences (no SMS settings) — SMS should still go through
++    preferencesService.createPreferences('user-1', {
++      email: { enabled: false },
++    });
++
++    const event: OrderCreatedEvent = {
++      type: 'order:created',
++      order: {
++        id: 'order-1',
++        userId: 'user-1',
++        items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++        total: 10,
++        status: 'pending',
++        createdAt: new Date(),
++        updatedAt: new Date(),
++      },
++      user: {
++        id: 'user-1',
++        name: 'Alice',
++        email: 'alice@example.com',
++        role: 'member',
++        createdAt: new Date(),
++        updatedAt: new Date(),
++      },
++      timestamp: new Date(),
++    };
++
++    await eventBus.emit(event);
++    // Email is disabled, so the email notification is suppressed
++    expect(notificationService.getNotificationCount()).toBe(0);
++
++    // But an SMS notification for the same user should be allowed
++    // since no SMS preferences are set (opt-out model)
++    expect(preferencesService.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(true);
++  });
++
++  it('should suppress SMS when user has disabled SMS', async () => {
++    preferencesService.createPreferences('user-1', {
++      sms: { enabled: false },
++    });
++
++    expect(preferencesService.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(false);
++  });
++
++  it('should independently control email and SMS preferences', async () => {
++    preferencesService.createPreferences('user-1', {
++      email: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      sms: { enabled: true, subscribedCategories: ['user_welcome'] },
++    });
++
++    // Email allows order_confirmation but not user_welcome
++    expect(preferencesService.isChannelAllowed('user-1', 'email', 'order_confirmation')).toBe(true);
++    expect(preferencesService.isChannelAllowed('user-1', 'email', 'user_welcome')).toBe(false);
++
++    // SMS allows user_welcome but not order_confirmation
++    expect(preferencesService.isChannelAllowed('user-1', 'sms', 'user_welcome')).toBe(true);
++    expect(preferencesService.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(false);
++  });
+ });
+diff --git a/tests/services/preferences.service.test.ts b/tests/services/preferences.service.test.ts
+index defaeda..3ed57eb 100644
+--- a/tests/services/preferences.service.test.ts
++++ b/tests/services/preferences.service.test.ts
+@@ -170,6 +170,159 @@ describe('PreferencesService', () => {
+     });
+   });
+ 
++  describe('createPreferences with SMS and webhook', () => {
++    it('should create preferences with SMS settings', () => {
++      const prefs = service.createPreferences('user-1', {
++        sms: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      });
++
++      expect(prefs.sms).toBeDefined();
++      expect(prefs.sms!.enabled).toBe(true);
++      expect(prefs.sms!.subscribedCategories).toEqual(['order_confirmation']);
++    });
++
++    it('should create preferences with webhook settings', () => {
++      const prefs = service.createPreferences('user-1', {
++        webhook: { enabled: false },
++      });
++
++      expect(prefs.webhook).toBeDefined();
++      expect(prefs.webhook!.enabled).toBe(false);
++      expect(prefs.webhook!.subscribedCategories).toEqual(ALL_NOTIFICATION_CATEGORIES);
++    });
++
++    it('should create preferences with all channels', () => {
++      const prefs = service.createPreferences('user-1', {
++        email: { frequency: 'daily' },
++        sms: { enabled: true },
++        webhook: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      });
++
++      expect(prefs.email.frequency).toBe('daily');
++      expect(prefs.sms!.enabled).toBe(true);
++      expect(prefs.sms!.subscribedCategories).toEqual(ALL_NOTIFICATION_CATEGORIES);
++      expect(prefs.webhook!.subscribedCategories).toEqual(['order_confirmation']);
++    });
++
++    it('should leave sms/webhook undefined when not provided', () => {
++      const prefs = service.createPreferences('user-1');
++      expect(prefs.sms).toBeUndefined();
++      expect(prefs.webhook).toBeUndefined();
++    });
++  });
++
++  describe('updatePreferences with SMS and webhook', () => {
++    it('should add SMS preferences to existing email-only preferences', () => {
++      service.createPreferences('user-1');
++      const updated = service.updatePreferences('user-1', {
++        sms: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      });
++
++      expect(updated.sms).toBeDefined();
++      expect(updated.sms!.enabled).toBe(true);
++      expect(updated.sms!.subscribedCategories).toEqual(['order_confirmation']);
++      expect(updated.email.enabled).toBe(true);
++    });
++
++    it('should update existing SMS preferences', () => {
++      service.createPreferences('user-1', {
++        sms: { enabled: true },
++      });
++      const updated = service.updatePreferences('user-1', {
++        sms: { enabled: false },
++      });
++
++      expect(updated.sms!.enabled).toBe(false);
++    });
++
++    it('should preserve SMS settings when only updating email', () => {
++      service.createPreferences('user-1', {
++        sms: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      });
++      const updated = service.updatePreferences('user-1', {
++        email: { frequency: 'weekly' },
++      });
++
++      expect(updated.sms!.enabled).toBe(true);
++      expect(updated.sms!.subscribedCategories).toEqual(['order_confirmation']);
++      expect(updated.email.frequency).toBe('weekly');
++    });
++
++    it('should add webhook preferences via update', () => {
++      service.createPreferences('user-1');
++      const updated = service.updatePreferences('user-1', {
++        webhook: { enabled: true, subscribedCategories: ['user_updated'] },
++      });
++
++      expect(updated.webhook).toBeDefined();
++      expect(updated.webhook!.subscribedCategories).toEqual(['user_updated']);
++    });
++  });
++
++  describe('isChannelAllowed', () => {
++    it('should allow all channels when no preferences exist (opt-out model)', () => {
++      expect(service.isChannelAllowed('user-999', 'email', 'order_confirmation')).toBe(true);
++      expect(service.isChannelAllowed('user-999', 'sms', 'order_confirmation')).toBe(true);
++      expect(service.isChannelAllowed('user-999', 'webhook', 'order_confirmation')).toBe(true);
++    });
++
++    it('should allow SMS when preferences exist but have no SMS settings', () => {
++      service.createPreferences('user-1');
++      expect(service.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(true);
++    });
++
++    it('should allow webhook when preferences exist but have no webhook settings', () => {
++      service.createPreferences('user-1');
++      expect(service.isChannelAllowed('user-1', 'webhook', 'order_confirmation')).toBe(true);
++    });
++
++    it('should block SMS when SMS is disabled', () => {
++      service.createPreferences('user-1', {
++        sms: { enabled: false },
++      });
++      expect(service.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(false);
++    });
++
++    it('should block SMS when category is not subscribed', () => {
++      service.createPreferences('user-1', {
++        sms: { enabled: true, subscribedCategories: ['order_confirmation'] },
++      });
++      expect(service.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(true);
++      expect(service.isChannelAllowed('user-1', 'sms', 'user_welcome')).toBe(false);
++    });
++
++    it('should block webhook when webhook is disabled', () => {
++      service.createPreferences('user-1', {
++        webhook: { enabled: false },
++      });
++      expect(service.isChannelAllowed('user-1', 'webhook', 'order_confirmation')).toBe(false);
++    });
++
++    it('should check email channel the same as isEmailAllowed', () => {
++      service.createPreferences('user-1', {
++        email: { enabled: false },
++      });
++      expect(service.isChannelAllowed('user-1', 'email', 'order_confirmation')).toBe(false);
++      expect(service.isEmailAllowed('user-1', 'order_confirmation')).toBe(false);
++    });
++
++    it('should allow in-app channel by default', () => {
++      service.createPreferences('user-1');
++      expect(service.isChannelAllowed('user-1', 'in-app', 'order_confirmation')).toBe(true);
++    });
++
++    it('should independently control channels', () => {
++      service.createPreferences('user-1', {
++        email: { enabled: false },
++        sms: { enabled: true, subscribedCategories: ['order_confirmation'] },
++        webhook: { enabled: true },
++      });
++      expect(service.isChannelAllowed('user-1', 'email', 'order_confirmation')).toBe(false);
++      expect(service.isChannelAllowed('user-1', 'sms', 'order_confirmation')).toBe(true);
++      expect(service.isChannelAllowed('user-1', 'webhook', 'order_confirmation')).toBe(true);
++    });
++  });
++
+   describe('validateCategories', () => {
+     it('should accept valid categories', () => {
+       expect(service.validateCategories(['order_confirmation', 'user_welcome'])).toBe(true);

@@ -1,0 +1,193 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index f8cf52b..793de41 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -47,6 +47,7 @@ export class NotificationService {
+   private records: NotificationRecord[] = [];
+   private preferencesService: PreferencesService | null = null;
+   private historyService: NotificationHistoryService | null = null;
++  private sendQueues: Map<string, Promise<NotificationResult>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+@@ -108,6 +109,26 @@ export class NotificationService {
+    * Payloads with metadata.userId will be checked against that user's preferences.
+    */
+   async send(payload: NotificationPayload): Promise<NotificationResult> {
++    const queueKey = payload.recipient;
++    const previousInQueue = this.sendQueues.get(queueKey) ?? Promise.resolve(undefined as unknown as NotificationResult);
++
++    const resultPromise = previousInQueue
++      .catch(() => {})
++      .then(() => this.processSend(payload));
++
++    this.sendQueues.set(queueKey, resultPromise);
++
++    const result = await resultPromise;
++
++    // Clean up queue entry if this was the last item
++    if (this.sendQueues.get(queueKey) === resultPromise) {
++      this.sendQueues.delete(queueKey);
++    }
++
++    return result;
++  }
++
++  private async processSend(payload: NotificationPayload): Promise<NotificationResult> {
+     // Check user preferences if available — routes to channel-specific check
+     if (this.preferencesService && payload.metadata?.['userId']) {
+       const userId = payload.metadata['userId'] as string;
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index cfe43e0..76dba5d 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,6 +5,8 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload, NotificationResult } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -273,4 +275,140 @@ describe('NotificationService', () => {
+       expect(emails[0]?.subject).toContain('Order Update');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications to the same recipient in order even with concurrent sends', async () => {
++      const deliveryOrder: string[] = [];
++      let resolveFirst: (() => void) | undefined;
++      const firstBlocked = new Promise<void>((resolve) => {
++        resolveFirst = resolve;
++      });
++
++      // Create a slow adapter that blocks on the first notification
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as const,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          if (payload.type === 'order_confirmation') {
++            await firstBlocked;
++          }
++          deliveryOrder.push(payload.type);
++          return {
++            success: true,
++            notificationId: payload.id,
++            channel: 'email',
++            deliveredAt: new Date(),
++          };
++        },
++      };
++
++      service.registerAdapter(slowAdapter);
++
++      // Fire both events concurrently — order_confirmation first, then status_update
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'alice@example.com',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Emit both concurrently — without the queue, the second would complete first
++      const p1 = eventBus.emit(orderCreatedEvent);
++      const p2 = eventBus.emit(statusChangedEvent);
++
++      // Unblock the first notification after both are queued
++      resolveFirst!();
++
++      await Promise.all([p1, p2]);
++
++      // The queue should ensure order_confirmation is delivered before order_status_update
++      expect(deliveryOrder).toEqual(['order_confirmation', 'order_status_update']);
++    });
++
++    it('should allow concurrent delivery to different recipients', async () => {
++      const deliveryOrder: string[] = [];
++      let resolveFirst: (() => void) | undefined;
++      const firstBlocked = new Promise<void>((resolve) => {
++        resolveFirst = resolve;
++      });
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as const,
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          if (payload.recipient === 'alice@example.com') {
++            await firstBlocked;
++          }
++          deliveryOrder.push(payload.recipient);
++          return {
++            success: true,
++            notificationId: payload.id,
++            channel: 'email',
++            deliveredAt: new Date(),
++          };
++        },
++      };
++
++      service.registerAdapter(slowAdapter);
++
++      // Send to two different recipients concurrently
++      const p1 = service.send({
++        id: 'n1',
++        type: 'welcome',
++        channel: 'email',
++        recipient: 'alice@example.com',
++        subject: 'Hello Alice',
++        body: 'Welcome',
++        priority: 'normal',
++        createdAt: new Date(),
++      });
++      const p2 = service.send({
++        id: 'n2',
++        type: 'welcome',
++        channel: 'email',
++        recipient: 'bob@example.com',
++        subject: 'Hello Bob',
++        body: 'Welcome',
++        priority: 'normal',
++        createdAt: new Date(),
++      });
++
++      // Bob's should complete first since Alice is blocked
++      resolveFirst!();
++      await Promise.all([p1, p2]);
++
++      // Bob should be delivered before Alice since Alice was blocked
++      expect(deliveryOrder[0]).toBe('bob@example.com');
++      expect(deliveryOrder[1]).toBe('alice@example.com');
++    });
++  });
+ });

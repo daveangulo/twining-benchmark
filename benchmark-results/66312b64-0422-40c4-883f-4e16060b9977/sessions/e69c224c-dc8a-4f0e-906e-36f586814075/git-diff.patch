@@ -1,0 +1,528 @@
+diff --git a/src/services/audit.service.ts b/src/services/audit.service.ts
+new file mode 100644
+index 0000000..ca1fa1a
+--- /dev/null
++++ b/src/services/audit.service.ts
+@@ -0,0 +1,80 @@
++/**
++ * Audit logging service — records every notification dispatched through
++ * the priority router for compliance and debugging purposes.
++ *
++ * Stores audit entries in-memory (same pattern as the other channel services).
++ */
++
++import { Logger } from '../utils/logger.js';
++import type { NotificationPriority } from './priority-router.js';
++
++export interface AuditEntry {
++  id: string;
++  timestamp: Date;
++  priority: NotificationPriority;
++  channel: 'sms' | 'email' | 'webhook';
++  recipient: string;
++  subject: string;
++  overridden: boolean;
++  originalChannel?: 'sms' | 'email' | 'webhook';
++}
++
++let nextId = 1;
++
++function generateAuditId(): string {
++  return `audit-${String(nextId++).padStart(4, '0')}`;
++}
++
++export function resetAuditIdCounter(): void {
++  nextId = 1;
++}
++
++export class AuditService {
++  private logger = new Logger('AuditService');
++  private entries: AuditEntry[] = [];
++
++  record(params: {
++    priority: NotificationPriority;
++    channel: 'sms' | 'email' | 'webhook';
++    recipient: string;
++    subject: string;
++    overridden?: boolean;
++    originalChannel?: 'sms' | 'email' | 'webhook';
++  }): AuditEntry {
++    const entry: AuditEntry = {
++      id: generateAuditId(),
++      timestamp: new Date(),
++      priority: params.priority,
++      channel: params.channel,
++      recipient: params.recipient,
++      subject: params.subject,
++      overridden: params.overridden ?? false,
++      originalChannel: params.originalChannel,
++    };
++    this.entries.push(entry);
++    this.logger.info(
++      `Audit: ${entry.id} — ${entry.priority} notification to ${entry.recipient} via ${entry.channel}${entry.overridden ? ` (overridden from ${entry.originalChannel})` : ''}`,
++    );
++    return entry;
++  }
++
++  getEntries(): AuditEntry[] {
++    return [...this.entries];
++  }
++
++  getEntriesForRecipient(recipient: string): AuditEntry[] {
++    return this.entries.filter((e) => e.recipient === recipient);
++  }
++
++  getEntriesByChannel(channel: 'sms' | 'email' | 'webhook'): AuditEntry[] {
++    return this.entries.filter((e) => e.channel === channel);
++  }
++
++  getEntryCount(): number {
++    return this.entries.length;
++  }
++
++  clearEntries(): void {
++    this.entries = [];
++  }
++}
+diff --git a/src/services/notification-preferences.service.ts b/src/services/notification-preferences.service.ts
+new file mode 100644
+index 0000000..e2ed584
+--- /dev/null
++++ b/src/services/notification-preferences.service.ts
+@@ -0,0 +1,53 @@
++/**
++ * Notification preferences service — allows per-user channel preferences
++ * that override the default priority-based routing.
++ *
++ * For example, a user can opt to receive ALL notifications via SMS,
++ * regardless of priority level.
++ */
++
++import { Logger } from '../utils/logger.js';
++
++export type ChannelPreference = 'sms' | 'email' | 'webhook';
++
++export interface UserPreferences {
++  userId: string;
++  preferredChannel: ChannelPreference;
++}
++
++export class NotificationPreferencesService {
++  private logger = new Logger('NotificationPreferencesService');
++  private preferences = new Map<string, ChannelPreference>();
++
++  setPreference(userId: string, channel: ChannelPreference): void {
++    this.preferences.set(userId, channel);
++    this.logger.info(`Set preference for ${userId}: ${channel}`);
++  }
++
++  getPreference(userId: string): ChannelPreference | undefined {
++    return this.preferences.get(userId);
++  }
++
++  removePreference(userId: string): boolean {
++    const deleted = this.preferences.delete(userId);
++    if (deleted) {
++      this.logger.info(`Removed preference for ${userId}`);
++    }
++    return deleted;
++  }
++
++  hasPreference(userId: string): boolean {
++    return this.preferences.has(userId);
++  }
++
++  getAllPreferences(): UserPreferences[] {
++    return Array.from(this.preferences.entries()).map(([userId, preferredChannel]) => ({
++      userId,
++      preferredChannel,
++    }));
++  }
++
++  clearPreferences(): void {
++    this.preferences.clear();
++  }
++}
+diff --git a/src/services/priority-router.ts b/src/services/priority-router.ts
+index 6d3e247..91ea737 100644
+--- a/src/services/priority-router.ts
++++ b/src/services/priority-router.ts
+@@ -6,11 +6,15 @@
+  * - normal -> email channel (NotificationService)
+  * - low    -> webhook channel
+  *
++ * Supports per-user channel preference overrides and audit logging.
++ *
+  * This replaces the previous broadcast approach where all channels
+  * received all notifications regardless of priority.
+  */
+ 
+ import { Logger } from '../utils/logger.js';
++import type { AuditService } from './audit.service.js';
++import type { ChannelPreference, NotificationPreferencesService } from './notification-preferences.service.js';
+ import type { NotificationService } from './notification.service.js';
+ import type { SmsChannelService } from './sms-channel.service.js';
+ import type { WebhookChannelService } from './webhook-channel.service.js';
+@@ -25,6 +29,12 @@ export interface PriorityNotification {
+   webhookUrl?: string;
+ }
+ 
++const PRIORITY_TO_CHANNEL: Record<NotificationPriority, ChannelPreference> = {
++  urgent: 'sms',
++  normal: 'email',
++  low: 'webhook',
++};
++
+ export class PriorityRouter {
+   private logger = new Logger('PriorityRouter');
+ 
+@@ -32,25 +42,46 @@ export class PriorityRouter {
+     private smsChannel: SmsChannelService,
+     private emailChannel: NotificationService,
+     private webhookChannel: WebhookChannelService,
++    private auditService?: AuditService,
++    private preferencesService?: NotificationPreferencesService,
+   ) {}
+ 
+   /**
+-   * Route a notification to the appropriate channel based on its priority.
++   * Route a notification to the appropriate channel based on its priority,
++   * or to the user's preferred channel if a preference override exists.
+    */
+   route(notification: PriorityNotification): void {
++    const defaultChannel = PRIORITY_TO_CHANNEL[notification.priority];
++    const preferredChannel = this.preferencesService?.getPreference(notification.recipient);
++    const channel = preferredChannel ?? defaultChannel;
++    const overridden = preferredChannel !== undefined && preferredChannel !== defaultChannel;
++
+     this.logger.info(
+-      `Routing ${notification.priority} notification to ${notification.recipient}`,
++      `Routing ${notification.priority} notification to ${notification.recipient} via ${channel}${overridden ? ` (overridden from ${defaultChannel})` : ''}`,
+     );
+ 
+-    switch (notification.priority) {
+-      case 'urgent':
++    this.dispatch(channel, notification);
++
++    this.auditService?.record({
++      priority: notification.priority,
++      channel,
++      recipient: notification.recipient,
++      subject: notification.subject,
++      overridden,
++      originalChannel: overridden ? defaultChannel : undefined,
++    });
++  }
++
++  private dispatch(channel: ChannelPreference, notification: PriorityNotification): void {
++    switch (channel) {
++      case 'sms':
+         this.smsChannel.send({
+           phoneNumber: notification.recipient,
+           message: `[${notification.subject}] ${notification.body}`,
+         });
+         break;
+ 
+-      case 'normal':
++      case 'email':
+         this.emailChannel.send({
+           recipient: notification.recipient,
+           subject: notification.subject,
+@@ -58,7 +89,7 @@ export class PriorityRouter {
+         });
+         break;
+ 
+-      case 'low':
++      case 'webhook':
+         this.webhookChannel.send({
+           url: notification.webhookUrl ?? 'https://hooks.default/notifications',
+           eventType: 'notification',
+diff --git a/tests/services/notification-flow.integration.test.ts b/tests/services/notification-flow.integration.test.ts
+new file mode 100644
+index 0000000..7230dc6
+--- /dev/null
++++ b/tests/services/notification-flow.integration.test.ts
+@@ -0,0 +1,283 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import { NotificationService, resetNotificationIdCounter } from '../../src/services/notification.service.js';
++import { SmsChannelService, resetSmsIdCounter } from '../../src/services/sms-channel.service.js';
++import { WebhookChannelService, resetWebhookIdCounter } from '../../src/services/webhook-channel.service.js';
++import { PriorityRouter } from '../../src/services/priority-router.js';
++import { AuditService, resetAuditIdCounter } from '../../src/services/audit.service.js';
++import { NotificationPreferencesService } from '../../src/services/notification-preferences.service.js';
++import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
++import type { PriorityNotification } from '../../src/services/priority-router.js';
++
++describe('Notification Flow Integration', () => {
++  let eventBus: EventBus;
++  let emailChannel: NotificationService;
++  let smsChannel: SmsChannelService;
++  let webhookChannel: WebhookChannelService;
++  let auditService: AuditService;
++  let preferencesService: NotificationPreferencesService;
++  let router: PriorityRouter;
++
++  beforeEach(() => {
++    eventBus = new EventBus();
++    statusChangeCallbacks.clear();
++    emailChannel = new NotificationService(eventBus);
++    smsChannel = new SmsChannelService(eventBus);
++    webhookChannel = new WebhookChannelService(eventBus);
++    auditService = new AuditService();
++    preferencesService = new NotificationPreferencesService();
++    router = new PriorityRouter(smsChannel, emailChannel, webhookChannel, auditService, preferencesService);
++    resetNotificationIdCounter();
++    resetSmsIdCounter();
++    resetWebhookIdCounter();
++    resetAuditIdCounter();
++  });
++
++  describe('priority routing → channel selection → audit log', () => {
++    it('should route urgent notification to SMS and create audit entry', () => {
++      const notification: PriorityNotification = {
++        priority: 'urgent',
++        recipient: '+1234567890',
++        subject: 'Server Down',
++        body: 'Production server is unreachable',
++      };
++
++      router.route(notification);
++
++      // Verify channel selection
++      expect(smsChannel.getMessageCount()).toBe(1);
++      expect(emailChannel.getNotificationCount()).toBe(0);
++      expect(webhookChannel.getDeliveryCount()).toBe(0);
++
++      // Verify SMS content
++      const sms = smsChannel.getMessages()[0]!;
++      expect(sms.phoneNumber).toBe('+1234567890');
++      expect(sms.message).toContain('Server Down');
++
++      // Verify audit entry
++      const audit = auditService.getEntries();
++      expect(audit).toHaveLength(1);
++      expect(audit[0]!.priority).toBe('urgent');
++      expect(audit[0]!.channel).toBe('sms');
++      expect(audit[0]!.recipient).toBe('+1234567890');
++      expect(audit[0]!.subject).toBe('Server Down');
++      expect(audit[0]!.overridden).toBe(false);
++    });
++
++    it('should route normal notification to email and create audit entry', () => {
++      router.route({
++        priority: 'normal',
++        recipient: 'user@example.com',
++        subject: 'Order Shipped',
++        body: 'Your order has been shipped',
++      });
++
++      expect(emailChannel.getNotificationCount()).toBe(1);
++      expect(smsChannel.getMessageCount()).toBe(0);
++      expect(webhookChannel.getDeliveryCount()).toBe(0);
++
++      const email = emailChannel.getNotifications()[0]!;
++      expect(email.recipient).toBe('user@example.com');
++      expect(email.subject).toBe('Order Shipped');
++
++      const audit = auditService.getEntries();
++      expect(audit).toHaveLength(1);
++      expect(audit[0]!.channel).toBe('email');
++      expect(audit[0]!.overridden).toBe(false);
++    });
++
++    it('should route low-priority notification to webhook and create audit entry', () => {
++      router.route({
++        priority: 'low',
++        recipient: 'system-monitor',
++        subject: 'Daily Report',
++        body: 'All systems nominal',
++        webhookUrl: 'https://hooks.example.com/reports',
++      });
++
++      expect(webhookChannel.getDeliveryCount()).toBe(1);
++      expect(smsChannel.getMessageCount()).toBe(0);
++      expect(emailChannel.getNotificationCount()).toBe(0);
++
++      const delivery = webhookChannel.getDeliveries()[0]!;
++      expect(delivery.url).toBe('https://hooks.example.com/reports');
++
++      const audit = auditService.getEntries();
++      expect(audit).toHaveLength(1);
++      expect(audit[0]!.channel).toBe('webhook');
++      expect(audit[0]!.overridden).toBe(false);
++    });
++  });
++
++  describe('user preference overrides', () => {
++    it('should override urgent→SMS to email when user prefers email', () => {
++      preferencesService.setPreference('+1234567890', 'email');
++
++      router.route({
++        priority: 'urgent',
++        recipient: '+1234567890',
++        subject: 'Alert',
++        body: 'Urgent alert',
++      });
++
++      // Should go to email instead of SMS
++      expect(emailChannel.getNotificationCount()).toBe(1);
++      expect(smsChannel.getMessageCount()).toBe(0);
++
++      // Audit should record the override
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('email');
++      expect(audit.overridden).toBe(true);
++      expect(audit.originalChannel).toBe('sms');
++    });
++
++    it('should override normal→email to SMS when user prefers SMS', () => {
++      preferencesService.setPreference('user@example.com', 'sms');
++
++      router.route({
++        priority: 'normal',
++        recipient: 'user@example.com',
++        subject: 'Update',
++        body: 'Order update',
++      });
++
++      expect(smsChannel.getMessageCount()).toBe(1);
++      expect(emailChannel.getNotificationCount()).toBe(0);
++
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('sms');
++      expect(audit.overridden).toBe(true);
++      expect(audit.originalChannel).toBe('email');
++    });
++
++    it('should override low→webhook to SMS when user prefers SMS', () => {
++      preferencesService.setPreference('system-monitor', 'sms');
++
++      router.route({
++        priority: 'low',
++        recipient: 'system-monitor',
++        subject: 'Log',
++        body: 'Low priority log',
++      });
++
++      expect(smsChannel.getMessageCount()).toBe(1);
++      expect(webhookChannel.getDeliveryCount()).toBe(0);
++
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('sms');
++      expect(audit.overridden).toBe(true);
++      expect(audit.originalChannel).toBe('webhook');
++    });
++
++    it('should not mark as overridden when preference matches priority default', () => {
++      preferencesService.setPreference('+1234567890', 'sms');
++
++      router.route({
++        priority: 'urgent',
++        recipient: '+1234567890',
++        subject: 'Alert',
++        body: 'Urgent alert',
++      });
++
++      expect(smsChannel.getMessageCount()).toBe(1);
++
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('sms');
++      expect(audit.overridden).toBe(false);
++      expect(audit.originalChannel).toBeUndefined();
++    });
++
++    it('should use default routing when user has no preference', () => {
++      // No preference set for this recipient
++      router.route({
++        priority: 'normal',
++        recipient: 'no-prefs@example.com',
++        subject: 'Hello',
++        body: 'Default routing',
++      });
++
++      expect(emailChannel.getNotificationCount()).toBe(1);
++
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('email');
++      expect(audit.overridden).toBe(false);
++    });
++
++    it('should resume default routing after preference is removed', () => {
++      preferencesService.setPreference('user@example.com', 'sms');
++      preferencesService.removePreference('user@example.com');
++
++      router.route({
++        priority: 'normal',
++        recipient: 'user@example.com',
++        subject: 'After removal',
++        body: 'Should go to email',
++      });
++
++      expect(emailChannel.getNotificationCount()).toBe(1);
++      expect(smsChannel.getMessageCount()).toBe(0);
++
++      const audit = auditService.getEntries()[0]!;
++      expect(audit.channel).toBe('email');
++      expect(audit.overridden).toBe(false);
++    });
++  });
++
++  describe('full flow with multiple notifications', () => {
++    it('should correctly route and audit a mixed batch of notifications', () => {
++      preferencesService.setPreference('vip@example.com', 'sms');
++
++      router.route({ priority: 'urgent', recipient: '+111', subject: 'A1', body: 'Urgent' });
++      router.route({ priority: 'normal', recipient: 'vip@example.com', subject: 'A2', body: 'Normal but overridden' });
++      router.route({ priority: 'low', recipient: 'logger', subject: 'A3', body: 'Low', webhookUrl: 'https://hooks.test/log' });
++      router.route({ priority: 'normal', recipient: 'regular@example.com', subject: 'A4', body: 'Normal default' });
++
++      // Channel counts: SMS gets urgent + overridden normal = 2
++      expect(smsChannel.getMessageCount()).toBe(2);
++      expect(emailChannel.getNotificationCount()).toBe(1);
++      expect(webhookChannel.getDeliveryCount()).toBe(1);
++
++      // Audit should have 4 entries
++      const entries = auditService.getEntries();
++      expect(entries).toHaveLength(4);
++
++      // First: urgent → sms (default)
++      expect(entries[0]!.channel).toBe('sms');
++      expect(entries[0]!.overridden).toBe(false);
++
++      // Second: normal → sms (overridden from email)
++      expect(entries[1]!.channel).toBe('sms');
++      expect(entries[1]!.overridden).toBe(true);
++      expect(entries[1]!.originalChannel).toBe('email');
++
++      // Third: low → webhook (default)
++      expect(entries[2]!.channel).toBe('webhook');
++      expect(entries[2]!.overridden).toBe(false);
++
++      // Fourth: normal → email (default, no preference)
++      expect(entries[3]!.channel).toBe('email');
++      expect(entries[3]!.overridden).toBe(false);
++    });
++
++    it('should allow querying audit entries by channel', () => {
++      router.route({ priority: 'urgent', recipient: '+111', subject: 'S1', body: 'B1' });
++      router.route({ priority: 'urgent', recipient: '+222', subject: 'S2', body: 'B2' });
++      router.route({ priority: 'normal', recipient: 'a@b.com', subject: 'S3', body: 'B3' });
++
++      expect(auditService.getEntriesByChannel('sms')).toHaveLength(2);
++      expect(auditService.getEntriesByChannel('email')).toHaveLength(1);
++      expect(auditService.getEntriesByChannel('webhook')).toHaveLength(0);
++    });
++
++    it('should allow querying audit entries by recipient', () => {
++      router.route({ priority: 'urgent', recipient: '+111', subject: 'S1', body: 'B1' });
++      router.route({ priority: 'normal', recipient: '+111', subject: 'S2', body: 'B2' });
++
++      // Note: +111 appears in both — one via SMS (urgent), one via email (normal)
++      const entries = auditService.getEntriesForRecipient('+111');
++      expect(entries).toHaveLength(2);
++      expect(entries[0]!.channel).toBe('sms');
++      expect(entries[1]!.channel).toBe('email');
++    });
++  });
++});

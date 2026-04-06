@@ -1,0 +1,587 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 4a85f8c..54866f6 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -5,3 +5,43 @@ Write your updates below. There is no enforced format — use whatever structure
+ 
+ ---
+ 
++## Agent 2 — Email Notification Adapter (completed)
++
++### What was done
++1. **Implemented full email adapter** (`src/adapters/email.adapter.ts`):
++   - **Template rendering**: Per-notification-type HTML/text templates (`order_confirmation`, `order_status_update`, `welcome`, `account_updated`) via `EMAIL_TEMPLATES` map and `renderEmail()` method
++   - **Recipient resolution**: `resolveRecipient()` validates email format and normalizes to lowercase; `isValidEmail()` exported for reuse
++   - **Pluggable transport**: `EmailTransport` function type allows swapping the delivery mechanism (default is no-op for dev/test; replace with SendGrid/SES/SMTP)
++   - **`RenderedEmail` interface**: Structured email object with `from`, `to`, `subject`, `html`, `text` fields
++   - **`send()` flow**: validate recipient → render template → call transport → record for auditing → return `NotificationResult`
++   - Conforms fully to `NotificationAdapter` interface (stateless, never throws, returns result)
++
++2. **Fixed notification service / callback registry bridge** (`src/services/notification.service.ts`):
++   - Added `statusChangeCallbacks.register()` subscription so `order:status-changed` events flow through both the EventBus path AND the direct callback registry path (mixed pattern)
++   - This fixed 3 pre-existing test failures where tests used `statusChangeCallbacks.notify()` but the service only listened on EventBus
++
++3. **Added exports to `src/index.ts`**:
++   - `EmailAdapter`, `isValidEmail` (values)
++   - `NotificationAdapter`, `EmailConfig`, `RenderedEmail`, `EmailTransport` (types)
++   - All `NotificationPayload`, `NotificationResult`, `NotificationRecord`, `NotificationType`, `NotificationChannel`, `NotificationPriority` (types)
++
++4. **Added 22 unit tests** (`tests/adapters/email.adapter.test.ts`):
++   - `isValidEmail` validation (valid/invalid cases)
++   - `resolveRecipient` (normalization, whitespace trimming, rejection)
++   - `renderEmail` (all 4 notification type templates verified for HTML and text content)
++   - `send` (success, transport invocation, sent email recording, invalid recipient failure, transport error handling, recipient normalization)
++   - `getSentEmails`/`clearSentEmails` (state management, array copy behavior)
++   - Integration test: wires `EmailAdapter` into `NotificationService` via constructor and verifies end-to-end flow
++
++### Key decisions
++- Kept the adapter stateless per the interface contract; `sentEmails` is only for testing/auditing, not business state
++- Used a function-based transport (`EmailTransport`) rather than a class-based abstraction — simpler and easily mockable
++- Template rendering is inline via a map of functions keyed by `NotificationType` — no separate template files needed
++- Recipient validation uses a simple regex; sufficient for the current domain
++
++### Context for next agents
++- The `NotificationService` now subscribes to BOTH `EventBus('order:status-changed')` AND `statusChangeCallbacks` for the mixed pattern
++- Webhook and in_app channels are still not implemented — follow the same `NotificationAdapter` pattern
++- To add a new channel: add to `NotificationChannel` type, create adapter class, register with `NotificationService`
++- All 92 tests pass, TypeScript compiles cleanly
++
+diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts
+index 8132770..c800f17 100644
+--- a/src/adapters/email.adapter.ts
++++ b/src/adapters/email.adapter.ts
+@@ -1,12 +1,13 @@
+ /**
+  * Email notification adapter — delivers notifications via email.
+  *
+- * This is a stub implementation that logs email sends rather than
+- * connecting to a real SMTP server. The interface is real and production-ready;
+- * swap the send() internals to integrate with an actual email provider
+- * (SendGrid, SES, SMTP, etc.).
+- *
+  * Implements NotificationAdapter so it can be registered with NotificationService.
++ *
++ * Features:
++ * - Template rendering: generates structured email HTML per notification type
++ * - Recipient validation: validates email format before sending
++ * - Configurable sender address and display name
++ * - Pluggable transport: swap the transport function for real SMTP/API integration
+  */
+ 
+ import type { NotificationAdapter } from './notification.adapter.js';
+@@ -14,6 +15,7 @@ import type {
+   NotificationChannel,
+   NotificationPayload,
+   NotificationResult,
++  NotificationType,
+ } from '../models/notification.js';
+ import { Logger } from '../utils/logger.js';
+ 
+@@ -29,30 +31,169 @@ const defaultEmailConfig: EmailConfig = {
+   fromName: 'TaskFlow Pro',
+ };
+ 
++/**
++ * A rendered email ready for delivery.
++ */
++export interface RenderedEmail {
++  from: string;
++  to: string;
++  subject: string;
++  html: string;
++  text: string;
++}
++
++/**
++ * Transport function signature — swap this to integrate with a real provider.
++ * The default transport logs the email (no-op). Replace with SendGrid, SES, SMTP, etc.
++ */
++export type EmailTransport = (email: RenderedEmail) => Promise<void>;
++
++/**
++ * Default transport: no-op (for development / testing).
++ */
++const noopTransport: EmailTransport = async () => {};
++
++// ---------- Email templates ----------
++
++const EMAIL_TEMPLATES: Record<NotificationType, (payload: NotificationPayload) => { html: string; text: string }> = {
++  order_confirmation(payload) {
++    const orderId = payload.metadata['orderId'] ?? 'N/A';
++    const html = [
++      '<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">',
++      `<h1 style="color: #2c3e50;">Order Confirmation</h1>`,
++      `<p>Hi,</p>`,
++      `<p>Thank you for your order <strong>${orderId}</strong>.</p>`,
++      `<div style="background: #f8f9fa; padding: 16px; border-radius: 4px;">`,
++      `<p>${payload.body}</p>`,
++      `</div>`,
++      `<p style="color: #7f8c8d; font-size: 12px;">If you have questions, reply to this email.</p>`,
++      '</div>',
++    ].join('\n');
++    const text = `Order Confirmation\n\n${payload.body}\n\nOrder ID: ${orderId}`;
++    return { html, text };
++  },
++
++  order_status_update(payload) {
++    const orderId = payload.metadata['orderId'] ?? 'N/A';
++    const newStatus = payload.metadata['newStatus'] ?? 'unknown';
++    const html = [
++      '<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">',
++      `<h1 style="color: #2c3e50;">Order Update</h1>`,
++      `<p>Your order <strong>${orderId}</strong> status is now: <strong>${newStatus}</strong>.</p>`,
++      `<div style="background: #f8f9fa; padding: 16px; border-radius: 4px;">`,
++      `<p>${payload.body}</p>`,
++      `</div>`,
++      '</div>',
++    ].join('\n');
++    const text = `Order Update\n\nOrder ${orderId} is now: ${newStatus}\n\n${payload.body}`;
++    return { html, text };
++  },
++
++  welcome(payload) {
++    const html = [
++      '<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">',
++      `<h1 style="color: #2c3e50;">Welcome to TaskFlow Pro!</h1>`,
++      `<p>${payload.body}</p>`,
++      `<p>Get started by exploring your dashboard.</p>`,
++      '</div>',
++    ].join('\n');
++    const text = `Welcome to TaskFlow Pro!\n\n${payload.body}`;
++    return { html, text };
++  },
++
++  account_updated(payload) {
++    const changes = payload.metadata['changes'] ?? '';
++    const html = [
++      '<div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">',
++      `<h1 style="color: #2c3e50;">Account Updated</h1>`,
++      `<p>${payload.body}</p>`,
++      changes ? `<p><em>Changed: ${changes}</em></p>` : '',
++      '</div>',
++    ].join('\n');
++    const text = `Account Updated\n\n${payload.body}`;
++    return { html, text };
++  },
++};
++
++// ---------- Validation ----------
++
++const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
++/**
++ * Validate that a recipient string looks like a valid email address.
++ */
++export function isValidEmail(email: string): boolean {
++  return EMAIL_REGEX.test(email);
++}
++
++// ---------- Adapter ----------
++
+ export class EmailAdapter implements NotificationAdapter {
+   readonly channel: NotificationChannel = 'email';
+   private logger = new Logger('EmailAdapter');
+-  private sentEmails: Array<{ payload: NotificationPayload; timestamp: Date }> = [];
++  private config: EmailConfig;
++  private transport: EmailTransport;
++  private sentEmails: Array<{ rendered: RenderedEmail; payload: NotificationPayload; timestamp: Date }> = [];
+ 
+-  constructor(private config: EmailConfig = defaultEmailConfig) {}
++  constructor(config: EmailConfig = defaultEmailConfig, transport?: EmailTransport) {
++    this.config = config;
++    this.transport = transport ?? noopTransport;
++  }
++
++  /**
++   * Render a NotificationPayload into a full RenderedEmail using the template system.
++   */
++  renderEmail(payload: NotificationPayload): RenderedEmail {
++    const templateFn = EMAIL_TEMPLATES[payload.type];
++    const { html, text } = templateFn(payload);
++
++    return {
++      from: `${this.config.fromName} <${this.config.fromAddress}>`,
++      to: payload.recipient,
++      subject: payload.subject,
++      html,
++      text,
++    };
++  }
++
++  /**
++   * Validate and resolve the recipient address.
++   * Returns the normalized email or throws if invalid.
++   */
++  resolveRecipient(recipient: string): string {
++    const normalized = recipient.trim().toLowerCase();
++    if (!isValidEmail(normalized)) {
++      throw new Error(`Invalid email address: ${recipient}`);
++    }
++    return normalized;
++  }
+ 
+   /**
+    * Send a notification as an email.
+    *
+-   * Stub implementation: logs the email and records it in memory.
+-   * Replace the body of this method with real SMTP/API integration.
++   * Flow: validate recipient → render template → deliver via transport → return result.
+    */
+   async send(payload: NotificationPayload): Promise<NotificationResult> {
+     try {
++      // 1. Validate recipient
++      const resolvedRecipient = this.resolveRecipient(payload.recipient);
++      const resolvedPayload = { ...payload, recipient: resolvedRecipient };
++
+       this.logger.info(
+-        `Sending email to ${payload.recipient}: "${payload.subject}"`,
++        `Sending email to ${resolvedRecipient}: "${payload.subject}"`,
+       );
+ 
+-      // Stub: record the email instead of actually sending it
+-      this.sentEmails.push({ payload, timestamp: new Date() });
++      // 2. Render template
++      const rendered = this.renderEmail(resolvedPayload);
++
++      // 3. Deliver via transport
++      await this.transport(rendered);
++
++      // 4. Record for testing / auditing
++      this.sentEmails.push({ rendered, payload: resolvedPayload, timestamp: new Date() });
+ 
+       this.logger.info(
+-        `Email delivered to ${payload.recipient} (from: ${this.config.fromName} <${this.config.fromAddress}>)`,
++        `Email delivered to ${resolvedRecipient} (from: ${rendered.from})`,
+       );
+ 
+       return {
+@@ -76,7 +217,7 @@ export class EmailAdapter implements NotificationAdapter {
+   /**
+    * Get all emails sent through this adapter (for testing/debugging).
+    */
+-  getSentEmails(): Array<{ payload: NotificationPayload; timestamp: Date }> {
++  getSentEmails(): Array<{ rendered: RenderedEmail; payload: NotificationPayload; timestamp: Date }> {
+     return [...this.sentEmails];
+   }
+ 
+diff --git a/src/index.ts b/src/index.ts
+index c41a761..691f6a1 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -49,6 +49,21 @@ export { UserService } from './services/user.service.js';
+ export { OrderService } from './services/order.service.js';
+ export { NotificationService } from './services/notification.service.js';
+ 
++// Adapters
++export type { NotificationAdapter } from './adapters/notification.adapter.js';
++export { EmailAdapter, isValidEmail } from './adapters/email.adapter.js';
++export type { EmailConfig, RenderedEmail, EmailTransport } from './adapters/email.adapter.js';
++
++// Notification models
++export type {
++  NotificationPayload,
++  NotificationResult,
++  NotificationRecord,
++  NotificationType,
++  NotificationChannel,
++  NotificationPriority,
++} from './models/notification.js';
++
+ // Config
+ export { createConfig, defaultConfig } from './config/app.config.js';
+ export type { AppConfig } from './config/app.config.js';
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 1832265..a3c9b3d 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -35,6 +35,7 @@ import type {
+   NotificationType,
+ } from '../models/notification.js';
+ import { Logger } from '../utils/logger.js';
++import { statusChangeCallbacks } from '../utils/callback-registry.js';
+ 
+ let nextId = 1;
+ 
+@@ -95,6 +96,13 @@ export class NotificationService {
+     this.eventBus.on<UserUpdatedEvent>('user:updated', (event) => {
+       return this.handleUserUpdated(event);
+     });
++
++    // Also subscribe via the direct callback registry (mixed pattern).
++    // Some services emit status changes through statusChangeCallbacks
++    // rather than EventBus, so we listen on both.
++    statusChangeCallbacks.register((event) => {
++      this.handleOrderStatusChanged(event);
++    });
+   }
+ 
+   /**
+diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts
+new file mode 100644
+index 0000000..1a3c68e
+--- /dev/null
++++ b/tests/adapters/email.adapter.test.ts
+@@ -0,0 +1,263 @@
++import { describe, it, expect, beforeEach, vi } from 'vitest';
++import { EmailAdapter, isValidEmail } from '../../src/adapters/email.adapter.js';
++import type { EmailTransport } from '../../src/adapters/email.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides: Partial<NotificationPayload> = {}): NotificationPayload {
++  return {
++    id: 'notif-0001',
++    type: 'order_confirmation',
++    channel: 'email',
++    recipient: 'alice@example.com',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    priority: 'normal',
++    metadata: { orderId: 'order-1', userId: 'user-1' },
++    createdAt: new Date(),
++    ...overrides,
++  };
++}
++
++describe('isValidEmail', () => {
++  it('should accept valid email addresses', () => {
++    expect(isValidEmail('alice@example.com')).toBe(true);
++    expect(isValidEmail('bob+tag@sub.domain.org')).toBe(true);
++    expect(isValidEmail('user@company.co')).toBe(true);
++  });
++
++  it('should reject invalid email addresses', () => {
++    expect(isValidEmail('')).toBe(false);
++    expect(isValidEmail('not-an-email')).toBe(false);
++    expect(isValidEmail('@missing-local.com')).toBe(false);
++    expect(isValidEmail('missing@')).toBe(false);
++    expect(isValidEmail('spaces in@email.com')).toBe(false);
++  });
++});
++
++describe('EmailAdapter', () => {
++  let adapter: EmailAdapter;
++  let transport: EmailTransport;
++
++  beforeEach(() => {
++    transport = vi.fn(async () => {});
++    adapter = new EmailAdapter(
++      { fromAddress: 'noreply@taskflow.example.com', fromName: 'TaskFlow Pro' },
++      transport,
++    );
++  });
++
++  describe('channel', () => {
++    it('should report channel as email', () => {
++      expect(adapter.channel).toBe('email');
++    });
++  });
++
++  describe('resolveRecipient', () => {
++    it('should normalize valid emails to lowercase', () => {
++      expect(adapter.resolveRecipient('Alice@Example.COM')).toBe('alice@example.com');
++    });
++
++    it('should trim whitespace', () => {
++      expect(adapter.resolveRecipient('  bob@example.com  ')).toBe('bob@example.com');
++    });
++
++    it('should throw for invalid emails', () => {
++      expect(() => adapter.resolveRecipient('not-valid')).toThrow('Invalid email address');
++    });
++  });
++
++  describe('renderEmail', () => {
++    it('should render order_confirmation template with HTML and text', () => {
++      const payload = makePayload({ type: 'order_confirmation' });
++      const rendered = adapter.renderEmail(payload);
++
++      expect(rendered.from).toBe('TaskFlow Pro <noreply@taskflow.example.com>');
++      expect(rendered.to).toBe('alice@example.com');
++      expect(rendered.subject).toBe('Order Confirmation: order-1');
++      expect(rendered.html).toContain('Order Confirmation');
++      expect(rendered.html).toContain('order-1');
++      expect(rendered.text).toContain('Order Confirmation');
++    });
++
++    it('should render order_status_update template', () => {
++      const payload = makePayload({
++        type: 'order_status_update',
++        subject: 'Order Update: order-1',
++        body: 'Your order status has changed from pending to confirmed.',
++        metadata: { orderId: 'order-1', previousStatus: 'pending', newStatus: 'confirmed' },
++      });
++      const rendered = adapter.renderEmail(payload);
++
++      expect(rendered.html).toContain('Order Update');
++      expect(rendered.html).toContain('confirmed');
++      expect(rendered.text).toContain('confirmed');
++    });
++
++    it('should render welcome template', () => {
++      const payload = makePayload({
++        type: 'welcome',
++        subject: 'Welcome to TaskFlow Pro!',
++        body: 'Hi Alice, welcome to TaskFlow Pro. Your account has been created.',
++        metadata: { userId: 'user-1' },
++      });
++      const rendered = adapter.renderEmail(payload);
++
++      expect(rendered.html).toContain('Welcome to TaskFlow Pro');
++      expect(rendered.html).toContain('Hi Alice');
++      expect(rendered.text).toContain('Welcome');
++    });
++
++    it('should render account_updated template', () => {
++      const payload = makePayload({
++        type: 'account_updated',
++        subject: 'Account Updated',
++        body: 'Your account has been updated. Changed fields: name, email.',
++        metadata: { userId: 'user-1', changes: 'name,email' },
++      });
++      const rendered = adapter.renderEmail(payload);
++
++      expect(rendered.html).toContain('Account Updated');
++      expect(rendered.html).toContain('name,email');
++      expect(rendered.text).toContain('Account Updated');
++    });
++  });
++
++  describe('send', () => {
++    it('should return success for a valid email', async () => {
++      const payload = makePayload();
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.channel).toBe('email');
++      expect(result.error).toBeUndefined();
++      expect(result.deliveredAt).toBeInstanceOf(Date);
++    });
++
++    it('should call the transport with rendered email', async () => {
++      const payload = makePayload();
++      await adapter.send(payload);
++
++      expect(transport).toHaveBeenCalledOnce();
++      const rendered = (transport as ReturnType<typeof vi.fn>).mock.calls[0]![0];
++      expect(rendered.to).toBe('alice@example.com');
++      expect(rendered.from).toContain('TaskFlow Pro');
++      expect(rendered.html).toContain('Order Confirmation');
++    });
++
++    it('should record sent emails', async () => {
++      const payload = makePayload();
++      await adapter.send(payload);
++
++      const sent = adapter.getSentEmails();
++      expect(sent).toHaveLength(1);
++      expect(sent[0]!.payload.recipient).toBe('alice@example.com');
++      expect(sent[0]!.rendered.html).toContain('Order Confirmation');
++    });
++
++    it('should return failure for invalid recipient', async () => {
++      const payload = makePayload({ recipient: 'bad-email' });
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.channel).toBe('email');
++      expect(result.error).toContain('Invalid email address');
++    });
++
++    it('should not call transport when recipient is invalid', async () => {
++      const payload = makePayload({ recipient: 'bad-email' });
++      await adapter.send(payload);
++
++      expect(transport).not.toHaveBeenCalled();
++    });
++
++    it('should return failure when transport throws', async () => {
++      const failingTransport: EmailTransport = async () => {
++        throw new Error('SMTP connection refused');
++      };
++      const failAdapter = new EmailAdapter(undefined, failingTransport);
++
++      const payload = makePayload();
++      const result = await failAdapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('SMTP connection refused');
++    });
++
++    it('should normalize recipient to lowercase', async () => {
++      const payload = makePayload({ recipient: 'Alice@Example.COM' });
++      await adapter.send(payload);
++
++      const sent = adapter.getSentEmails();
++      expect(sent[0]!.payload.recipient).toBe('alice@example.com');
++    });
++  });
++
++  describe('getSentEmails / clearSentEmails', () => {
++    it('should start with no sent emails', () => {
++      expect(adapter.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should clear sent emails', async () => {
++      await adapter.send(makePayload());
++      expect(adapter.getSentEmails()).toHaveLength(1);
++
++      adapter.clearSentEmails();
++      expect(adapter.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should return a copy of the array', async () => {
++      await adapter.send(makePayload());
++      const first = adapter.getSentEmails();
++      const second = adapter.getSentEmails();
++      expect(first).not.toBe(second);
++      expect(first).toEqual(second);
++    });
++  });
++
++  describe('default config', () => {
++    it('should use default config when none provided', async () => {
++      const defaultAdapter = new EmailAdapter();
++      const payload = makePayload();
++      const rendered = defaultAdapter.renderEmail(payload);
++
++      expect(rendered.from).toBe('TaskFlow Pro <noreply@taskflow.example.com>');
++    });
++  });
++
++  describe('integration with NotificationService', () => {
++    it('should work when wired into NotificationService via constructor', async () => {
++      // This test verifies the adapter conforms to the NotificationAdapter interface
++      const { EventBus } = await import('../../src/events/event-bus.js');
++      const { NotificationService, resetNotificationIdCounter } = await import(
++        '../../src/services/notification.service.js'
++      );
++
++      resetNotificationIdCounter();
++      const eventBus = new EventBus();
++      const emailAdapter = new EmailAdapter(undefined, transport);
++      const service = new NotificationService(eventBus, [emailAdapter]);
++
++      await eventBus.emit({
++        type: 'user:created',
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      });
++
++      // Notification service should have recorded the notification
++      expect(service.getNotificationCount()).toBe(1);
++      // Transport should have been called
++      expect(transport).toHaveBeenCalledOnce();
++      // Sent email should have rendered HTML
++      const sent = emailAdapter.getSentEmails();
++      expect(sent).toHaveLength(1);
++      expect(sent[0]!.rendered.html).toContain('Welcome to TaskFlow Pro');
++    });
++  });
++});

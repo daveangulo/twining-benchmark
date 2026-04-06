@@ -1,0 +1,243 @@
+{
+  "compactionCount": 0,
+  "condition": "twining-lite",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts\nindex 11ae17d..dd7a433 100644\n--- a/src/services/notification.service.ts\n+++ b/src/services/notification.service.ts\n@@ -45,6 +45,7 @@ export class NotificationService {\n   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n   private preferencesService?: PreferencesService;\n   private historyService?: NotificationHistoryService;\n+  private sendQueue: Promise<Notification> = Promise.resolve(null as unknown as Notification);\n \n   constructor(private eventBus: EventBus) {\n     this.registerEventHandlers();\n@@ -118,8 +119,18 @@ export class NotificationService {\n   /**\n    * Send a notification through the appropriate adapter and record it.\n    * This is the single delivery path — all notifications go through here.\n+   * Sends are serialized via an internal queue to guarantee delivery order.\n    */\n   async send(payload: NotificationPayload): Promise<Notification> {\n+    const result = this.sendQueue.then(\n+      () => this.doSend(payload),\n+      () => this.doSend(payload),\n+    );\n+    this.sendQueue = result;\n+    return result;\n+  }\n+\n+  private async doSend(payload: NotificationPayload): Promise<Notification> {\n     // Check user preferences before sending (all channels)\n     if (this.preferencesService) {\n       if (!this.preferencesService.shouldSend(payload.channel, payload.recipient, payload.type)) {\n",
+      "linesAdded": 11,
+      "linesRemoved": 0,
+      "path": "src/services/notification.service.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts\nindex 2040ecc..c2ff935 100644\n--- a/tests/services/notification.service.test.ts\n+++ b/tests/services/notification.service.test.ts\n@@ -10,6 +10,8 @@ import { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';\n import { Database } from '../../src/utils/database.js';\n import { PreferencesRepository } from '../../src/repositories/preferences.repository.js';\n import { PreferencesService, resetPreferencesIdCounter } from '../../src/services/preferences.service.js';\n+import type { NotificationAdapter, AdapterSendResult } from '../../src/adapters/notification.adapter.js';\n+import type { NotificationPayload } from '../../src/models/notification.js';\n import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';\n \n describe('NotificationService', () => {\n@@ -376,3 +378,150 @@ describe('NotificationService multi-channel preferences', () => {\n     expect(smsResult.status).toBe('suppressed');\n   });\n });\n+\n+describe('NotificationService delivery ordering', () => {\n+  let eventBus: EventBus;\n+  let service: NotificationService;\n+\n+  beforeEach(() => {\n+    eventBus = new EventBus();\n+    service = new NotificationService(eventBus);\n+    resetNotificationIdCounter();\n+  });\n+\n+  it('should deliver notifications in send() call order even with slow adapters', async () => {\n+    // Create a slow adapter that takes variable time to simulate network latency\n+    const deliveryOrder: string[] = [];\n+    const slowAdapter: NotificationAdapter = {\n+      channel: 'email' as const,\n+      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n+        // First notification takes longer than second to simulate out-of-order risk\n+        const delay = payload.subject === 'First' ? 50 : 10;\n+        await new Promise((resolve) => setTimeout(resolve, delay));\n+        deliveryOrder.push(payload.subject);\n+        return { success: true };\n+      },\n+    };\n+\n+    service.registerAdapter(slowAdapter);\n+\n+    // Fire two sends concurrently — without queue, Second would finish before First\n+    const [first, second] = await Promise.all([\n+      service.send({\n+        recipient: 'user@example.com',\n+        subject: 'First',\n+        body: 'Order placed',\n+        channel: 'email',\n+        type: 'order-confirmation',\n+        priority: 'normal',\n+      }),\n+      service.send({\n+        recipient: 'user@example.com',\n+        subject: 'Second',\n+        body: 'Payment confirmed',\n+        channel: 'email',\n+        type: 'order-status-update',\n+        priority: 'normal',\n+      }),\n+    ]);\n+\n+    expect(first.status).toBe('sent');\n+    expect(second.status).toBe('sent');\n+    // The queue ensures First is delivered before Second despite taking longer\n+    expect(deliveryOrder).toEqual(['First', 'Second']);\n+  });\n+\n+  it('should preserve ordering when events are emitted concurrently', async () => {\n+    const deliveryOrder: string[] = [];\n+    const trackingAdapter: NotificationAdapter = {\n+      channel: 'email' as const,\n+      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n+        // Variable delays to expose ordering bugs\n+        const delay = payload.type === 'order-confirmation' ? 30 : 5;\n+        await new Promise((resolve) => setTimeout(resolve, delay));\n+        deliveryOrder.push(payload.type);\n+        return { success: true };\n+      },\n+    };\n+\n+    service.registerAdapter(trackingAdapter);\n+\n+    // Emit both events concurrently (simulating rapid-fire domain events)\n+    const orderCreated: OrderCreatedEvent = {\n+      type: 'order:created',\n+      order: {\n+        id: 'order-1',\n+        userId: 'user-1',\n+        items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n+        total: 10,\n+        status: 'pending',\n+        createdAt: new Date(),\n+        updatedAt: new Date(),\n+      },\n+      user: {\n+        id: 'user-1',\n+        name: 'Alice',\n+        email: 'alice@example.com',\n+        role: 'member',\n+        createdAt: new Date(),\n+        updatedAt: new Date(),\n+      },\n+      timestamp: new Date(),\n+    };\n+\n+    const orderStatusChanged: OrderStatusChangedEvent = {\n+      type: 'order:status-changed',\n+      order: {\n+        id: 'order-1',\n+        userId: 'user-1',\n+        items: [],\n+        total: 10,\n+        status: 'confirmed',\n+        createdAt: new Date(),\n+        updatedAt: new Date(),\n+      },\n+      previousStatus: 'pending',\n+      newStatus: 'confirmed',\n+      timestamp: new Date(),\n+    };\n+\n+    // Emit concurrently — without the queue, order-status-update would arrive first\n+    await Promise.all([\n+      eventBus.emit(orderCreated),\n+      eventBus.emit(orderStatusChanged),\n+    ]);\n+\n+    // Order confirmation must be delivered before status update\n+    expect(deliveryOrder).toEqual(['order-confirmation', 'order-status-update']);\n+  });\n+\n+  it('should preserve ordering across three or more concurrent sends', async () => {\n+    const deliveryOrder: string[] = [];\n+    const adapter: NotificationAdapter = {\n+      channel: 'email' as const,\n+      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n+        // Reverse delay: earlier sends take longer\n+        const delays: Record<string, number> = { 'A': 40, 'B': 20, 'C': 5 };\n+        await new Promise((resolve) => setTimeout(resolve, delays[payload.subject] ?? 0));\n+        deliveryOrder.push(payload.subject);\n+        return { success: true };\n+      },\n+    };\n+\n+    service.registerAdapter(adapter);\n+\n+    const makeSend = (subject: string) =>\n+      service.send({\n+        recipient: 'user@example.com',\n+        subject,\n+        body: 'test',\n+        channel: 'email',\n+        type: 'order-confirmation',\n+        priority: 'normal',\n+      });\n+\n+    await Promise.all([makeSend('A'), makeSend('B'), makeSend('C')]);\n+\n+    expect(deliveryOrder).toEqual(['A', 'B', 'C']);\n+  });\n+});\n",
+      "linesAdded": 149,
+      "linesRemoved": 0,
+      "path": "tests/services/notification.service.test.ts"
+    }
+  ],
+  "numTurns": 20,
+  "prompt": "You are Agent 10 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Fix a notification delivery ordering issue.\n\nUsers report that notifications sometimes arrive out of order — e.g., a \"payment confirmed\" notification arrives before the \"order placed\" notification.\n\nSpecifically:\n1. Check for any prior coordination context about the notification architecture.\n2. Investigate the notification service and how it dispatches to adapters.\n3. The issue is likely in how concurrent notifications are handled — check if there's a queue or if notifications fire-and-forget.\n4. Fix the ordering issue while maintaining the existing architecture.\n5. Add a test that verifies notification ordering.\n6. Make sure all tests pass.\n\nImportant:\n- Understand the notification architecture before making changes — check decisions from Session 1.\n- Keep the fix minimal — don't restructure the notification system.",
+  "runId": "9f93c5c4-9e87-4087-9fb5-46f67fbd819a",
+  "scenario": "sprint-simulation",
+  "sessionId": "b6201c11-8c0f-45a6-bbad-00973d983428",
+  "stopReason": "success",
+  "taskIndex": 9,
+  "timing": {
+    "durationMs": 1471105,
+    "endTime": "2026-04-03T02:39:22.624Z",
+    "startTime": "2026-04-03T02:14:51.519Z",
+    "timeToFirstActionMs": 56559
+  },
+  "tokenUsage": {
+    "cacheCreation": 0,
+    "cacheRead": 0,
+    "costUsd": 0.6901332499999999,
+    "input": 0,
+    "output": 0,
+    "total": 0
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "max_results": 2,
+        "query": "select:mcp__twining__twining_assemble,mcp__twining__twining_why"
+      },
+      "timestamp": "2026-04-03T02:14:59.050Z",
+      "toolName": "ToolSearch"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "agent_id": "agent-10",
+        "scope": "src/services/",
+        "task": "Fix notification delivery ordering issue - notifications arrive out of order"
+      },
+      "timestamp": "2026-04-03T02:15:02.459Z",
+      "toolName": "mcp__twining__twining_assemble"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "scope": "src/services/notification"
+      },
+      "timestamp": "2026-04-03T02:15:03.002Z",
+      "toolName": "mcp__twining__twining_why"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "pattern": "src/**/*.ts"
+      },
+      "timestamp": "2026-04-03T02:15:03.043Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "pattern": "tests/**/*.ts"
+      },
+      "timestamp": "2026-04-03T02:15:03.388Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-04-03T02:15:08.953Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-04-03T02:15:09.443Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/models/notification.ts"
+      },
+      "timestamp": "2026-04-03T02:15:09.821Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-04-03T02:15:10.543Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/services/order.service.ts"
+      },
+      "timestamp": "2026-04-03T02:15:21.069Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/services/notification.service.ts",
+        "new_string": "export class NotificationService {\n  private logger = new Logger('NotificationService');\n  private notifications: Notification[] = [];\n  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n  private preferencesService?: PreferencesService;\n  private historyService?: NotificationHistoryService;\n  private sendQueue: Promise<Notification> = Promise.resolve(null as unknown as Notification);\n\n  constructor(private eventBus: EventBus) {\n    this.registerEventHandlers();\n  }",
+        "old_string": "export class NotificationService {\n  private logger = new Logger('NotificationService');\n  private notifications: Notification[] = [];\n  private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();\n  private preferencesService?: PreferencesService;\n  private historyService?: NotificationHistoryService;\n\n  constructor(private eventBus: EventBus) {\n    this.registerEventHandlers();\n  }",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-03T02:15:48.078Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/services/notification.service.ts",
+        "new_string": "  /**\n   * Send a notification through the appropriate adapter and record it.\n   * This is the single delivery path — all notifications go through here.\n   * Sends are serialized via an internal queue to guarantee delivery order.\n   */\n  async send(payload: NotificationPayload): Promise<Notification> {\n    const result = this.sendQueue.then(\n      () => this.doSend(payload),\n      () => this.doSend(payload),\n    );\n    this.sendQueue = result;\n    return result;\n  }\n\n  private async doSend(payload: NotificationPayload): Promise<Notification> {\n    // Check user preferences before sending (all channels)\n    if (this.preferencesService) {",
+        "old_string": "  /**\n   * Send a notification through the appropriate adapter and record it.\n   * This is the single delivery path — all notifications go through here.\n   */\n  async send(payload: NotificationPayload): Promise<Notification> {\n    // Check user preferences before sending (all channels)\n    if (this.preferencesService) {",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-03T02:15:55.612Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/src/adapters/notification.adapter.ts"
+      },
+      "timestamp": "2026-04-03T02:15:59.046Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/tests/services/notification.service.test.ts",
+        "new_string": "import { describe, it, expect, beforeEach } from 'vitest';\nimport { EventBus } from '../../src/events/event-bus.js';\nimport {\n  NotificationService,\n  resetNotificationIdCounter,\n} from '../../src/services/notification.service.js';\nimport { EmailAdapter } from '../../src/adapters/email.adapter.js';\nimport { SmsAdapter } from '../../src/adapters/sms.adapter.js';\nimport { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';\nimport { Database } from '../../src/utils/database.js';\nimport { PreferencesRepository } from '../../src/repositories/preferences.repository.js';\nimport { PreferencesService, resetPreferencesIdCounter } from '../../src/services/preferences.service.js';\nimport type { NotificationAdapter, AdapterSendResult } from '../../src/adapters/notification.adapter.js';\nimport type { NotificationPayload } from '../../src/models/notification.js';\nimport type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';",
+        "old_string": "import { describe, it, expect, beforeEach } from 'vitest';\nimport { EventBus } from '../../src/events/event-bus.js';\nimport {\n  NotificationService,\n  resetNotificationIdCounter,\n} from '../../src/services/notification.service.js';\nimport { EmailAdapter } from '../../src/adapters/email.adapter.js';\nimport { SmsAdapter } from '../../src/adapters/sms.adapter.js';\nimport { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';\nimport { Database } from '../../src/utils/database.js';\nimport { PreferencesRepository } from '../../src/repositories/preferences.repository.js';\nimport { PreferencesService, resetPreferencesIdCounter } from '../../src/services/preferences.service.js';\nimport type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-03T02:16:07.076Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-HC5bY0/tests/services/notification.service.test.ts",
+        "new_string": "  it('should independently control email and SMS preferences', async () => {\n    preferencesService.create({\n      userId: 'alice@example.com',\n      emailEnabled: true,\n      channels: { sms: { enabled: false } },\n    });\n\n    const emailResult = await service.send({\n      recipient: 'alice@example.com',\n      subject: 'Order confirmed',\n      body: 'Your order is confirmed',\n      channel: 'email',\n      type: 'order-confirmation',\n      priority: 'normal',\n    });\n    expect(emailResult.status).toBe('sent');\n\n    const smsResult = await service.send({\n      recipient: 'alice@example.com',\n      subject: 'Order confirmed',\n      body: 'Your order is confirmed',\n      channel: 'sms',\n      type: 'order-confirmation',\n      priority: 'normal',\n    });\n    expect(smsResult.status).toBe('suppressed');\n  });\n});\n\ndescribe('NotificationService delivery ordering', () => {\n  let eventBus: EventBus;\n  let service: NotificationService;\n\n  beforeEach(() => {\n    eventBus = new EventBus();\n    service = new NotificationService(eventBus);\n    resetNotificationIdCounter();\n  });\n\n  it('should deliver notifications in send() call order even with slow adapters', async () => {\n    // Create a slow adapter that takes variable time to simulate network latency\n    const deliveryOrder: string[] = [];\n    const slowAdapter: NotificationAdapter = {\n      channel: 'email' as const,\n      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n        // First notification takes longer than second to simulate out-of-order risk\n        const delay = payload.subject === 'First' ? 50 : 10;\n        await new Promise((resolve) => setTimeout(resolve, delay));\n        deliveryOrder.push(payload.subject);\n        return { success: true };\n      },\n    };\n\n    service.registerAdapter(slowAdapter);\n\n    // Fire two sends concurrently — without queue, Second would finish before First\n    const [first, second] = await Promise.all([\n      service.send({\n        recipient: 'user@example.com',\n        subject: 'First',\n        body: 'Order placed',\n        channel: 'email',\n        type: 'order-confirmation',\n        priority: 'normal',\n      }),\n      service.send({\n        recipient: 'user@example.com',\n        subject: 'Second',\n        body: 'Payment confirmed',\n        channel: 'email',\n        type: 'order-status-update',\n        priority: 'normal',\n      }),\n    ]);\n\n    expect(first.status).toBe('sent');\n    expect(second.status).toBe('sent');\n    // The queue ensures First is delivered before Second despite taking longer\n    expect(deliveryOrder).toEqual(['First', 'Second']);\n  });\n\n  it('should preserve ordering when events are emitted concurrently', async () => {\n    const deliveryOrder: string[] = [];\n    const trackingAdapter: NotificationAdapter = {\n      channel: 'email' as const,\n      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n        // Variable delays to expose ordering bugs\n        const delay = payload.type === 'order-confirmation' ? 30 : 5;\n        await new Promise((resolve) => setTimeout(resolve, delay));\n        deliveryOrder.push(payload.type);\n        return { success: true };\n      },\n    };\n\n    service.registerAdapter(trackingAdapter);\n\n    // Emit both events concurrently (simulating rapid-fire domain events)\n    const orderCreated: OrderCreatedEvent = {\n      type: 'order:created',\n      order: {\n        id: 'order-1',\n        userId: 'user-1',\n        items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],\n        total: 10,\n        status: 'pending',\n        createdAt: new Date(),\n        updatedAt: new Date(),\n      },\n      user: {\n        id: 'user-1',\n        name: 'Alice',\n        email: 'alice@example.com',\n        role: 'member',\n        createdAt: new Date(),\n        updatedAt: new Date(),\n      },\n      timestamp: new Date(),\n    };\n\n    const orderStatusChanged: OrderStatusChangedEvent = {\n      type: 'order:status-changed',\n      order: {\n        id: 'order-1',\n        userId: 'user-1',\n        items: [],\n        total: 10,\n        status: 'confirmed',\n        createdAt: new Date(),\n        updatedAt: new Date(),\n      },\n      previousStatus: 'pending',\n      newStatus: 'confirmed',\n      timestamp: new Date(),\n    };\n\n    // Emit concurrently — without the queue, order-status-update would arrive first\n    await Promise.all([\n      eventBus.emit(orderCreated),\n      eventBus.emit(orderStatusChanged),\n    ]);\n\n    // Order confirmation must be delivered before status update\n    expect(deliveryOrder).toEqual(['order-confirmation', 'order-status-update']);\n  });\n\n  it('should preserve ordering across three or more concurrent sends', async () => {\n    const deliveryOrder: string[] = [];\n    const adapter: NotificationAdapter = {\n      channel: 'email' as const,\n      async send(payload: NotificationPayload): Promise<AdapterSendResult> {\n        // Reverse delay: earlier sends take longer\n        const delays: Record<string, number> = { 'A': 40, 'B': 20, 'C': 5 };\n        await new Promise((resolve) => setTimeout(resolve, delays[payload.subject] ?? 0));\n        deliveryOrder.push(payload.subject);\n        return { success: true };\n      },\n    };\n\n    service.registerAdapter(adapter);\n\n    const makeSend = (subject: string) =>\n      service.send({\n        recipient: 'user@example.com',\n        subject,\n        body: 'test',\n        channel: 'email',\n        type: 'order-confirmation',\n        priority: 'normal',\n      });\n\n    await Promise.all([makeSend('A'), makeSend('B'), makeSend('C')]);\n\n    expect(deliveryOrder).toEqual(['A', 'B', 'C']);\n  });\n});",
+        "old_string": "  it('should independently control email and SMS preferences', async () => {\n    preferencesService.create({\n      userId: 'alice@example.com',\n      emailEnabled: true,\n      channels: { sms: { enabled: false } },\n    });\n\n    const emailResult = await service.send({\n      recipient: 'alice@example.com',\n      subject: 'Order confirmed',\n      body: 'Your order is confirmed',\n      channel: 'email',\n      type: 'order-confirmation',\n      priority: 'normal',\n    });\n    expect(emailResult.status).toBe('sent');\n\n    const smsResult = await service.send({\n      recipient: 'alice@example.com',\n      subject: 'Order confirmed',\n      body: 'Your order is confirmed',\n      channel: 'sms',\n      type: 'order-confirmation',\n      priority: 'normal',\n    });\n    expect(smsResult.status).toBe('suppressed');\n  });\n});",
+        "replace_all": false
+      },
+      "timestamp": "2026-04-03T02:16:32.074Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "npx vitest run 2>&1",
+        "timeout": 60000
+      },
+      "timestamp": "2026-04-03T02:16:35.618Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "max_results": 3,
+        "query": "select:mcp__twining__twining_decide,mcp__twining__twining_verify,mcp__twining__twining_post"
+      },
+      "timestamp": "2026-04-03T02:16:40.840Z",
+      "toolName": "ToolSearch"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "affected_files": [
+          "src/services/notification.service.ts",
+          "tests/services/notification.service.test.ts"
+        ],
+        "agent_id": "agent-10",
+        "alternatives": [
+          {
+            "option": "Add ordering in EventBus.emit() to serialize all event processing globally",
+            "reason_rejected": "Over-broad — would serialize ALL event handlers, not just notifications. Other event consumers may benefit from concurrency."
+          },
+          {
+            "option": "Add sequence numbers to notifications and let consumers reorder",
+            "reason_rejected": "Pushes complexity to consumers. The notification service should guarantee order at the source."
+          },
+          {
+            "option": "Make OrderService await each event emission before emitting the next",
+            "reason_rejected": "Only fixes the OrderService case, not general concurrent sends. The fix belongs in NotificationService where delivery happens."
+          }
+        ],
+        "confidence": "high",
+        "context": "Users reported notifications arriving out of order (e.g., \"payment confirmed\" before \"order placed\"). The root cause: concurrent events (order:created and order:status-changed) trigger separate EventBus handlers that both call send() concurrently. Since adapter.send() is async, faster adapters complete before slower ones, breaking delivery order.",
+        "domain": "implementation",
+        "rationale": "Added a promise-chain queue (sendQueue) to NotificationService. The public send() method chains onto the queue so each doSend() waits for the previous one to complete. This serializes delivery in call order with minimal code change — just a queue field and a thin send() wrapper that delegates to the new private doSend() method. The fix is internal to NotificationService and doesn't change any public API or the event-driven architecture.",
+        "scope": "src/services/notification.service.ts",
+        "summary": "Added send queue to NotificationService to guarantee notification delivery order"
+      },
+      "timestamp": "2026-04-03T02:16:54.603Z",
+      "toolName": "mcp__twining__twining_decide"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "agent_id": "agent-10",
+        "detail": "## What was done\n1. **Root cause**: Concurrent EventBus emissions (different event types) trigger concurrent send() calls in NotificationService. Async adapter.send() means faster adapters complete first, breaking delivery order.\n2. **Fix**: Added a `sendQueue` promise chain to NotificationService. The public `send()` chains onto it, delegating to private `doSend()`. Each send waits for the previous to complete, guaranteeing FIFO order.\n3. **Tests added** (3 new tests in `tests/services/notification.service.test.ts`):\n   - Concurrent sends with slow adapter (50ms vs 10ms) deliver in call order\n   - Concurrent event emissions preserve notification order\n   - Three concurrent sends with reverse delays (40ms, 20ms, 5ms) deliver in order\n4. **All 281 tests pass**, no existing tests broken.",
+        "entry_type": "status",
+        "scope": "src/services/notification.service.ts",
+        "summary": "Agent 10: Fixed notification ordering — added send queue to NotificationService, 3 new ordering tests, all 281 tests pass"
+      },
+      "timestamp": "2026-04-03T02:17:00.027Z",
+      "toolName": "mcp__twining__twining_post"
+    }
+  ],
+  "turnUsage": []
+}

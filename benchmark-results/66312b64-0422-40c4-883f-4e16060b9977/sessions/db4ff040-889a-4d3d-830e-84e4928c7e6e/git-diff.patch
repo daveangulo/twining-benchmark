@@ -1,0 +1,478 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 5f7bc72..da25d31 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -18,3 +18,28 @@ Write your updates below. There is no enforced format — use whatever structure
+ - EventBus is still in the codebase but no longer used by Order/Notification services
+ 
+ **All 70 tests pass.**
++
++---
++
++## Notification Architecture Unification: Event-Driven
++
++**Problem:** Two conflicting architectural approaches coexisted:
++- OrderService used direct calls to NotificationService (tight coupling)
++- UserService used EventBus for event-driven communication (loose coupling)
++- An unused CallbackRegistry offered yet a third pattern
++
++**Decision: Unified on EventBus (event-driven) throughout.**
++
++**Rationale:**
++1. **Event types already existed** — `OrderCreatedEvent` and `OrderStatusChangedEvent` were defined in `event-types.ts` but unused, showing the original architect intended event-driven order notifications
++2. **Loose coupling** — Services emit events without knowing who listens. Adding analytics, audit logging, or new notification channels requires zero changes to OrderService or UserService
++3. **Consistency** — All services now follow the same pattern: emit events via EventBus, let subscribers react
++4. **Built-in audit trail** — EventBus logs all events, useful for debugging and replay
++
++**What changed:**
++- `OrderService`: Constructor now takes `EventBus` instead of `NotificationService`. Emits `order:created` and `order:status-changed` events instead of direct method calls
++- `NotificationService`: No longer has public `notifyOrderCreated`/`notifyOrderUpdated` methods. Instead exposes a `register(eventBus)` method that subscribes to order events. Notification logic is now private event handlers
++- `CallbackRegistry` (`src/utils/callback-registry.ts`): Deleted — was unused and represented a third competing pattern
++- Tests updated: OrderService tests verify event emission via `eventBus.getEventLog()`; NotificationService tests emit events via EventBus and verify notifications are created
++
++**All 70 tests pass.**
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 1d299b1..74558fc 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -1,13 +1,18 @@
+ /**
+- * Notification service — handles sending notifications for order lifecycle events.
++ * Notification service — handles sending notifications for lifecycle events.
+  *
+- * Uses direct service-to-service calls for simplicity and debuggability.
+- * OrderService calls these methods directly when orders are created/updated.
++ * Subscribes to EventBus events (order:created, order:status-changed) and
++ * sends notifications in response. This keeps NotificationService decoupled
++ * from the services that emit events — new event sources can be added without
++ * touching this file, and new notification channels can be added here without
++ * touching emitting services.
+  */
+ 
+ import type { Order } from '../models/order.js';
+ import type { User } from '../models/user.js';
+ import type { OrderStatus } from '../models/order.js';
++import type { EventBus } from '../events/event-bus.js';
++import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ export interface Notification {
+@@ -33,9 +38,23 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+ 
+   /**
+-   * Notify that a new order has been created — sends confirmation to user.
++   * Register event handlers on the given EventBus.
++   * Call this once during application bootstrap to wire up notifications.
+    */
+-  notifyOrderCreated(order: Order, user: User): void {
++  register(eventBus: EventBus): void {
++    eventBus.on<OrderCreatedEvent>('order:created', (event) => {
++      this.handleOrderCreated(event.order, event.user);
++    });
++
++    eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
++      this.handleOrderStatusChanged(event.order, event.previousStatus as OrderStatus, event.newStatus as OrderStatus);
++    });
++  }
++
++  /**
++   * Handle an order:created event — sends confirmation to user.
++   */
++  private handleOrderCreated(order: Order, user: User): void {
+     this.logger.info(`Sending order confirmation for order ${order.id}`);
+ 
+     const itemSummary = order.items
+@@ -50,9 +69,9 @@ export class NotificationService {
+   }
+ 
+   /**
+-   * Notify that an order's status has changed.
++   * Handle an order:status-changed event — notifies user of status change.
+    */
+-  notifyOrderUpdated(order: Order, previousStatus: OrderStatus, newStatus: OrderStatus): void {
++  private handleOrderStatusChanged(order: Order, previousStatus: OrderStatus, newStatus: OrderStatus): void {
+     this.logger.info(
+       `Sending status update for order ${order.id}: ${previousStatus} -> ${newStatus}`,
+     );
+diff --git a/src/services/order.service.ts b/src/services/order.service.ts
+index 4fa4f0b..a1acb4d 100644
+--- a/src/services/order.service.ts
++++ b/src/services/order.service.ts
+@@ -4,18 +4,18 @@
+  * Depends on:
+  * - OrderRepository (data layer) for persistence
+  * - UserRepository (data layer) for user validation
+- * - NotificationService for sending order lifecycle notifications
++ * - EventBus (event system) for publishing order lifecycle events
+  *
+- * Architecture note: OrderService calls NotificationService directly
+- * for simplicity and debuggability. Direct calls are easier to trace
+- * and test than events.
++ * Uses the same event-driven pattern as UserService: emit events on
++ * state changes and let subscribers (e.g. NotificationService) react
++ * independently. This keeps services decoupled and extensible.
+  */
+ 
+ import type { Order, CreateOrderInput, OrderStatus } from '../models/order.js';
+ import { calculateOrderTotal } from '../models/order.js';
+ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+-import type { NotificationService } from './notification.service.js';
++import type { EventBus } from '../events/event-bus.js';
+ import { Logger } from '../utils/logger.js';
+ 
+ let nextId = 1;
+@@ -34,7 +34,7 @@ export class OrderService {
+   constructor(
+     private orderRepository: OrderRepository,
+     private userRepository: UserRepository,
+-    private notificationService: NotificationService,
++    private eventBus: EventBus,
+   ) {}
+ 
+   /**
+@@ -67,8 +67,12 @@ export class OrderService {
+ 
+     this.orderRepository.save(order);
+ 
+-    // Notify directly
+-    this.notificationService.notifyOrderCreated(order, user);
++    await this.eventBus.emit({
++      type: 'order:created',
++      order,
++      user,
++      timestamp: now,
++    });
+ 
+     return order;
+   }
+@@ -105,8 +109,13 @@ export class OrderService {
+       updatedAt: new Date(),
+     });
+ 
+-    // Notify directly
+-    this.notificationService.notifyOrderUpdated(updated, previousStatus, newStatus);
++    await this.eventBus.emit({
++      type: 'order:status-changed',
++      order: updated,
++      previousStatus,
++      newStatus,
++      timestamp: new Date(),
++    });
+ 
+     return updated;
+   }
+diff --git a/src/utils/callback-registry.ts b/src/utils/callback-registry.ts
+deleted file mode 100644
+index 5dbb72d..0000000
+--- a/src/utils/callback-registry.ts
++++ /dev/null
+@@ -1,65 +0,0 @@
+-/**
+- * Callback registry for direct service-to-service notification.
+- *
+- * Alternative approach to EventBus: register callbacks directly on services
+- * for lightweight, synchronous notification without an intermediary.
+- *
+- * Trade-offs vs EventBus:
+- * - Simpler (no event types, no serialization)
+- * - Synchronous by default (predictable ordering)
+- * - Tighter coupling (caller knows about callbacks)
+- * - No event log / replay capability
+- */
+-
+-export class CallbackRegistry<T = unknown> {
+-  private callbacks: ((data: T) => void)[] = [];
+-
+-  /**
+-   * Register a callback to be notified when events occur.
+-   */
+-  register(cb: (data: T) => void): () => void {
+-    this.callbacks.push(cb);
+-    // Return unregister function
+-    return () => {
+-      const index = this.callbacks.indexOf(cb);
+-      if (index >= 0) {
+-        this.callbacks.splice(index, 1);
+-      }
+-    };
+-  }
+-
+-  /**
+-   * Notify all registered callbacks with the given data.
+-   */
+-  notify(data: T): void {
+-    for (const cb of this.callbacks) {
+-      cb(data);
+-    }
+-  }
+-
+-  /**
+-   * Get the number of registered callbacks.
+-   */
+-  get size(): number {
+-    return this.callbacks.length;
+-  }
+-
+-  /**
+-   * Clear all registered callbacks.
+-   */
+-  clear(): void {
+-    this.callbacks = [];
+-  }
+-}
+-
+-// --- Pre-configured registries ---
+-// These are shared instances used across services.
+-
+-import type { OrderStatusChangedEvent } from '../events/event-types.js';
+-
+-/**
+- * Registry for order status change callbacks.
+- * Services register here to be notified of status changes
+- * via the direct callback pattern (as opposed to EventBus).
+- */
+-export const statusChangeCallbacks = new CallbackRegistry<OrderStatusChangedEvent>();
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 00413a2..82fa137 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -3,16 +3,20 @@ import {
+   NotificationService,
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
++import { EventBus } from '../../src/events/event-bus.js';
+ import type { Order } from '../../src/models/order.js';
+ import type { User } from '../../src/models/user.js';
+ 
+ describe('NotificationService', () => {
+   let service: NotificationService;
++  let eventBus: EventBus;
+   let testOrder: Order;
+   let testUser: User;
+ 
+   beforeEach(() => {
++    eventBus = new EventBus();
+     service = new NotificationService();
++    service.register(eventBus);
+     resetNotificationIdCounter();
+ 
+     testOrder = {
+@@ -37,9 +41,14 @@ describe('NotificationService', () => {
+     };
+   });
+ 
+-  describe('notifyOrderCreated', () => {
+-    it('should send notification on order created', () => {
+-      service.notifyOrderCreated(testOrder, testUser);
++  describe('order:created event', () => {
++    it('should send notification on order created', async () => {
++      await eventBus.emit({
++        type: 'order:created',
++        order: testOrder,
++        user: testUser,
++        timestamp: new Date(),
++      });
+ 
+       const notifications = service.getNotifications();
+       expect(notifications).toHaveLength(1);
+@@ -49,7 +58,7 @@ describe('NotificationService', () => {
+       expect(notifications[0]?.body).toContain('$20.00');
+     });
+ 
+-    it('should include all items in notification body', () => {
++    it('should include all items in notification body', async () => {
+       const multiItemOrder: Order = {
+         ...testOrder,
+         items: [
+@@ -59,7 +68,12 @@ describe('NotificationService', () => {
+         total: 45,
+       };
+ 
+-      service.notifyOrderCreated(multiItemOrder, testUser);
++      await eventBus.emit({
++        type: 'order:created',
++        order: multiItemOrder,
++        user: testUser,
++        timestamp: new Date(),
++      });
+ 
+       const notifications = service.getNotifications();
+       expect(notifications[0]?.body).toContain('Widget x2');
+@@ -67,11 +81,17 @@ describe('NotificationService', () => {
+     });
+   });
+ 
+-  describe('notifyOrderUpdated', () => {
+-    it('should send notification on status change', () => {
++  describe('order:status-changed event', () => {
++    it('should send notification on status change', async () => {
+       const confirmedOrder: Order = { ...testOrder, status: 'confirmed' };
+ 
+-      service.notifyOrderUpdated(confirmedOrder, 'pending', 'confirmed');
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: confirmedOrder,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
+ 
+       const notifications = service.getNotifications();
+       expect(notifications).toHaveLength(1);
+@@ -82,35 +102,60 @@ describe('NotificationService', () => {
+   });
+ 
+   describe('notification management', () => {
+-    it('should count notifications', () => {
++    it('should count notifications', async () => {
+       expect(service.getNotificationCount()).toBe(0);
+ 
+-      service.notifyOrderUpdated(testOrder, 'pending', 'confirmed');
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: testOrder,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
+ 
+       expect(service.getNotificationCount()).toBe(1);
+     });
+ 
+-    it('should filter by recipient', () => {
+-      service.notifyOrderCreated(testOrder, testUser);
++    it('should filter by recipient', async () => {
++      await eventBus.emit({
++        type: 'order:created',
++        order: testOrder,
++        user: testUser,
++        timestamp: new Date(),
++      });
+ 
+       expect(service.getNotificationsForRecipient('alice@example.com')).toHaveLength(1);
+       expect(service.getNotificationsForRecipient('bob@example.com')).toHaveLength(0);
+     });
+ 
+-    it('should clear notifications', () => {
+-      service.notifyOrderUpdated(testOrder, 'pending', 'confirmed');
++    it('should clear notifications', async () => {
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: testOrder,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
+ 
+       service.clearNotifications();
+       expect(service.getNotificationCount()).toBe(0);
+     });
+ 
+-    it('should generate sequential notification IDs', () => {
+-      service.notifyOrderUpdated(testOrder, 'pending', 'confirmed');
+-      service.notifyOrderUpdated(
+-        { ...testOrder, id: 'order-2', status: 'shipped' },
+-        'confirmed',
+-        'shipped',
+-      );
++    it('should generate sequential notification IDs', async () => {
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: testOrder,
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: { ...testOrder, id: 'order-2', status: 'shipped' },
++        previousStatus: 'confirmed',
++        newStatus: 'shipped',
++        timestamp: new Date(),
++      });
+ 
+       const notifications = service.getNotifications();
+       expect(notifications[0]?.id).toBe('notif-0001');
+diff --git a/tests/services/order.service.test.ts b/tests/services/order.service.test.ts
+index e64398b..0376105 100644
+--- a/tests/services/order.service.test.ts
++++ b/tests/services/order.service.test.ts
+@@ -1,8 +1,8 @@
+-import { describe, it, expect, beforeEach, vi } from 'vitest';
++import { describe, it, expect, beforeEach } from 'vitest';
+ import { Database } from '../../src/utils/database.js';
+ import { UserRepository } from '../../src/repositories/user.repository.js';
+ import { OrderRepository } from '../../src/repositories/order.repository.js';
+-import { NotificationService } from '../../src/services/notification.service.js';
++import { EventBus } from '../../src/events/event-bus.js';
+ import { OrderService, resetOrderIdCounter } from '../../src/services/order.service.js';
+ import type { User } from '../../src/models/user.js';
+ 
+@@ -10,7 +10,7 @@ describe('OrderService', () => {
+   let db: Database;
+   let userRepo: UserRepository;
+   let orderRepo: OrderRepository;
+-  let notificationService: NotificationService;
++  let eventBus: EventBus;
+   let service: OrderService;
+   let testUser: User;
+ 
+@@ -18,8 +18,8 @@ describe('OrderService', () => {
+     db = new Database();
+     userRepo = new UserRepository(db);
+     orderRepo = new OrderRepository(db);
+-    notificationService = new NotificationService();
+-    service = new OrderService(orderRepo, userRepo, notificationService);
++    eventBus = new EventBus();
++    service = new OrderService(orderRepo, userRepo, eventBus);
+     resetOrderIdCounter();
+ 
+     // Create a test user
+@@ -35,9 +35,7 @@ describe('OrderService', () => {
+   });
+ 
+   describe('createOrder', () => {
+-    it('should create an order and notify', async () => {
+-      const spy = vi.spyOn(notificationService, 'notifyOrderCreated');
+-
++    it('should create an order and emit event', async () => {
+       const order = await service.createOrder({
+         userId: 'user-1',
+         items: [
+@@ -50,8 +48,9 @@ describe('OrderService', () => {
+       expect(order.total).toBe(20);
+       expect(order.status).toBe('pending');
+ 
+-      expect(spy).toHaveBeenCalledOnce();
+-      expect(spy).toHaveBeenCalledWith(order, testUser);
++      const events = eventBus.getEventLog();
++      expect(events).toHaveLength(1);
++      expect(events[0]?.type).toBe('order:created');
+     });
+ 
+     it('should throw for non-existent user', async () => {
+@@ -96,9 +95,7 @@ describe('OrderService', () => {
+   });
+ 
+   describe('updateOrderStatus', () => {
+-    it('should update status and notify', async () => {
+-      const spy = vi.spyOn(notificationService, 'notifyOrderUpdated');
+-
++    it('should update status and emit event', async () => {
+       const order = await service.createOrder({
+         userId: 'user-1',
+         items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
+@@ -107,8 +104,9 @@ describe('OrderService', () => {
+       const updated = await service.updateOrderStatus(order.id, 'confirmed');
+       expect(updated.status).toBe('confirmed');
+ 
+-      expect(spy).toHaveBeenCalledOnce();
+-      expect(spy).toHaveBeenCalledWith(updated, 'pending', 'confirmed');
++      const events = eventBus.getEventLog();
++      expect(events).toHaveLength(2); // created + status-changed
++      expect(events[1]?.type).toBe('order:status-changed');
+     });
+ 
+     it('should reject invalid status transition', async () => {

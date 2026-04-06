@@ -1,0 +1,179 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 5504645..d13e7dd 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -430,3 +430,32 @@ Refactored the preferences system from email-only to support per-channel setting
+ 
+ ### Test results
+ 225 tests pass (30 new + 195 existing). Clean TypeScript compilation.
++
++---
++
++## Agent 10 — Notification Delivery Ordering Fix (Complete)
++
++### What was done
++Fixed a bug where notifications to the same recipient could arrive out of order when sent concurrently (e.g., "payment confirmed" before "order placed").
++
++**Root cause**: `NotificationService.send()` dispatched to adapters without any queuing. When multiple `send()` calls were made concurrently for the same recipient, the adapter calls (which are async and take varying time) could complete in any order, causing notifications to be stored and delivered out of submission order.
++
++**The fix** (`src/services/notification.service.ts`):
++- Added a `recipientQueues` map (`Map<string, Promise>`) that chains `send()` calls per recipient
++- `send()` now chains onto the previous promise for the same recipient, ensuring sequential processing
++- Extracted the original `send()` logic into a private `doSend()` method
++- Queue entries are cleaned up after the last notification for a recipient completes
++- Notifications to **different** recipients remain fully concurrent — no global serialization
++
++### Tests added
++Two new tests in `tests/services/notification.service.test.ts`:
++1. **Should deliver notifications to the same recipient in order** — uses a slow-then-fast adapter to prove that without queuing the second notification would arrive first, but with queuing order is preserved
++2. **Should not block notifications to different recipients** — verifies that a slow notification to one recipient doesn't delay delivery to another recipient
++
++### Key decisions
++- **Per-recipient queue, not global queue**: A global queue would serialize all notifications unnecessarily. Per-recipient queues only serialize notifications that could conflict.
++- **Promise chaining, not explicit queue data structure**: Simpler implementation — each send chains onto the previous promise for that recipient. No need for a queue class or worker.
++- **No changes to event handlers**: The legacy `handleOrderCreated` and `handleOrderStatusChanged` handlers are synchronous and already execute in EventBus emission order. The ordering bug only affects the async `send()` pathway.
++
++### Test results
++227 tests pass (2 new + 225 existing). Clean TypeScript compilation.
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 9d298b6..b96facf 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -46,6 +46,7 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | undefined;
++  private recipientQueues: Map<string, Promise<Notification | null>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+@@ -74,6 +75,27 @@ export class NotificationService {
+    * with status 'failed' and a notification:failed event is emitted.
+    */
+   async send(payload: NotificationPayload): Promise<Notification | null> {
++    const recipient = payload.recipient;
++
++    // Chain onto the existing queue for this recipient to preserve ordering.
++    // Each send waits for the previous send to the same recipient to finish
++    // before starting, ensuring notifications arrive in submission order.
++    const previous = this.recipientQueues.get(recipient) ?? Promise.resolve(null);
++    const current = previous.then(() => this.doSend(payload));
++
++    this.recipientQueues.set(recipient, current);
++
++    try {
++      return await current;
++    } finally {
++      // Clean up the queue entry if this was the last item
++      if (this.recipientQueues.get(recipient) === current) {
++        this.recipientQueues.delete(recipient);
++      }
++    }
++  }
++
++  private async doSend(payload: NotificationPayload): Promise<Notification | null> {
+     // Check user preferences before sending
+     if (this.preferencesService) {
+       const userId = payload.metadata?.['userId'] as string | undefined ?? payload.recipient;
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 35faaf4..1b6a1c0 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -263,6 +263,97 @@ describe('NotificationService', () => {
+       expect(notification.status).toBe('failed');
+     });
+ 
++    it('should deliver notifications to the same recipient in order', async () => {
++      // Simulate an adapter where each call takes a different amount of time.
++      // Without queuing, the second (faster) notification would arrive first.
++      let resolveFirst: () => void;
++      const firstBlocks = new Promise<void>((r) => { resolveFirst = r; });
++      let callIndex = 0;
++
++      service.registerAdapter({
++        channel: 'email',
++        async send() {
++          const idx = callIndex++;
++          if (idx === 0) {
++            // First notification is slow
++            await firstBlocks;
++          }
++          // Second notification completes immediately
++          return { success: true };
++        },
++      });
++
++      const p1 = service.send({
++        recipient: 'user@example.com',
++        type: 'order-confirmation',
++        channel: 'email',
++        subject: 'Order Placed',
++        body: 'Your order has been placed.',
++      });
++
++      const p2 = service.send({
++        recipient: 'user@example.com',
++        type: 'order-status-update',
++        channel: 'email',
++        subject: 'Payment Confirmed',
++        body: 'Your payment has been confirmed.',
++      });
++
++      // Unblock the first (slow) notification
++      resolveFirst!();
++
++      const [n1, n2] = await Promise.all([p1, p2]);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      // Order placed must arrive before payment confirmed
++      expect(notifications[0]?.subject).toBe('Order Placed');
++      expect(notifications[1]?.subject).toBe('Payment Confirmed');
++      expect(n1!.id).toBe(notifications[0]?.id);
++      expect(n2!.id).toBe(notifications[1]?.id);
++    });
++
++    it('should not block notifications to different recipients', async () => {
++      let resolveFirst: () => void;
++      const firstBlocks = new Promise<void>((r) => { resolveFirst = r; });
++      const deliveryOrder: string[] = [];
++
++      service.registerAdapter({
++        channel: 'email',
++        async send(payload) {
++          if (payload.recipient === 'slow@example.com') {
++            await firstBlocks;
++          }
++          deliveryOrder.push(payload.recipient);
++          return { success: true };
++        },
++      });
++
++      const p1 = service.send({
++        recipient: 'slow@example.com',
++        type: 'system-alert',
++        channel: 'email',
++        subject: 'Slow',
++        body: 'Slow delivery.',
++      });
++
++      const p2 = service.send({
++        recipient: 'fast@example.com',
++        type: 'system-alert',
++        channel: 'email',
++        subject: 'Fast',
++        body: 'Fast delivery.',
++      });
++
++      // fast@example.com should complete without waiting for slow@example.com
++      await p2;
++      expect(deliveryOrder).toContain('fast@example.com');
++
++      resolveFirst!();
++      await p1;
++      expect(deliveryOrder).toEqual(['fast@example.com', 'slow@example.com']);
++    });
++
+     it('should mark as failed when adapter returns failure', async () => {
+       service.registerAdapter({
+         channel: 'email',

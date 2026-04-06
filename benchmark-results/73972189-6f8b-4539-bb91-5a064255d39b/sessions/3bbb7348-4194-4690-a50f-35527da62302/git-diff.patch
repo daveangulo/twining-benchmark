@@ -1,0 +1,196 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index ebdc3b2..fa85dca 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -319,3 +319,25 @@ Refactored user preferences from email-only to per-channel settings (email, SMS,
+ 
+ ### Status
+ All 222 tests passing (194 existing + 28 new). TypeScript compiles cleanly.
++
++---
++
++## Agent 10 — Fix Notification Delivery Ordering (completed)
++
++### What was done
++Fixed a race condition in `src/services/notification.service.ts` where notifications could arrive out of order (e.g., "payment confirmed" before "order placed").
++
++**Root cause**: `dispatchNotification()` was fire-and-forget — it called `adapter.send(payload).then().catch()` without awaiting. Event handlers (`handleOrderCreated`, `handleOrderStatusChanged`) were synchronous (`void` return), so even though EventBus `emit()` awaits handlers, the adapter delivery was untracked. Sequential events would race each other through the adapter.
++
++**Fix** (3 changes, all in `notification.service.ts`):
++1. Made `dispatchNotification()` `async` and replaced `.then()/.catch()` with `try/await/catch`
++2. Made `handleOrderCreated()` and `handleOrderStatusChanged()` `async`, returning `Promise<void>`
++3. Both handlers now `await this.dispatchNotification(...)` so the EventBus serializes delivery
++
++**Test added**: `tests/services/notification.service.test.ts` — "should deliver notifications in order when events are emitted sequentially" verifies that order_confirmation arrives before order_status_update when events are emitted in sequence through an adapter.
++
++### Key decision
++- Kept the fix minimal — no queue, no sequence numbers. The EventBus already serializes handlers (`for...of` with `await`), so making the handlers properly async is sufficient to guarantee ordering for sequential emits.
++
++### Status
++All 223 tests passing (222 existing + 1 new). TypeScript compiles cleanly.
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 667762e..5dc0d1f 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -92,26 +92,26 @@ export class NotificationService {
+    * Add new event subscriptions here when extending notification coverage.
+    */
+   private registerEventHandlers(): void {
+-    this.eventBus.on<OrderCreatedEvent>('order:created', (event) => {
+-      this.handleOrderCreated(event);
++    this.eventBus.on<OrderCreatedEvent>('order:created', async (event) => {
++      await this.handleOrderCreated(event);
+     });
+ 
+-    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', (event) => {
+-      this.handleOrderStatusChanged(event);
++    this.eventBus.on<OrderStatusChangedEvent>('order:status-changed', async (event) => {
++      await this.handleOrderStatusChanged(event);
+     });
+   }
+ 
+   /**
+    * Handle order created event — send confirmation to user.
+    */
+-  private handleOrderCreated(event: OrderCreatedEvent): void {
++  private async handleOrderCreated(event: OrderCreatedEvent): Promise<void> {
+     this.logger.info(`Sending order confirmation for order ${event.order.id}`);
+ 
+     const itemSummary = event.order.items
+       .map((item) => `${item.name} x${item.quantity}`)
+       .join(', ');
+ 
+-    this.dispatchNotification({
++    await this.dispatchNotification({
+       type: 'order_confirmation',
+       channel: this.defaultChannel,
+       recipient: event.user.email,
+@@ -130,12 +130,12 @@ export class NotificationService {
+   /**
+    * Handle order status change — notify user of update.
+    */
+-  private handleOrderStatusChanged(event: OrderStatusChangedEvent): void {
++  private async handleOrderStatusChanged(event: OrderStatusChangedEvent): Promise<void> {
+     this.logger.info(
+       `Sending status update for order ${event.order.id}: ${event.previousStatus} -> ${event.newStatus}`,
+     );
+ 
+-    this.dispatchNotification({
++    await this.dispatchNotification({
+       type: 'order_status_update',
+       channel: this.defaultChannel,
+       recipient: event.order.userId,
+@@ -155,7 +155,7 @@ export class NotificationService {
+    * If no adapter is registered for the channel, the notification is still
+    * recorded with 'pending' status (delivery deferred until adapter is available).
+    */
+-  private dispatchNotification(params: {
++  private async dispatchNotification(params: {
+     type: NotificationType;
+     channel: NotificationChannel;
+     recipient: string;
+@@ -163,7 +163,7 @@ export class NotificationService {
+     body: string;
+     metadata: Record<string, unknown>;
+     userId?: string;
+-  }): void {
++  }): Promise<void> {
+     // Check user preferences before sending
+     if (this.preferencesService && params.userId) {
+       if (!this.preferencesService.shouldSendNotification(params.userId, params.channel, params.type)) {
+@@ -189,16 +189,14 @@ export class NotificationService {
+     const adapter = this.adapters.get(params.channel);
+ 
+     if (adapter) {
+-      adapter
+-        .send(payload)
+-        .then(() => {
+-          this.recordNotification(payload, 'sent', now);
+-        })
+-        .catch((error: unknown) => {
+-          const message = error instanceof Error ? error.message : String(error);
+-          this.logger.error(`Failed to send notification ${payload.id}: ${message}`);
+-          this.recordNotification(payload, 'failed', null);
+-        });
++      try {
++        await adapter.send(payload);
++        this.recordNotification(payload, 'sent', now);
++      } catch (error: unknown) {
++        const message = error instanceof Error ? error.message : String(error);
++        this.logger.error(`Failed to send notification ${payload.id}: ${message}`);
++        this.recordNotification(payload, 'failed', null);
++      }
+     } else {
+       // No adapter registered — record as sent for backward compatibility
+       // (in-memory tracking without an external delivery channel)
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index ef2cef4..3430975 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -269,6 +269,66 @@ describe('NotificationService', () => {
+       expect(notifications[0]?.channel).toBe('email');
+     });
+ 
++    it('should deliver notifications in order when events are emitted sequentially', async () => {
++      const emailAdapter = new EmailAdapter({ from: 'noreply@taskflow.com' });
++      service.registerAdapter(emailAdapter);
++
++      const now = new Date();
++
++      // Emit order:created then order:status-changed sequentially
++      await eventBus.emit({
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [
++            { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++          ],
++          total: 10,
++          status: 'pending',
++          createdAt: now,
++          updatedAt: now,
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: now,
++          updatedAt: now,
++        },
++        timestamp: now,
++      } satisfies OrderCreatedEvent);
++
++      await eventBus.emit({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'alice@example.com',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: now,
++          updatedAt: now,
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: now,
++      } satisfies OrderStatusChangedEvent);
++
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      // Order confirmation must arrive before status update
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++
++      // Adapter should also have received them in order
++      const emails = emailAdapter.getSentEmails();
++      expect(emails).toHaveLength(2);
++      expect(emails[0]?.subject).toContain('Order Confirmation');
++      expect(emails[1]?.subject).toContain('Order Update');
++    });
++
+     it('should record notification even without adapter', async () => {
+       await eventBus.emit({
+         type: 'order:status-changed',

@@ -1,0 +1,700 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index e795631..e3887df 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -371,3 +371,77 @@ Added notification history tracking so every sent notification is logged to a pe
+ 
+ ### Test status
+ All 176 tests pass (159 existing + 17 new).
++
++---
++
++## Agent 8 — SMS Notification Adapter (completed)
++
++### What was done
++
++Added SMS as a new notification channel, following the exact adapter pattern established by email and webhook adapters.
++
++1. **Updated `src/models/notification.ts`** — Added `'sms'` to `NotificationChannel` union type.
++
++2. **Created `src/adapters/sms.adapter.ts`** — `SmsNotificationAdapter`:
++   - Implements `NotificationAdapter` for the `'sms'` channel
++   - `SmsConfig`: `fromNumber` (sender phone number/short code), `maxRetries` (default 2)
++   - `formatMessage()` converts `NotificationPayload` → `SmsMessage` (to, from, body)
++   - `send()` validates from number is configured, validates recipient phone number (E.164 format: `+` followed by 7-15 digits), formats message, sends via transport with retry logic
++   - Never throws per the adapter contract — returns `DeliveryResult`
++   - Pluggable `SmsTransport` interface with `InMemorySmsTransport` default for testing
++   - `getSentMessages()` / `clearSentMessages()` / `getConfig()` convenience accessors
++
++3. **Created `tests/adapters/sms.adapter.test.ts`** — 20 tests:
++   - Basic delivery and message formatting
++   - From number validation (empty, undefined/default)
++   - Recipient validation (no plus prefix, empty, non-numeric, valid international)
++   - All 4 notification types
++   - Retry logic (retry success, retry exhaustion, first-attempt success)
++   - Config access, clearing, channel identity, formatMessage direct access
++   - InMemorySmsTransport standalone tests
++
++4. **Updated `src/index.ts`** — exports `SmsNotificationAdapter`, `InMemorySmsTransport`, and types
++
++5. **Flagged email-only assumption in user preferences** — Added detailed TODO comments in:
++   - `src/models/user-preferences.ts` — Lists 7 specific changes needed (add smsEnabled, smsPhoneNumber, update inputs/defaults, generalize to per-channel map, update validator, update repository)
++   - `src/validators/preferences.validator.ts` — Documents that SMS has no channel-level toggle yet and passes through unless category is unsubscribed
++
++### Key design decisions
++
++- **Follows existing adapter pattern exactly**: Same structure as email/webhook — config, transport abstraction, in-memory transport, retry logic, never-throw contract.
++- **E.164 phone number validation**: Recipients must be in international format (`+` prefix, 7-15 digits). This is standard for SMS APIs (Twilio, SNS, etc.).
++- **SMS body = subject + body**: SMS messages are kept concise — `"${subject}: ${body}"`. No HTML, no templates.
++- **Did NOT modify user preferences model**: Per instructions, flagged the email-only assumption for the next developer rather than rewriting preferences.
++
++### EMAIL-ONLY ASSUMPTION — NOW INVALID
++
++The user preferences model (`src/models/user-preferences.ts`) was designed in Session 3 assuming email was the only channel. Key fields like `emailEnabled` and `emailFrequency` are email-specific with no SMS equivalents. SMS notifications currently:
++- Are **allowed by default** (opt-out model — no preferences = allow)
++- Are **gated only by category subscriptions** (subscribedCategories)
++- Have **no SMS-specific enable/disable toggle** (no `smsEnabled` field)
++- Have **no phone number storage** in preferences (recipient comes from the payload)
++
++The preferences model needs to be updated to support per-channel settings. See the TODO comments in `src/models/user-preferences.ts` for a detailed list of required changes.
++
++### How to use
++
++```typescript
++const smsAdapter = new SmsNotificationAdapter({
++  fromNumber: '+15559876543',
++});
++notificationService.registerAdapter(smsAdapter);
++```
++
++### Constraints for other agents
++
++- **Same adapter pattern as email/webhook**: implements `NotificationAdapter`, registered via `registerAdapter()`.
++- **`SmsTransport` is pluggable**: Default is `InMemorySmsTransport`. For production, provide a Twilio/SNS-backed transport.
++- **Recipients must be E.164 phone numbers**: Format `+` followed by 7-15 digits (e.g., `+15551234567`).
++- **User preferences need updating**: The preferences model does not yet support SMS-specific settings. See TODO comments in `src/models/user-preferences.ts`.
++
++### Files created/modified
++- **Created:** `src/adapters/sms.adapter.ts`, `tests/adapters/sms.adapter.test.ts`
++- **Modified:** `src/models/notification.ts` (added 'sms' to channel type), `src/models/user-preferences.ts` (flagged email-only assumption), `src/validators/preferences.validator.ts` (flagged SMS gap), `src/index.ts` (new exports)
++
++### Test status
++All 196 tests pass (176 existing + 20 new).
+diff --git a/src/adapters/sms.adapter.ts b/src/adapters/sms.adapter.ts
+new file mode 100644
+index 0000000..8e59f37
+--- /dev/null
++++ b/src/adapters/sms.adapter.ts
+@@ -0,0 +1,212 @@
++/**
++ * SMS notification adapter.
++ *
++ * Implements NotificationAdapter for the 'sms' channel.
++ * Formats notification payloads as short text messages and sends them
++ * to a configured phone number via a pluggable transport.
++ *
++ * In production the transport would use Twilio / AWS SNS / etc.
++ * The default transport stores messages in memory for testing.
++ */
++
++import type { NotificationAdapter, DeliveryResult } from './notification.adapter.js';
++import type {
++  NotificationPayload,
++  NotificationChannel,
++} from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++// ---------------------------------------------------------------------------
++// Configuration
++// ---------------------------------------------------------------------------
++
++export interface SmsConfig {
++  /** The sender phone number or short code (e.g. "+15551234567"). */
++  fromNumber: string;
++  /** Maximum delivery attempts before giving up. */
++  maxRetries: number;
++}
++
++const DEFAULT_SMS_CONFIG: SmsConfig = {
++  fromNumber: '',
++  maxRetries: 2,
++};
++
++// ---------------------------------------------------------------------------
++// SMS message type
++// ---------------------------------------------------------------------------
++
++export interface SmsMessage {
++  to: string;
++  from: string;
++  body: string;
++}
++
++// ---------------------------------------------------------------------------
++// Transport abstraction
++// ---------------------------------------------------------------------------
++
++/**
++ * Pluggable transport that actually delivers the SMS.
++ * The default implementation stores messages in memory (for testing).
++ * In production, swap this for a Twilio / SNS transport.
++ */
++export interface SmsTransport {
++  send(message: SmsMessage): Promise<void>;
++}
++
++/**
++ * Record of a sent SMS — includes the message and timestamp.
++ */
++export interface SentSms {
++  message: SmsMessage;
++  sentAt: Date;
++}
++
++/**
++ * In-memory transport — stores sent messages for inspection in tests.
++ */
++export class InMemorySmsTransport implements SmsTransport {
++  private deliveredMessages: SentSms[] = [];
++
++  async send(message: SmsMessage): Promise<void> {
++    this.deliveredMessages.push({
++      message,
++      sentAt: new Date(),
++    });
++  }
++
++  getDeliveredMessages(): SentSms[] {
++    return [...this.deliveredMessages];
++  }
++
++  clear(): void {
++    this.deliveredMessages = [];
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++const PHONE_REGEX = /^\+[1-9]\d{6,14}$/;
++
++function validateRecipient(recipient: string): string | null {
++  if (!recipient || !PHONE_REGEX.test(recipient)) {
++    return `Invalid phone number: ${recipient}`;
++  }
++  return null;
++}
++
++// ---------------------------------------------------------------------------
++// Adapter
++// ---------------------------------------------------------------------------
++
++export class SmsNotificationAdapter implements NotificationAdapter {
++  readonly channel: NotificationChannel = 'sms';
++
++  private logger = new Logger('SmsAdapter');
++  private config: SmsConfig;
++  private transport: SmsTransport;
++
++  constructor(config?: Partial<SmsConfig>, transport?: SmsTransport) {
++    this.config = { ...DEFAULT_SMS_CONFIG, ...config };
++    this.transport = transport ?? new InMemorySmsTransport();
++  }
++
++  /**
++   * Format the notification payload as a short text message and send it.
++   *
++   * Per the NotificationAdapter contract this method never throws.
++   */
++  async send(payload: NotificationPayload): Promise<DeliveryResult> {
++    try {
++      // 1. Validate from number is configured
++      if (!this.config.fromNumber) {
++        const error = 'SMS from number is not configured';
++        this.logger.error(error);
++        return { success: false, error };
++      }
++
++      // 2. Validate recipient phone number
++      const validationError = validateRecipient(payload.recipient);
++      if (validationError) {
++        this.logger.error(validationError);
++        return { success: false, error: validationError };
++      }
++
++      // 3. Format message
++      const message = this.formatMessage(payload);
++
++      // 4. Attempt delivery with retries
++      let lastError: string | undefined;
++      for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
++        try {
++          await this.transport.send(message);
++          this.logger.info(
++            `SMS delivered to ${payload.recipient}: ${payload.notificationType}`,
++          );
++          return { success: true };
++        } catch (err: unknown) {
++          lastError = err instanceof Error ? err.message : 'Transport error';
++          this.logger.warn(
++            `Delivery attempt ${attempt + 1} failed for ${payload.recipient}: ${lastError}`,
++          );
++        }
++      }
++
++      this.logger.error(
++        `All delivery attempts exhausted for ${payload.recipient}: ${lastError}`,
++      );
++      return { success: false, error: lastError };
++    } catch (err: unknown) {
++      const message = err instanceof Error ? err.message : 'Unknown SMS error';
++      this.logger.error(`Unexpected error sending to ${payload.recipient}: ${message}`);
++      return { success: false, error: message };
++    }
++  }
++
++  /**
++   * Format a NotificationPayload into a short SMS text message.
++   * SMS messages are kept concise — subject + body, no HTML.
++   */
++  formatMessage(payload: NotificationPayload): SmsMessage {
++    return {
++      to: payload.recipient,
++      from: this.config.fromNumber,
++      body: `${payload.subject}: ${payload.body}`,
++    };
++  }
++
++  // -----------------------------------------------------------------------
++  // Convenience accessors (primarily for testing)
++  // -----------------------------------------------------------------------
++
++  /**
++   * Get all SMS messages sent through this adapter.
++   * Only works when using InMemorySmsTransport.
++   */
++  getSentMessages(): SentSms[] {
++    if (this.transport instanceof InMemorySmsTransport) {
++      return this.transport.getDeliveredMessages();
++    }
++    return [];
++  }
++
++  /**
++   * Clear sent message history.
++   * Only works when using InMemorySmsTransport.
++   */
++  clearSentMessages(): void {
++    if (this.transport instanceof InMemorySmsTransport) {
++      this.transport.clear();
++    }
++  }
++
++  /**
++   * Get the current configuration (useful for testing).
++   */
++  getConfig(): Readonly<SmsConfig> {
++    return { ...this.config };
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index a56f321..247db30 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -86,6 +86,16 @@ export type {
+   WebhookPayload,
+   SentWebhook,
+ } from './adapters/webhook.adapter.js';
++export {
++  SmsNotificationAdapter,
++  InMemorySmsTransport,
++} from './adapters/sms.adapter.js';
++export type {
++  SmsConfig,
++  SmsTransport,
++  SmsMessage,
++  SentSms,
++} from './adapters/sms.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/src/models/notification.ts b/src/models/notification.ts
+index 1257152..3b1917c 100644
+--- a/src/models/notification.ts
++++ b/src/models/notification.ts
+@@ -11,7 +11,7 @@
+  * Supported notification channels. Each channel corresponds to a
+  * NotificationAdapter implementation.
+  */
+-export type NotificationChannel = 'email' | 'in-app' | 'webhook';
++export type NotificationChannel = 'email' | 'in-app' | 'webhook' | 'sms';
+ 
+ /**
+  * Categorises the reason a notification was sent.
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+index 00fa48f..339b089 100644
+--- a/src/models/user-preferences.ts
++++ b/src/models/user-preferences.ts
+@@ -1,9 +1,28 @@
+ /**
+  * User notification preferences model.
+  *
+- * Controls how and when a user receives notifications. Currently
+- * focused on email settings — the only active notification channel.
+- * Designed to be extensible when additional channels are added.
++ * Controls how and when a user receives notifications.
++ *
++ * WARNING — EMAIL-ONLY ASSUMPTION NO LONGER VALID:
++ * This model was originally designed assuming email was the only notification
++ * channel. SMS is now a supported channel, but this model has NOT been updated
++ * yet. The following changes are needed:
++ *
++ *   1. Add `smsEnabled: boolean` — per-channel toggle for SMS (like emailEnabled)
++ *   2. Add `smsPhoneNumber: string` — the user's SMS-capable phone number
++ *   3. Update `CreatePreferencesInput` and `UpdatePreferencesInput` to accept
++ *      the new SMS fields
++ *   4. Update `getDefaultPreferences()` to include SMS defaults (enabled by
++ *      default to match the opt-out model)
++ *   5. Consider generalizing to a per-channel settings map to avoid adding
++ *      new top-level fields for every channel:
++ *        channelSettings: Record<NotificationChannel, { enabled: boolean; ... }>
++ *   6. Update the `shouldSendNotification` validator in
++ *      `src/validators/preferences.validator.ts` to check the new SMS toggle
++ *   7. Update the UserPreferencesRepository serialization if schema changes
++ *
++ * Until these changes are made, SMS notifications are gated only by category
++ * subscriptions (no SMS-specific enable/disable toggle).
+  */
+ 
+ import type { NotificationType } from './notification.js';
+diff --git a/src/validators/preferences.validator.ts b/src/validators/preferences.validator.ts
+index 784516d..c2c85d2 100644
+--- a/src/validators/preferences.validator.ts
++++ b/src/validators/preferences.validator.ts
+@@ -3,6 +3,18 @@
+  *
+  * These validators contain no side effects and no database calls.
+  * They operate on a preferences object (or undefined for opt-out model).
++ *
++ * TODO(multi-channel): The UserNotificationPreferences model was designed
++ * with email-only in mind (emailEnabled, emailFrequency). Now that SMS is
++ * a supported channel, the preferences model needs to be updated:
++ *   - Add `smsEnabled: boolean` toggle (like emailEnabled)
++ *   - Add `smsPhoneNumber: string` to store the user's SMS-capable number
++ *   - Consider generalizing to a per-channel map, e.g.
++ *     `channelSettings: Record<NotificationChannel, { enabled: boolean }>`
++ *   - Until then, SMS notifications are allowed by default when a user has
++ *     no preferences record (opt-out model), or when they have preferences
++ *     (only category subscription is checked, no SMS-specific toggle exists).
++ * See also: src/models/user-preferences.ts
+  */
+ 
+ import type { UserNotificationPreferences } from '../models/user-preferences.js';
+@@ -26,7 +38,10 @@ export function shouldSendNotification(
+     return true;
+   }
+ 
+-  // Check channel-level switch (currently only email)
++  // Check channel-level switch
++  // NOTE: Only email has a dedicated toggle today. SMS notifications pass
++  // through unless the category is unsubscribed. When the preferences model
++  // is updated to support per-channel toggles, add an smsEnabled check here.
+   if (channel === 'email' && !preferences.emailEnabled) {
+     return false;
+   }
+diff --git a/tests/adapters/sms.adapter.test.ts b/tests/adapters/sms.adapter.test.ts
+new file mode 100644
+index 0000000..579b75c
+--- /dev/null
++++ b/tests/adapters/sms.adapter.test.ts
+@@ -0,0 +1,289 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  SmsNotificationAdapter,
++  InMemorySmsTransport,
++} from '../../src/adapters/sms.adapter.js';
++import type {
++  SmsTransport,
++  SmsMessage,
++} from '../../src/adapters/sms.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {
++  return {
++    recipient: '+15551234567',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    channel: 'sms',
++    notificationType: 'order_confirmation',
++    metadata: { orderId: 'order-1', userId: 'user-1' },
++    ...overrides,
++  };
++}
++
++describe('SmsNotificationAdapter', () => {
++  let adapter: SmsNotificationAdapter;
++  let transport: InMemorySmsTransport;
++
++  beforeEach(() => {
++    transport = new InMemorySmsTransport();
++    adapter = new SmsNotificationAdapter(
++      { fromNumber: '+15559876543' },
++      transport,
++    );
++  });
++
++  // -----------------------------------------------------------------------
++  // Basic send
++  // -----------------------------------------------------------------------
++
++  it('should deliver an SMS successfully', async () => {
++    const result = await adapter.send(makePayload());
++
++    expect(result.success).toBe(true);
++    const sent = adapter.getSentMessages();
++    expect(sent).toHaveLength(1);
++    expect(sent[0]?.message.to).toBe('+15551234567');
++    expect(sent[0]?.message.from).toBe('+15559876543');
++  });
++
++  it('should format message as subject + body', async () => {
++    await adapter.send(makePayload());
++
++    const sent = adapter.getSentMessages();
++    const msg = sent[0]?.message;
++    expect(msg?.body).toBe(
++      'Order Confirmation: order-1: Your order has been placed. Items: Widget x2. Total: $20.00',
++    );
++  });
++
++  // -----------------------------------------------------------------------
++  // From number validation
++  // -----------------------------------------------------------------------
++
++  it('should fail when from number is not configured', async () => {
++    adapter = new SmsNotificationAdapter({ fromNumber: '' }, transport);
++    const result = await adapter.send(makePayload());
++
++    expect(result.success).toBe(false);
++    expect(result.error).toBe('SMS from number is not configured');
++    expect(adapter.getSentMessages()).toHaveLength(0);
++  });
++
++  it('should fail when from number is undefined (default)', async () => {
++    adapter = new SmsNotificationAdapter(undefined, transport);
++    const result = await adapter.send(makePayload());
++
++    expect(result.success).toBe(false);
++    expect(result.error).toBe('SMS from number is not configured');
++  });
++
++  // -----------------------------------------------------------------------
++  // Recipient validation
++  // -----------------------------------------------------------------------
++
++  it('should fail for invalid phone number (no plus prefix)', async () => {
++    const result = await adapter.send(makePayload({ recipient: '15551234567' }));
++
++    expect(result.success).toBe(false);
++    expect(result.error).toBe('Invalid phone number: 15551234567');
++  });
++
++  it('should fail for empty recipient', async () => {
++    const result = await adapter.send(makePayload({ recipient: '' }));
++
++    expect(result.success).toBe(false);
++    expect(result.error).toBe('Invalid phone number: ');
++  });
++
++  it('should fail for non-numeric phone number', async () => {
++    const result = await adapter.send(makePayload({ recipient: '+abc' }));
++
++    expect(result.success).toBe(false);
++    expect(result.error).toContain('Invalid phone number');
++  });
++
++  it('should accept valid international phone numbers', async () => {
++    const result = await adapter.send(makePayload({ recipient: '+442071234567' }));
++
++    expect(result.success).toBe(true);
++  });
++
++  // -----------------------------------------------------------------------
++  // Notification types
++  // -----------------------------------------------------------------------
++
++  it('should format order_status_update messages', async () => {
++    await adapter.send(
++      makePayload({
++        notificationType: 'order_status_update',
++        subject: 'Order Update: order-1',
++        body: 'Status changed from pending to confirmed.',
++      }),
++    );
++
++    const sent = adapter.getSentMessages();
++    expect(sent[0]?.message.body).toContain('pending to confirmed');
++  });
++
++  it('should format user_welcome messages', async () => {
++    await adapter.send(
++      makePayload({
++        notificationType: 'user_welcome',
++        subject: 'Welcome!',
++        body: 'Welcome aboard, Alice!',
++      }),
++    );
++
++    const sent = adapter.getSentMessages();
++    expect(sent[0]?.message.body).toBe('Welcome!: Welcome aboard, Alice!');
++  });
++
++  it('should format user_updated messages', async () => {
++    await adapter.send(
++      makePayload({
++        notificationType: 'user_updated',
++        subject: 'Account Updated',
++        body: 'Your email has been changed.',
++      }),
++    );
++
++    const sent = adapter.getSentMessages();
++    expect(sent[0]?.message.body).toContain('Account Updated');
++  });
++
++  // -----------------------------------------------------------------------
++  // Retry logic
++  // -----------------------------------------------------------------------
++
++  it('should retry on transport failure', async () => {
++    let attempts = 0;
++    const failingTransport: SmsTransport = {
++      async send() {
++        attempts++;
++        if (attempts < 3) {
++          throw new Error('Connection timeout');
++        }
++      },
++    };
++
++    adapter = new SmsNotificationAdapter(
++      { fromNumber: '+15559876543', maxRetries: 2 },
++      failingTransport,
++    );
++    const result = await adapter.send(makePayload());
++
++    expect(result.success).toBe(true);
++    expect(attempts).toBe(3); // 1 initial + 2 retries
++  });
++
++  it('should return failure after exhausting retries', async () => {
++    const failingTransport: SmsTransport = {
++      async send() {
++        throw new Error('Permanent failure');
++      },
++    };
++
++    adapter = new SmsNotificationAdapter(
++      { fromNumber: '+15559876543', maxRetries: 1 },
++      failingTransport,
++    );
++    const result = await adapter.send(makePayload());
++
++    expect(result.success).toBe(false);
++    expect(result.error).toBe('Permanent failure');
++  });
++
++  it('should succeed on first attempt when no errors', async () => {
++    let attempts = 0;
++    const countingTransport: SmsTransport = {
++      async send() {
++        attempts++;
++      },
++    };
++
++    adapter = new SmsNotificationAdapter(
++      { fromNumber: '+15559876543', maxRetries: 3 },
++      countingTransport,
++    );
++    await adapter.send(makePayload());
++
++    expect(attempts).toBe(1);
++  });
++
++  // -----------------------------------------------------------------------
++  // Configuration
++  // -----------------------------------------------------------------------
++
++  it('should expose config via getConfig', () => {
++    adapter = new SmsNotificationAdapter({
++      fromNumber: '+15559876543',
++      maxRetries: 5,
++    });
++
++    const config = adapter.getConfig();
++    expect(config.fromNumber).toBe('+15559876543');
++    expect(config.maxRetries).toBe(5);
++  });
++
++  // -----------------------------------------------------------------------
++  // Clearing
++  // -----------------------------------------------------------------------
++
++  it('should clear sent messages', async () => {
++    await adapter.send(makePayload());
++    expect(adapter.getSentMessages()).toHaveLength(1);
++
++    adapter.clearSentMessages();
++    expect(adapter.getSentMessages()).toHaveLength(0);
++  });
++
++  // -----------------------------------------------------------------------
++  // Channel
++  // -----------------------------------------------------------------------
++
++  it('should report sms channel', () => {
++    expect(adapter.channel).toBe('sms');
++  });
++
++  // -----------------------------------------------------------------------
++  // formatMessage
++  // -----------------------------------------------------------------------
++
++  it('should expose formatMessage for direct use', () => {
++    const formatted = adapter.formatMessage(makePayload());
++
++    expect(formatted.to).toBe('+15551234567');
++    expect(formatted.from).toBe('+15559876543');
++    expect(formatted.body).toContain('Order Confirmation');
++  });
++});
++
++describe('InMemorySmsTransport', () => {
++  it('should store and retrieve delivered messages', async () => {
++    const transport = new InMemorySmsTransport();
++
++    await transport.send({
++      to: '+15551234567',
++      from: '+15559876543',
++      body: 'Hello!',
++    });
++
++    const messages = transport.getDeliveredMessages();
++    expect(messages).toHaveLength(1);
++    expect(messages[0]?.message.to).toBe('+15551234567');
++  });
++
++  it('should clear delivered messages', async () => {
++    const transport = new InMemorySmsTransport();
++
++    await transport.send({
++      to: '+15551234567',
++      from: '+15559876543',
++      body: 'Hello!',
++    });
++
++    transport.clear();
++    expect(transport.getDeliveredMessages()).toHaveLength(0);
++  });
++});

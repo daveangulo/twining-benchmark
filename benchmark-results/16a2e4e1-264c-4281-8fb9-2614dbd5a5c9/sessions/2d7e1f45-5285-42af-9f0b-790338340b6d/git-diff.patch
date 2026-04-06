@@ -1,0 +1,191 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 2404f76..9c2ab0c 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -62,6 +62,16 @@ export class NotificationService {
+   private adapters: Map<NotificationChannel, NotificationAdapter> = new Map();
+   private preferencesService: PreferencesService | undefined;
+ 
++  /**
++   * Sequential send queue — ensures notifications are dispatched in the order
++   * they are received, even when multiple domain events fire concurrently.
++   *
++   * Without this, concurrent calls to send() could race through adapter.send()
++   * and deliver notifications out of order (e.g., "payment confirmed" before
++   * "order placed").
++   */
++  private sendQueue: Promise<unknown> = Promise.resolve();
++
+   constructor(private eventBus: EventBus) {
+     this.registerEventHandlers();
+   }
+@@ -125,16 +135,31 @@ export class NotificationService {
+   /**
+    * Send a notification through the appropriate adapter.
+    *
+-   * This is the core dispatch method. It:
+-   * 1. Builds a NotificationRecord from the input.
+-   * 2. Looks up the adapter for the specified channel.
+-   * 3. Calls adapter.send() and records the result.
+-   * 4. Emits notification:sent or notification:failed events.
++   * Calls are queued internally so that concurrent sends are dispatched
++   * sequentially, preserving the order in which they were requested. This
++   * prevents out-of-order delivery when multiple domain events fire at once.
+    *
+    * @param input - Notification details. Channel defaults to 'email'.
+    * @returns The created NotificationRecord with delivery status.
+    */
+   async send(input: CreateNotificationInput): Promise<NotificationRecord> {
++    // Chain onto the send queue so dispatches execute one at a time.
++    const sendOp = this.sendQueue.then(() => this.dispatchNotification(input));
++
++    // Update the queue tail. `catch` swallows errors so one failed delivery
++    // doesn't block subsequent notifications.
++    this.sendQueue = sendOp.catch(() => {});
++
++    return sendOp;
++  }
++
++  /**
++   * Internal dispatch — does the real work of building the record, checking
++   * preferences, calling the adapter, and emitting lifecycle events.
++   *
++   * MUST only be called through send() to respect the ordering queue.
++   */
++  private async dispatchNotification(input: CreateNotificationInput): Promise<NotificationRecord> {
+     const channel = input.channel ?? 'email';
+     const priority = input.priority ?? 'normal';
+ 
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index e0b939b..f2ef6f7 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -434,6 +434,128 @@ describe('NotificationService', () => {
+     });
+   });
+ 
++  describe('notification ordering', () => {
++    it('should deliver notifications in order even when events fire concurrently', async () => {
++      // Use an adapter with variable delay to simulate real-world network jitter.
++      // The first notification takes longer than the second — without the send
++      // queue this would cause out-of-order delivery.
++      let callIndex = 0;
++      const deliveryOrder: string[] = [];
++
++      const slowThenFastAdapter: NotificationAdapter = {
++        channel: 'email',
++        async send(payload: NotificationPayload): Promise<NotificationResult> {
++          const idx = callIndex++;
++          // First call is slow (50 ms), second is fast (0 ms)
++          const delay = idx === 0 ? 50 : 0;
++          await new Promise((r) => setTimeout(r, delay));
++          deliveryOrder.push(payload.type);
++          return { success: true, notificationId: '', channel: 'email' };
++        },
++      };
++      service.registerAdapter(slowThenFastAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const orderStatusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently (no await between them) — this is the
++      // scenario that triggers out-of-order delivery without the queue fix.
++      const [, ] = await Promise.all([
++        eventBus.emit(orderCreatedEvent),
++        eventBus.emit(orderStatusChangedEvent),
++      ]);
++
++      // Adapter should have been called in order: order_confirmation first,
++      // then order_status_update — even though the first call is slower.
++      expect(deliveryOrder).toEqual(['order_confirmation', 'order_status_update']);
++
++      // NotificationService records should also be in the correct order.
++      const notifications = service.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++
++    it('should continue dispatching after a failed notification', async () => {
++      let callCount = 0;
++      const failThenSucceedAdapter: NotificationAdapter = {
++        channel: 'email',
++        async send(_payload: NotificationPayload): Promise<NotificationResult> {
++          callCount++;
++          if (callCount === 1) {
++            return {
++              success: false,
++              notificationId: '',
++              channel: 'email',
++              failureReason: 'Transient error',
++            };
++          }
++          return { success: true, notificationId: '', channel: 'email' };
++        },
++      };
++      service.registerAdapter(failThenSucceedAdapter);
++
++      // Send two notifications; the first will fail, the second should still go through.
++      const p1 = service.send({
++        type: 'order_confirmation',
++        recipient: 'alice@example.com',
++        subject: 'Order #1',
++        body: 'First',
++      });
++      const p2 = service.send({
++        type: 'order_status_update',
++        recipient: 'alice@example.com',
++        subject: 'Order #1 update',
++        body: 'Second',
++      });
++
++      const [rec1, rec2] = await Promise.all([p1, p2]);
++
++      expect(rec1.status).toBe('failed');
++      expect(rec2.status).toBe('sent');
++
++      // Both should still be recorded in order.
++      const notifications = service.getNotifications();
++      expect(notifications[0]?.type).toBe('order_confirmation');
++      expect(notifications[1]?.type).toBe('order_status_update');
++    });
++  });
++
+   describe('notification lifecycle events', () => {
+     it('should emit notification:sent event on successful delivery', async () => {
+       await eventBus.emit({

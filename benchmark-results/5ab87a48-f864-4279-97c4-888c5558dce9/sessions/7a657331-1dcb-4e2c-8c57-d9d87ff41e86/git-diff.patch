@@ -1,0 +1,506 @@
+diff --git a/src/index.ts b/src/index.ts
+index 20cde43..d70a5e7 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -27,6 +27,7 @@ export { Database, getDatabase, resetDatabase } from './utils/database.js';
+ export { Logger } from './utils/logger.js';
+ export { paginate } from './utils/pagination.js';
+ export type { PaginationResult } from './utils/pagination.js';
++export { bucketByTime } from './utils/time-series.js';
+ 
+ // Repositories
+ export { BaseRepository } from './repositories/base.repository.js';
+diff --git a/src/services/analytics.service.ts b/src/services/analytics.service.ts
+index f2fff7b..3bfa63a 100644
+--- a/src/services/analytics.service.ts
++++ b/src/services/analytics.service.ts
+@@ -9,57 +9,25 @@
+  * It queries the existing repositories and computes aggregations over
+  * the results. It does NOT subscribe to the EventBus — it pulls data
+  * on demand rather than maintaining a running aggregate.
+- *
+- * ============================================================
+- * IMPLEMENTATION GUIDE FOR NEXT DEVELOPER
+- * ============================================================
+- *
+- * Each public method currently returns placeholder data. To implement:
+- *
+- * 1. getDashboard():
+- *    - Call getMetricSummary() for each of the four metric types
+- *    - Call getOrderStatusBreakdown() and getRevenueBreakdown()
+- *    - Call getUserAnalytics()
+- *    - Assemble into a DashboardData object
+- *
+- * 2. getMetricSummary(query):
+- *    - Fetch orders/users from repositories filtered by query date range
+- *    - Compute the current-period value (e.g., count of orders, sum of revenue)
+- *    - Compute the previous-period value (same duration, shifted back)
+- *    - Build time series by bucketing records into the requested granularity
+- *    - Calculate changePercent and trend
+- *
+- * 3. getOrderStatusBreakdown(query):
+- *    - Fetch orders in the date range
+- *    - Group by status, count each, compute percentages
+- *
+- * 4. getRevenueBreakdown(query):
+- *    - Fetch orders in the date range
+- *    - Sum totals overall and by status
+- *    - Compute average order value
+- *
+- * 5. getUserAnalytics(query):
+- *    - Fetch users, filter by createdAt for new users
+- *    - Cross-reference with orders to find active users
+- *    - Group by role
+- *
+- * Time bucketing helper: Consider adding a utility in src/utils/
+- * that buckets an array of dated records into TimeSeriesPoint[].
+- * ============================================================
+  */
+ 
++import type { Order } from '../models/order.js';
++import type { User } from '../models/user.js';
+ import type { OrderRepository } from '../repositories/order.repository.js';
+ import type { UserRepository } from '../repositories/user.repository.js';
+ import type {
+   AnalyticsQuery,
+   MetricQuery,
+   MetricSummary,
++  MetricType,
+   DashboardData,
+   OrderStatusBreakdown,
+   RevenueBreakdown,
++  TimeGranularity,
+   UserAnalytics,
+ } from '../models/analytics.js';
+ import { Logger } from '../utils/logger.js';
++import { bucketByTime } from '../utils/time-series.js';
+ 
+ export class AnalyticsService {
+   private logger = new Logger('AnalyticsService');
+@@ -71,9 +39,6 @@ export class AnalyticsService {
+ 
+   /**
+    * Get the full dashboard data for a given time range.
+-   *
+-   * This is the primary entry point for the dashboard route.
+-   * It assembles all metrics into a single DashboardData response.
+    */
+   async getDashboard(query: AnalyticsQuery): Promise<DashboardData> {
+     this.logger.info(
+@@ -83,20 +48,23 @@ export class AnalyticsService {
+     const granularity = query.granularity ?? 'day';
+     const resolvedQuery: AnalyticsQuery = { ...query, granularity };
+ 
+-    // TODO: Replace placeholders with real aggregation (see implementation guide above)
+-    const [orders, revenue, users, averageOrderValue] = await Promise.all([
+-      this.getMetricSummary({ ...resolvedQuery, metricType: 'orders' }),
+-      this.getMetricSummary({ ...resolvedQuery, metricType: 'revenue' }),
+-      this.getMetricSummary({ ...resolvedQuery, metricType: 'users' }),
+-      this.getMetricSummary({ ...resolvedQuery, metricType: 'average-order-value' }),
+-    ]);
++    const [orders, revenue, users, averageOrderValue, orderStatusBreakdown, revenueBreakdown, userAnalytics] =
++      await Promise.all([
++        this.getMetricSummary({ ...resolvedQuery, metricType: 'orders' }),
++        this.getMetricSummary({ ...resolvedQuery, metricType: 'revenue' }),
++        this.getMetricSummary({ ...resolvedQuery, metricType: 'users' }),
++        this.getMetricSummary({ ...resolvedQuery, metricType: 'average-order-value' }),
++        this.getOrderStatusBreakdown(resolvedQuery),
++        this.getRevenueBreakdown(resolvedQuery),
++        this.getUserAnalytics(resolvedQuery),
++      ]);
+ 
+     return {
+       query: resolvedQuery,
+       metrics: { orders, revenue, users, averageOrderValue },
+-      orderStatusBreakdown: await this.getOrderStatusBreakdown(resolvedQuery),
+-      revenueBreakdown: await this.getRevenueBreakdown(resolvedQuery),
+-      userAnalytics: await this.getUserAnalytics(resolvedQuery),
++      orderStatusBreakdown,
++      revenueBreakdown,
++      userAnalytics,
+       generatedAt: new Date(),
+     };
+   }
+@@ -107,14 +75,34 @@ export class AnalyticsService {
+   async getMetricSummary(query: MetricQuery): Promise<MetricSummary> {
+     this.logger.info(`Computing metric summary: ${query.metricType}`);
+ 
+-    // TODO: Implement real aggregation from repositories
++    const granularity = query.granularity ?? 'day';
++    const { startDate, endDate, metricType } = query;
++
++    // Compute previous period (same duration, immediately before startDate)
++    const periodMs = endDate.getTime() - startDate.getTime();
++    const prevStart = new Date(startDate.getTime() - periodMs);
++    const prevEnd = new Date(startDate.getTime() - 1);
++
++    const currentValue = this.computeMetricValue(metricType, startDate, endDate);
++    const previousValue = this.computeMetricValue(metricType, prevStart, prevEnd);
++
++    const changePercent =
++      previousValue === 0
++        ? currentValue > 0 ? 100 : 0
++        : ((currentValue - previousValue) / previousValue) * 100;
++
++    const trend: MetricSummary['trend'] =
++      changePercent > 0 ? 'up' : changePercent < 0 ? 'down' : 'flat';
++
++    const timeSeries = this.buildTimeSeries(metricType, granularity, startDate, endDate);
++
+     return {
+-      metricType: query.metricType,
+-      currentValue: 0,
+-      previousValue: 0,
+-      changePercent: 0,
+-      trend: 'flat',
+-      timeSeries: [],
++      metricType,
++      currentValue: Math.round(currentValue * 100) / 100,
++      previousValue: Math.round(previousValue * 100) / 100,
++      changePercent: Math.round(changePercent * 100) / 100,
++      trend,
++      timeSeries,
+     };
+   }
+ 
+@@ -124,14 +112,23 @@ export class AnalyticsService {
+   async getOrderStatusBreakdown(query: AnalyticsQuery): Promise<OrderStatusBreakdown[]> {
+     this.logger.info('Computing order status breakdown');
+ 
+-    // TODO: Implement real aggregation from OrderRepository
+-    return [
+-      { status: 'pending', count: 0, percentage: 0 },
+-      { status: 'confirmed', count: 0, percentage: 0 },
+-      { status: 'shipped', count: 0, percentage: 0 },
+-      { status: 'delivered', count: 0, percentage: 0 },
+-      { status: 'cancelled', count: 0, percentage: 0 },
+-    ];
++    const orders = this.getOrdersInRange(query.startDate, query.endDate);
++    const total = orders.length;
++
++    const statusCounts = new Map<string, number>();
++    for (const order of orders) {
++      statusCounts.set(order.status, (statusCounts.get(order.status) ?? 0) + 1);
++    }
++
++    const allStatuses: Order['status'][] = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'];
++    return allStatuses.map((status) => {
++      const count = statusCounts.get(status) ?? 0;
++      return {
++        status,
++        count,
++        percentage: total > 0 ? Math.round((count / total) * 10000) / 100 : 0,
++      };
++    });
+   }
+ 
+   /**
+@@ -140,17 +137,23 @@ export class AnalyticsService {
+   async getRevenueBreakdown(query: AnalyticsQuery): Promise<RevenueBreakdown> {
+     this.logger.info('Computing revenue breakdown');
+ 
+-    // TODO: Implement real aggregation from OrderRepository
++    const orders = this.getOrdersInRange(query.startDate, query.endDate);
++    const totalRevenue = orders.reduce((sum, o) => sum + o.total, 0);
++    const averageOrderValue = orders.length > 0 ? totalRevenue / orders.length : 0;
++
++    const revenueByStatus = new Map<string, number>();
++    for (const order of orders) {
++      revenueByStatus.set(order.status, (revenueByStatus.get(order.status) ?? 0) + order.total);
++    }
++
++    const allStatuses: Order['status'][] = ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled'];
+     return {
+-      totalRevenue: 0,
+-      averageOrderValue: 0,
+-      byStatus: [
+-        { status: 'pending', revenue: 0 },
+-        { status: 'confirmed', revenue: 0 },
+-        { status: 'shipped', revenue: 0 },
+-        { status: 'delivered', revenue: 0 },
+-        { status: 'cancelled', revenue: 0 },
+-      ],
++      totalRevenue: Math.round(totalRevenue * 100) / 100,
++      averageOrderValue: Math.round(averageOrderValue * 100) / 100,
++      byStatus: allStatuses.map((status) => ({
++        status,
++        revenue: Math.round((revenueByStatus.get(status) ?? 0) * 100) / 100,
++      })),
+     };
+   }
+ 
+@@ -160,12 +163,143 @@ export class AnalyticsService {
+   async getUserAnalytics(query: AnalyticsQuery): Promise<UserAnalytics> {
+     this.logger.info('Computing user analytics');
+ 
+-    // TODO: Implement real aggregation from UserRepository and OrderRepository
++    const { startDate, endDate } = query;
++    const allUsers = this.userRepository.findAll();
++    const newUsers = allUsers.filter(
++      (u) => u.createdAt >= startDate && u.createdAt <= endDate,
++    );
++
++    // Active users: users who placed at least one order in the period
++    const ordersInRange = this.getOrdersInRange(startDate, endDate);
++    const activeUserIds = new Set(ordersInRange.map((o) => o.userId));
++    const activeUsersInPeriod = activeUserIds.size;
++
++    // Role breakdown (all users, not just new)
++    const roleCounts = new Map<string, number>();
++    for (const user of allUsers) {
++      roleCounts.set(user.role, (roleCounts.get(user.role) ?? 0) + 1);
++    }
++
++    const byRole = [...roleCounts.entries()].map(([role, count]) => ({ role, count }));
++
+     return {
+-      totalUsers: 0,
+-      newUsersInPeriod: 0,
+-      activeUsersInPeriod: 0,
+-      byRole: [],
++      totalUsers: allUsers.length,
++      newUsersInPeriod: newUsers.length,
++      activeUsersInPeriod,
++      byRole,
+     };
+   }
++
++  // ---------------------------------------------------------------------------
++  // Private helpers
++  // ---------------------------------------------------------------------------
++
++  private getOrdersInRange(startDate: Date, endDate: Date): Order[] {
++    return this.orderRepository.findAll(
++      (order) => order.createdAt >= startDate && order.createdAt <= endDate,
++    );
++  }
++
++  private getUsersInRange(startDate: Date, endDate: Date): User[] {
++    return this.userRepository.findAll(
++      (user) => user.createdAt >= startDate && user.createdAt <= endDate,
++    );
++  }
++
++  private computeMetricValue(
++    metricType: MetricType,
++    startDate: Date,
++    endDate: Date,
++  ): number {
++    switch (metricType) {
++      case 'orders':
++        return this.getOrdersInRange(startDate, endDate).length;
++      case 'revenue':
++        return this.getOrdersInRange(startDate, endDate).reduce(
++          (sum, o) => sum + o.total,
++          0,
++        );
++      case 'users':
++        return this.getUsersInRange(startDate, endDate).length;
++      case 'average-order-value': {
++        const orders = this.getOrdersInRange(startDate, endDate);
++        if (orders.length === 0) return 0;
++        const total = orders.reduce((sum, o) => sum + o.total, 0);
++        return total / orders.length;
++      }
++    }
++  }
++
++  private buildTimeSeries(
++    metricType: MetricType,
++    granularity: TimeGranularity,
++    startDate: Date,
++    endDate: Date,
++  ) {
++    switch (metricType) {
++      case 'orders':
++        return bucketByTime(
++          this.getOrdersInRange(startDate, endDate),
++          (o) => o.createdAt,
++          () => 1,
++          granularity,
++          startDate,
++          endDate,
++        );
++      case 'revenue':
++        return bucketByTime(
++          this.getOrdersInRange(startDate, endDate),
++          (o) => o.createdAt,
++          (o) => o.total,
++          granularity,
++          startDate,
++          endDate,
++        );
++      case 'users':
++        return bucketByTime(
++          this.getUsersInRange(startDate, endDate),
++          (u) => u.createdAt,
++          () => 1,
++          granularity,
++          startDate,
++          endDate,
++        );
++      case 'average-order-value':
++        // For AOV time series, show per-bucket average
++        return this.buildAovTimeSeries(granularity, startDate, endDate);
++    }
++  }
++
++  private buildAovTimeSeries(
++    granularity: TimeGranularity,
++    startDate: Date,
++    endDate: Date,
++  ) {
++    const orders = this.getOrdersInRange(startDate, endDate);
++    const revenueSeries = bucketByTime(
++      orders,
++      (o) => o.createdAt,
++      (o) => o.total,
++      granularity,
++      startDate,
++      endDate,
++    );
++    const countSeries = bucketByTime(
++      orders,
++      (o) => o.createdAt,
++      () => 1,
++      granularity,
++      startDate,
++      endDate,
++    );
++
++    return revenueSeries.map((point, i) => ({
++      timestamp: point.timestamp,
++      value:
++        countSeries[i].value > 0
++          ? Math.round((point.value / countSeries[i].value) * 100) / 100
++          : 0,
++      label: point.label,
++    }));
++  }
+ }
+diff --git a/src/utils/time-series.ts b/src/utils/time-series.ts
+new file mode 100644
+index 0000000..9629963
+--- /dev/null
++++ b/src/utils/time-series.ts
+@@ -0,0 +1,120 @@
++import type { TimeGranularity, TimeSeriesPoint } from '../models/analytics.js';
++
++/**
++ * Get the start of the time bucket that contains the given date,
++ * based on the specified granularity.
++ */
++function getBucketStart(date: Date, granularity: TimeGranularity): Date {
++  const d = new Date(date);
++  switch (granularity) {
++    case 'hour':
++      d.setMinutes(0, 0, 0);
++      return d;
++    case 'day':
++      d.setHours(0, 0, 0, 0);
++      return d;
++    case 'week': {
++      d.setHours(0, 0, 0, 0);
++      const day = d.getDay();
++      d.setDate(d.getDate() - day);
++      return d;
++    }
++    case 'month':
++      d.setHours(0, 0, 0, 0);
++      d.setDate(1);
++      return d;
++  }
++}
++
++/**
++ * Advance a date by one granularity unit.
++ */
++function advanceBucket(date: Date, granularity: TimeGranularity): Date {
++  const d = new Date(date);
++  switch (granularity) {
++    case 'hour':
++      d.setHours(d.getHours() + 1);
++      return d;
++    case 'day':
++      d.setDate(d.getDate() + 1);
++      return d;
++    case 'week':
++      d.setDate(d.getDate() + 7);
++      return d;
++    case 'month':
++      d.setMonth(d.getMonth() + 1);
++      return d;
++  }
++}
++
++/**
++ * Format a bucket timestamp as a human-readable label.
++ */
++function formatBucketLabel(date: Date, granularity: TimeGranularity): string {
++  switch (granularity) {
++    case 'hour':
++      return date.toISOString().slice(0, 13) + ':00';
++    case 'day':
++      return date.toISOString().slice(0, 10);
++    case 'week':
++      return `Week of ${date.toISOString().slice(0, 10)}`;
++    case 'month':
++      return date.toISOString().slice(0, 7);
++  }
++}
++
++/**
++ * Bucket an array of items into a time series of aggregated values.
++ *
++ * Generates a complete series between startDate and endDate with
++ * zero-filled gaps, which is important for consistent charting.
++ *
++ * @param items - The items to bucket
++ * @param getTimestamp - Extract the timestamp from an item
++ * @param getValue - Extract the numeric value from an item (summed per bucket)
++ * @param granularity - The time bucket size
++ * @param startDate - Start of the range (inclusive)
++ * @param endDate - End of the range (inclusive)
++ */
++export function bucketByTime<T>(
++  items: T[],
++  getTimestamp: (item: T) => Date,
++  getValue: (item: T) => number,
++  granularity: TimeGranularity,
++  startDate: Date,
++  endDate: Date,
++): TimeSeriesPoint[] {
++  // Build the bucket map keyed by bucket start timestamp
++  const bucketMap = new Map<number, number>();
++
++  // Generate all bucket slots (zero-filled)
++  let cursor = getBucketStart(new Date(startDate), granularity);
++  while (cursor <= endDate) {
++    bucketMap.set(cursor.getTime(), 0);
++    cursor = advanceBucket(cursor, granularity);
++  }
++
++  // Distribute items into buckets
++  for (const item of items) {
++    const ts = getTimestamp(item);
++    if (ts < startDate || ts > endDate) continue;
++    const bucketStart = getBucketStart(ts, granularity);
++    const key = bucketStart.getTime();
++    const existing = bucketMap.get(key) ?? 0;
++    bucketMap.set(key, existing + getValue(item));
++  }
++
++  // Convert to sorted TimeSeriesPoint array
++  const points: TimeSeriesPoint[] = [];
++  const sortedKeys = [...bucketMap.keys()].sort((a, b) => a - b);
++  for (const key of sortedKeys) {
++    const timestamp = new Date(key);
++    points.push({
++      timestamp,
++      value: bucketMap.get(key)!,
++      label: formatBucketLabel(timestamp, granularity),
++    });
++  }
++
++  return points;
++}

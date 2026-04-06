@@ -1,0 +1,509 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index cd0afb9..b8fc57d 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -1,9 +1,8 @@
+ /**
+  * Notification service — handles sending notifications in response to events.
+  *
+- * Uses an internal EventBus to dispatch notification events to channel handlers.
+- * Channel handlers (e.g., EmailNotificationChannel) subscribe to the notification
+- * bus and deliver messages through their respective transports.
++ * Uses a PriorityRouter to dispatch notifications to the appropriate channel
++ * based on priority level (urgent → SMS, normal → email, low → webhook).
+  *
+  * NOTE: This service currently uses TWO different patterns for receiving
+  * notifications, which is inconsistent and should be unified:
+@@ -11,20 +10,17 @@
+  * 1. EventBus subscriptions (event-driven) — used for order:created events
+  * 2. CallbackRegistry (direct callbacks) — used for order:status-changed events
+  *
+- * Both approaches work but the mixed usage makes the codebase harder to
+- * maintain. A future refactor should pick ONE approach and use it consistently.
+- *
+  * Depends on:
+  * - EventBus (event system) for receiving some events
+  * - CallbackRegistry (direct callbacks) for other events
+- * - SimpleEventBus (notification dispatch) for channel-based delivery
++ * - PriorityRouter for priority-based channel routing
+  */
+ 
+ import type { EventBus } from '../events/event-bus.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../events/event-types.js';
+ import { statusChangeCallbacks } from '../utils/callback-registry.js';
+-import { SimpleEventBus } from '../utils/event-bus.js';
+ import { Logger } from '../utils/logger.js';
++import type { NotificationPriority, PriorityRouter } from './priority-router.js';
+ 
+ /**
+  * Event payload dispatched to notification channels via the internal bus.
+@@ -34,6 +30,7 @@ export interface NotificationEvent {
+   recipient: string;
+   subject: string;
+   body: string;
++  priority: NotificationPriority;
+ }
+ 
+ /**
+@@ -66,6 +63,50 @@ export class EmailNotificationChannel implements NotificationChannel {
+   }
+ }
+ 
++/**
++ * SMS notification channel — delivers notifications via SMS.
++ * Stores delivered messages in-memory for testability.
++ */
++export class SmsNotificationChannel implements NotificationChannel {
++  private deliveredMessages: NotificationEvent[] = [];
++  private logger = new Logger('SmsChannel');
++
++  handle(event: NotificationEvent): void {
++    this.logger.info(`Sending SMS to ${event.recipient}: ${event.subject}`);
++    this.deliveredMessages.push({ ...event });
++  }
++
++  getDeliveredMessages(): NotificationEvent[] {
++    return [...this.deliveredMessages];
++  }
++
++  clearDeliveredMessages(): void {
++    this.deliveredMessages = [];
++  }
++}
++
++/**
++ * Webhook notification channel — delivers notifications via webhook.
++ * Stores delivered payloads in-memory for testability.
++ */
++export class WebhookNotificationChannel implements NotificationChannel {
++  private deliveredPayloads: NotificationEvent[] = [];
++  private logger = new Logger('WebhookChannel');
++
++  handle(event: NotificationEvent): void {
++    this.logger.info(`Sending webhook for ${event.recipient}: ${event.subject}`);
++    this.deliveredPayloads.push({ ...event });
++  }
++
++  getDeliveredPayloads(): NotificationEvent[] {
++    return [...this.deliveredPayloads];
++  }
++
++  clearDeliveredPayloads(): void {
++    this.deliveredPayloads = [];
++  }
++}
++
+ export interface Notification {
+   id: string;
+   recipient: string;
+@@ -87,25 +128,14 @@ export function resetNotificationIdCounter(): void {
+ export class NotificationService {
+   private logger = new Logger('NotificationService');
+   private notifications: Notification[] = [];
+-  private notificationBus = new SimpleEventBus();
++  private priorityRouter: PriorityRouter | null;
+ 
+   constructor(
+     private eventBus: EventBus,
+-    channels: NotificationChannel[] = [],
++    priorityRouter: PriorityRouter | null = null,
+   ) {
++    this.priorityRouter = priorityRouter;
+     this.registerHandlers();
+-    this.registerChannels(channels);
+-  }
+-
+-  /**
+-   * Register notification channels on the internal bus.
+-   */
+-  private registerChannels(channels: NotificationChannel[]): void {
+-    for (const channel of channels) {
+-      this.notificationBus.subscribe('notification', (data) => {
+-        return channel.handle(data as NotificationEvent);
+-      });
+-    }
+   }
+ 
+   /**
+@@ -141,6 +171,7 @@ export class NotificationService {
+       recipient: event.user.email,
+       subject: `Order Confirmation: ${event.order.id}`,
+       body: `Your order has been placed. Items: ${itemSummary}. Total: $${event.order.total.toFixed(2)}`,
++      priority: 'normal',
+     });
+   }
+ 
+@@ -157,17 +188,19 @@ export class NotificationService {
+       recipient: event.order.userId,
+       subject: `Order Update: ${event.order.id}`,
+       body: `Your order status has changed from ${event.previousStatus} to ${event.newStatus}.`,
++      priority: 'urgent',
+     });
+   }
+ 
+   /**
+-   * Send a notification: store in-memory and dispatch to channels via the notification bus.
++   * Send a notification: store in-memory and route to the appropriate channel via priority.
+    */
+   private sendNotification(params: {
+     type: string;
+     recipient: string;
+     subject: string;
+     body: string;
++    priority: NotificationPriority;
+   }): void {
+     const notification: Notification = {
+       id: generateNotificationId(),
+@@ -177,16 +210,19 @@ export class NotificationService {
+       sentAt: new Date(),
+     };
+     this.notifications.push(notification);
+-    this.logger.info(`Notification sent: ${notification.id} to ${params.recipient}`);
+-
+-    // Dispatch to registered channels
+-    const event: NotificationEvent = {
+-      type: params.type,
+-      recipient: params.recipient,
+-      subject: params.subject,
+-      body: params.body,
+-    };
+-    void this.notificationBus.publish('notification', event);
++    this.logger.info(`Notification sent: ${notification.id} to ${params.recipient} [${params.priority}]`);
++
++    // Route to the appropriate channel based on priority
++    if (this.priorityRouter) {
++      const event: NotificationEvent = {
++        type: params.type,
++        recipient: params.recipient,
++        subject: params.subject,
++        body: params.body,
++        priority: params.priority,
++      };
++      void this.priorityRouter.route({ ...event, priority: params.priority });
++    }
+   }
+ 
+   /**
+diff --git a/src/services/priority-router.ts b/src/services/priority-router.ts
+new file mode 100644
+index 0000000..32a8f91
+--- /dev/null
++++ b/src/services/priority-router.ts
+@@ -0,0 +1,56 @@
++/**
++ * Priority-based notification router.
++ *
++ * Routes notifications to specific channel handlers based on priority:
++ * - urgent → SMS channel
++ * - normal → email channel
++ * - low → webhook channel
++ *
++ * This replaces the previous broadcast approach where all channels
++ * received every notification regardless of priority.
++ */
++
++import type { NotificationChannel, NotificationEvent } from './notification.service.js';
++import { Logger } from '../utils/logger.js';
++
++export type NotificationPriority = 'urgent' | 'normal' | 'low';
++
++export interface PrioritizedNotification extends NotificationEvent {
++  priority: NotificationPriority;
++}
++
++export class PriorityRouter {
++  private logger = new Logger('PriorityRouter');
++  private routes = new Map<NotificationPriority, NotificationChannel>();
++
++  /**
++   * Register a channel handler for a specific priority level.
++   */
++  registerRoute(priority: NotificationPriority, channel: NotificationChannel): void {
++    this.routes.set(priority, channel);
++    this.logger.info(`Registered channel for priority: ${priority}`);
++  }
++
++  /**
++   * Route a notification to the appropriate channel based on its priority.
++   * Throws if no channel is registered for the given priority.
++   */
++  async route(notification: PrioritizedNotification): Promise<void> {
++    const channel = this.routes.get(notification.priority);
++    if (!channel) {
++      throw new Error(`No channel registered for priority: ${notification.priority}`);
++    }
++
++    this.logger.info(
++      `Routing ${notification.priority} notification to registered channel: ${notification.subject}`,
++    );
++    await channel.handle(notification);
++  }
++
++  /**
++   * Check whether a channel is registered for the given priority.
++   */
++  hasRoute(priority: NotificationPriority): boolean {
++    return this.routes.has(priority);
++  }
++}
+diff --git a/tests/services/email-notification.test.ts b/tests/services/email-notification.test.ts
+index 1926ecb..f21dbc9 100644
+--- a/tests/services/email-notification.test.ts
++++ b/tests/services/email-notification.test.ts
+@@ -3,26 +3,41 @@ import { EventBus } from '../../src/events/event-bus.js';
+ import {
+   NotificationService,
+   EmailNotificationChannel,
++  SmsNotificationChannel,
++  WebhookNotificationChannel,
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import type { NotificationEvent } from '../../src/services/notification.service.js';
++import { PriorityRouter } from '../../src/services/priority-router.js';
+ import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+-describe('Email Notification Channel', () => {
++describe('Priority-Based Channel Routing', () => {
+   let eventBus: EventBus;
++  let router: PriorityRouter;
+   let emailChannel: EmailNotificationChannel;
++  let smsChannel: SmsNotificationChannel;
++  let webhookChannel: WebhookNotificationChannel;
+   let service: NotificationService;
+ 
+   beforeEach(() => {
+     eventBus = new EventBus();
+     statusChangeCallbacks.clear();
++
+     emailChannel = new EmailNotificationChannel();
+-    service = new NotificationService(eventBus, [emailChannel]);
++    smsChannel = new SmsNotificationChannel();
++    webhookChannel = new WebhookNotificationChannel();
++
++    router = new PriorityRouter();
++    router.registerRoute('urgent', smsChannel);
++    router.registerRoute('normal', emailChannel);
++    router.registerRoute('low', webhookChannel);
++
++    service = new NotificationService(eventBus, router);
+     resetNotificationIdCounter();
+   });
+ 
+-  it('should deliver order confirmation emails via the email channel', async () => {
++  it('should route order confirmation (normal priority) to email channel', async () => {
+     const event: OrderCreatedEvent = {
+       type: 'order:created',
+       order: {
+@@ -56,9 +71,13 @@ describe('Email Notification Channel', () => {
+     expect(emails[0]?.subject).toContain('Order Confirmation');
+     expect(emails[0]?.body).toContain('Widget x2');
+     expect(emails[0]?.body).toContain('$20.00');
++
++    // Should NOT go to SMS or webhook
++    expect(smsChannel.getDeliveredMessages()).toHaveLength(0);
++    expect(webhookChannel.getDeliveredPayloads()).toHaveLength(0);
+   });
+ 
+-  it('should deliver status update emails via the email channel', () => {
++  it('should route status update (urgent priority) to SMS channel', () => {
+     const event: OrderStatusChangedEvent = {
+       type: 'order:status-changed',
+       order: {
+@@ -77,56 +96,20 @@ describe('Email Notification Channel', () => {
+ 
+     statusChangeCallbacks.notify(event);
+ 
+-    const emails = emailChannel.getDeliveredEmails();
+-    expect(emails).toHaveLength(1);
+-    expect(emails[0]?.type).toBe('order:status-update');
+-    expect(emails[0]?.recipient).toBe('user-1');
+-    expect(emails[0]?.subject).toContain('Order Update');
+-    expect(emails[0]?.body).toContain('pending');
+-    expect(emails[0]?.body).toContain('confirmed');
+-  });
+-
+-  it('should support multiple channels simultaneously', async () => {
+-    // Use a fresh EventBus so only multiService is subscribed
+-    const freshBus = new EventBus();
+-    const channelA = new EmailNotificationChannel();
+-    const channelB = new EmailNotificationChannel();
+-    const multiService = new NotificationService(freshBus, [channelA, channelB]);
++    const messages = smsChannel.getDeliveredMessages();
++    expect(messages).toHaveLength(1);
++    expect(messages[0]?.type).toBe('order:status-update');
++    expect(messages[0]?.recipient).toBe('user-1');
++    expect(messages[0]?.subject).toContain('Order Update');
++    expect(messages[0]?.body).toContain('pending');
++    expect(messages[0]?.body).toContain('confirmed');
+ 
+-    const event: OrderCreatedEvent = {
+-      type: 'order:created',
+-      order: {
+-        id: 'order-1',
+-        userId: 'user-1',
+-        items: [
+-          { productId: 'p1', name: 'Gadget', quantity: 1, unitPrice: 50 },
+-        ],
+-        total: 50,
+-        status: 'pending',
+-        createdAt: new Date(),
+-        updatedAt: new Date(),
+-      },
+-      user: {
+-        id: 'user-1',
+-        name: 'Bob',
+-        email: 'bob@example.com',
+-        role: 'member',
+-        createdAt: new Date(),
+-        updatedAt: new Date(),
+-      },
+-      timestamp: new Date(),
+-    };
+-
+-    await freshBus.emit(event);
+-
+-    expect(channelA.getDeliveredEmails()).toHaveLength(1);
+-    expect(channelB.getDeliveredEmails()).toHaveLength(1);
+-
+-    // Suppress unused variable warning
+-    void multiService;
++    // Should NOT go to email or webhook
++    expect(emailChannel.getDeliveredEmails()).toHaveLength(0);
++    expect(webhookChannel.getDeliveredPayloads()).toHaveLength(0);
+   });
+ 
+-  it('should work with custom NotificationChannel implementations', async () => {
++  it('should support custom NotificationChannel implementations via router', async () => {
+     const captured: NotificationEvent[] = [];
+     const customChannel = {
+       handle(event: NotificationEvent) {
+@@ -134,7 +117,9 @@ describe('Email Notification Channel', () => {
+       },
+     };
+ 
+-    const customService = new NotificationService(eventBus, [customChannel]);
++    const customRouter = new PriorityRouter();
++    customRouter.registerRoute('normal', customChannel);
++    const customService = new NotificationService(eventBus, customRouter);
+ 
+     const event: OrderCreatedEvent = {
+       type: 'order:created',
+diff --git a/tests/services/priority-router.test.ts b/tests/services/priority-router.test.ts
+new file mode 100644
+index 0000000..42b8e4d
+--- /dev/null
++++ b/tests/services/priority-router.test.ts
+@@ -0,0 +1,112 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { PriorityRouter } from '../../src/services/priority-router.js';
++import type { PrioritizedNotification } from '../../src/services/priority-router.js';
++import {
++  EmailNotificationChannel,
++  SmsNotificationChannel,
++  WebhookNotificationChannel,
++} from '../../src/services/notification.service.js';
++
++describe('PriorityRouter', () => {
++  let router: PriorityRouter;
++  let smsChannel: SmsNotificationChannel;
++  let emailChannel: EmailNotificationChannel;
++  let webhookChannel: WebhookNotificationChannel;
++
++  beforeEach(() => {
++    router = new PriorityRouter();
++    smsChannel = new SmsNotificationChannel();
++    emailChannel = new EmailNotificationChannel();
++    webhookChannel = new WebhookNotificationChannel();
++
++    router.registerRoute('urgent', smsChannel);
++    router.registerRoute('normal', emailChannel);
++    router.registerRoute('low', webhookChannel);
++  });
++
++  function makeNotification(priority: PrioritizedNotification['priority']): PrioritizedNotification {
++    return {
++      type: 'test',
++      recipient: 'user@example.com',
++      subject: 'Test Subject',
++      body: 'Test body',
++      priority,
++    };
++  }
++
++  describe('routing by priority', () => {
++    it('should route urgent notifications to SMS channel', async () => {
++      await router.route(makeNotification('urgent'));
++
++      expect(smsChannel.getDeliveredMessages()).toHaveLength(1);
++      expect(emailChannel.getDeliveredEmails()).toHaveLength(0);
++      expect(webhookChannel.getDeliveredPayloads()).toHaveLength(0);
++    });
++
++    it('should route normal notifications to email channel', async () => {
++      await router.route(makeNotification('normal'));
++
++      expect(smsChannel.getDeliveredMessages()).toHaveLength(0);
++      expect(emailChannel.getDeliveredEmails()).toHaveLength(1);
++      expect(webhookChannel.getDeliveredPayloads()).toHaveLength(0);
++    });
++
++    it('should route low-priority notifications to webhook channel', async () => {
++      await router.route(makeNotification('low'));
++
++      expect(smsChannel.getDeliveredMessages()).toHaveLength(0);
++      expect(emailChannel.getDeliveredEmails()).toHaveLength(0);
++      expect(webhookChannel.getDeliveredPayloads()).toHaveLength(1);
++    });
++  });
++
++  describe('route registration', () => {
++    it('should report registered routes via hasRoute', () => {
++      const emptyRouter = new PriorityRouter();
++      expect(emptyRouter.hasRoute('urgent')).toBe(false);
++
++      emptyRouter.registerRoute('urgent', smsChannel);
++      expect(emptyRouter.hasRoute('urgent')).toBe(true);
++    });
++
++    it('should throw when routing to an unregistered priority', async () => {
++      const emptyRouter = new PriorityRouter();
++
++      await expect(emptyRouter.route(makeNotification('urgent'))).rejects.toThrow(
++        'No channel registered for priority: urgent',
++      );
++    });
++  });
++
++  describe('notification delivery', () => {
++    it('should pass full notification payload to the channel', async () => {
++      const notification: PrioritizedNotification = {
++        type: 'order:confirmation',
++        recipient: 'alice@example.com',
++        subject: 'Order Confirmed',
++        body: 'Your order is confirmed.',
++        priority: 'normal',
++      };
++
++      await router.route(notification);
++
++      const emails = emailChannel.getDeliveredEmails();
++      expect(emails).toHaveLength(1);
++      expect(emails[0]?.type).toBe('order:confirmation');
++      expect(emails[0]?.recipient).toBe('alice@example.com');
++      expect(emails[0]?.subject).toBe('Order Confirmed');
++      expect(emails[0]?.body).toBe('Your order is confirmed.');
++    });
++
++    it('should handle multiple notifications across priorities', async () => {
++      await router.route(makeNotification('urgent'));
++      await router.route(makeNotification('normal'));
++      await router.route(makeNotification('low'));
++      await router.route(makeNotification('urgent'));
++
++      expect(smsChannel.getDeliveredMessages()).toHaveLength(2);
++      expect(emailChannel.getDeliveredEmails()).toHaveLength(1);
++      expect(webhookChannel.getDeliveredPayloads()).toHaveLength(1);
++    });
++  });
++});

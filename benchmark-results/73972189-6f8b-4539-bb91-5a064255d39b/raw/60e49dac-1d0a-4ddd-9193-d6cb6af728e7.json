@@ -1,0 +1,453 @@
+{
+  "compactionCount": 0,
+  "condition": "shared-markdown",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/COORDINATION.md b/COORDINATION.md\nindex a6d7035..a353b81 100644\n--- a/COORDINATION.md\n+++ b/COORDINATION.md\n@@ -66,3 +66,50 @@ Domain Services ──emit()──▶ EventBus ──subscribe──▶ Notifica\n - **Created:** `src/models/notification.ts`, `src/adapters/notification.adapter.ts`, `src/adapters/email.adapter.ts`\n - **Modified:** `src/services/notification.service.ts`, `src/services/order.service.ts`, `src/index.ts`, `tests/services/notification.service.test.ts`, `tests/services/order.service.test.ts`\n \n+---\n+\n+## Agent 2 — Email Notification Adapter (completed)\n+\n+### What was done\n+\n+Replaced the stub email adapter with a full implementation featuring:\n+\n+1. **Template rendering** — Each `NotificationType` (`order_confirmation`, `order_status_update`, `user_welcome`, `user_updated`) has its own template renderer producing both **plain text** and **HTML** bodies. HTML output is XSS-safe (escapes `<`, `>`, `&`, `\"`).\n+\n+2. **Recipient validation** — `send()` validates the recipient email format before attempting delivery. Invalid addresses return `{ success: false, error }` without touching the transport.\n+\n+3. **Pluggable transport abstraction** — Introduced `EmailTransport` interface with a default `InMemoryEmailTransport` for testing. Production code can swap in an SMTP/SendGrid/SES transport without changing the adapter.\n+\n+4. **Configurable settings** — `EmailConfig` with `fromAddress`, `replyTo`, and `maxRetries`. Defaults to `noreply@taskflowpro.com` and 2 retries.\n+\n+5. **Retry logic** — Transport failures are retried up to `maxRetries` times before returning failure.\n+\n+6. **`RenderedEmail` type** — Full email representation with `to`, `from`, `replyTo`, `subject`, `textBody`, `htmlBody`. The `renderEmail()` method is public for testing.\n+\n+7. **Updated `SentEmail`** — Now includes `from`, `textBody`, `htmlBody` fields (previously just `to`, `subject`, `body`).\n+\n+8. **23 unit tests** in `tests/adapters/email.adapter.test.ts` covering:\n+   - Basic delivery\n+   - From/replyTo configuration\n+   - Recipient validation (empty, no @, no domain, valid)\n+   - Template rendering for all 4 notification types\n+   - HTML escaping (XSS prevention)\n+   - Metadata inclusion in templates\n+   - Retry logic (retry success, retry exhaustion, first-attempt success)\n+   - Config access, clearing, channel identity\n+   - InMemoryEmailTransport standalone tests\n+\n+### Constraints for other agents\n+\n+- **The adapter interface is unchanged.** `EmailNotificationAdapter` still implements `NotificationAdapter` with `channel` and `send()`.\n+- **`getSentEmails()` still works** for existing tests but now returns `SentEmail` with `from`, `textBody`, `htmlBody` instead of the old `body` field.\n+- **To use a custom transport:** Pass it as the second constructor arg: `new EmailNotificationAdapter(config, transport)`.\n+- **To add a new notification type template:** Add an entry to the `EMAIL_TEMPLATES` record in `src/adapters/email.adapter.ts`.\n+\n+### Files created/modified\n+- **Modified:** `src/adapters/email.adapter.ts` (full rewrite), `src/index.ts` (new exports)\n+- **Created:** `tests/adapters/email.adapter.test.ts`\n+\n+### Test status\n+All 94 tests pass (71 existing + 23 new).\n+\n",
+      "linesAdded": 47,
+      "linesRemoved": 0,
+      "path": "COORDINATION.md"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts\nindex d6e2206..91dca1f 100644\n--- a/src/adapters/email.adapter.ts\n+++ b/src/adapters/email.adapter.ts\n@@ -1,69 +1,340 @@\n /**\n  * Email notification adapter.\n  *\n- * Implements NotificationAdapter for the 'email' channel. In production this\n- * would integrate with an SMTP service or transactional email API (SendGrid,\n- * SES, etc.). The current implementation is a stub that logs delivery and\n- * records sent messages in memory for testing.\n+ * Implements NotificationAdapter for the 'email' channel with:\n+ * - Template rendering per notification type (HTML + plain text)\n+ * - Recipient email validation\n+ * - Configurable SMTP settings (from address, reply-to, etc.)\n+ * - Retry support with configurable max attempts\n+ *\n+ * In production the transport would integrate with SMTP / SendGrid / SES.\n+ * The default transport stores emails in memory for testing.\n  */\n \n import type { NotificationAdapter, DeliveryResult } from './notification.adapter.js';\n-import type { NotificationPayload, NotificationChannel } from '../models/notification.js';\n+import type {\n+  NotificationPayload,\n+  NotificationChannel,\n+  NotificationType,\n+} from '../models/notification.js';\n import { Logger } from '../utils/logger.js';\n \n+// ---------------------------------------------------------------------------\n+// Configuration\n+// ---------------------------------------------------------------------------\n+\n+export interface EmailConfig {\n+  /** Sender address shown in the \"From\" header. */\n+  fromAddress: string;\n+  /** Optional reply-to address. Defaults to fromAddress. */\n+  replyTo?: string;\n+  /** Maximum delivery attempts before giving up. */\n+  maxRetries: number;\n+}\n+\n+const DEFAULT_EMAIL_CONFIG: EmailConfig = {\n+  fromAddress: 'noreply@taskflowpro.com',\n+  maxRetries: 2,\n+};\n+\n+// ---------------------------------------------------------------------------\n+// Email template types\n+// ---------------------------------------------------------------------------\n+\n+export interface RenderedEmail {\n+  to: string;\n+  from: string;\n+  replyTo: string;\n+  subject: string;\n+  textBody: string;\n+  htmlBody: string;\n+}\n+\n /**\n- * Record of an email that was \"sent\" (stored in memory).\n+ * Record of a successfully sent email — includes rendered content.\n  */\n export interface SentEmail {\n   to: string;\n+  from: string;\n   subject: string;\n-  body: string;\n+  textBody: string;\n+  htmlBody: string;\n   sentAt: Date;\n }\n \n+// ---------------------------------------------------------------------------\n+// Transport abstraction\n+// ---------------------------------------------------------------------------\n+\n+/**\n+ * Pluggable transport that actually delivers the email.\n+ * The default implementation stores emails in memory (for testing).\n+ * In production, swap this for an SMTP or API-backed transport.\n+ */\n+export interface EmailTransport {\n+  deliver(email: RenderedEmail): Promise<void>;\n+}\n+\n+/**\n+ * In-memory transport — stores delivered emails for inspection in tests.\n+ */\n+export class InMemoryEmailTransport implements EmailTransport {\n+  private deliveredEmails: SentEmail[] = [];\n+\n+  async deliver(email: RenderedEmail): Promise<void> {\n+    this.deliveredEmails.push({\n+      to: email.to,\n+      from: email.from,\n+      subject: email.subject,\n+      textBody: email.textBody,\n+      htmlBody: email.htmlBody,\n+      sentAt: new Date(),\n+    });\n+  }\n+\n+  getDeliveredEmails(): SentEmail[] {\n+    return [...this.deliveredEmails];\n+  }\n+\n+  clear(): void {\n+    this.deliveredEmails = [];\n+  }\n+}\n+\n+// ---------------------------------------------------------------------------\n+// Template rendering\n+// ---------------------------------------------------------------------------\n+\n+type TemplateRenderer = (payload: NotificationPayload) => { text: string; html: string };\n+\n+const EMAIL_TEMPLATES: Record<NotificationType, TemplateRenderer> = {\n+  order_confirmation(payload) {\n+    const text = [\n+      `Hi,`,\n+      ``,\n+      `${payload.body}`,\n+      ``,\n+      payload.metadata?.orderId ? `Order ID: ${payload.metadata.orderId}` : '',\n+      ``,\n+      `Thank you for your order!`,\n+      `— The TaskFlow Pro Team`,\n+    ]\n+      .filter(Boolean)\n+      .join('\\n');\n+\n+    const html = [\n+      `<h1>Order Confirmation</h1>`,\n+      `<p>${escapeHtml(payload.body)}</p>`,\n+      payload.metadata?.orderId\n+        ? `<p><strong>Order ID:</strong> ${escapeHtml(payload.metadata.orderId)}</p>`\n+        : '',\n+      `<p>Thank you for your order!</p>`,\n+      `<p>&mdash; The TaskFlow Pro Team</p>`,\n+    ]\n+      .filter(Boolean)\n+      .join('\\n');\n+\n+    return { text, html };\n+  },\n+\n+  order_status_update(payload) {\n+    const text = [\n+      `Hi,`,\n+      ``,\n+      `${payload.body}`,\n+      ``,\n+      payload.metadata?.orderId ? `Order ID: ${payload.metadata.orderId}` : '',\n+      ``,\n+      `— The TaskFlow Pro Team`,\n+    ]\n+      .filter(Boolean)\n+      .join('\\n');\n+\n+    const html = [\n+      `<h1>Order Status Update</h1>`,\n+      `<p>${escapeHtml(payload.body)}</p>`,\n+      payload.metadata?.orderId\n+        ? `<p><strong>Order ID:</strong> ${escapeHtml(payload.metadata.orderId)}</p>`\n+        : '',\n+      `<p>&mdash; The TaskFlow Pro Team</p>`,\n+    ]\n+      .filter(Boolean)\n+      .join('\\n');\n+\n+    return { text, html };\n+  },\n+\n+  user_welcome(payload) {\n+    const text = [\n+      `Welcome to TaskFlow Pro!`,\n+      ``,\n+      `${payload.body}`,\n+      ``,\n+      `If you have any questions, just reply to this email.`,\n+      `— The TaskFlow Pro Team`,\n+    ].join('\\n');\n+\n+    const html = [\n+      `<h1>Welcome to TaskFlow Pro!</h1>`,\n+      `<p>${escapeHtml(payload.body)}</p>`,\n+      `<p>If you have any questions, just reply to this email.</p>`,\n+      `<p>&mdash; The TaskFlow Pro Team</p>`,\n+    ].join('\\n');\n+\n+    return { text, html };\n+  },\n+\n+  user_updated(payload) {\n+    const text = [\n+      `Hi,`,\n+      ``,\n+      `${payload.body}`,\n+      ``,\n+      `If you did not make this change, please contact support immediately.`,\n+      `— The TaskFlow Pro Team`,\n+    ].join('\\n');\n+\n+    const html = [\n+      `<h1>Account Updated</h1>`,\n+      `<p>${escapeHtml(payload.body)}</p>`,\n+      `<p>If you did not make this change, please contact support immediately.</p>`,\n+      `<p>&mdash; The TaskFlow Pro Team</p>`,\n+    ].join('\\n');\n+\n+    return { text, html };\n+  },\n+};\n+\n+// ---------------------------------------------------------------------------\n+// Helpers\n+// ---------------------------------------------------------------------------\n+\n+const EMAIL_REGEX = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n+\n+function validateRecipient(recipient: string): string | null {\n+  if (!recipient || !EMAIL_REGEX.test(recipient)) {\n+    return `Invalid email address: ${recipient}`;\n+  }\n+  return null;\n+}\n+\n+function escapeHtml(str: string): string {\n+  return str\n+    .replace(/&/g, '&amp;')\n+    .replace(/</g, '&lt;')\n+    .replace(/>/g, '&gt;')\n+    .replace(/\"/g, '&quot;');\n+}\n+\n+// ---------------------------------------------------------------------------\n+// Adapter\n+// ---------------------------------------------------------------------------\n+\n export class EmailNotificationAdapter implements NotificationAdapter {\n   readonly channel: NotificationChannel = 'email';\n \n   private logger = new Logger('EmailAdapter');\n-  private sentEmails: SentEmail[] = [];\n+  private config: EmailConfig;\n+  private transport: EmailTransport;\n+\n+  constructor(config?: Partial<EmailConfig>, transport?: EmailTransport) {\n+    this.config = { ...DEFAULT_EMAIL_CONFIG, ...config };\n+    this.transport = transport ?? new InMemoryEmailTransport();\n+  }\n \n   /**\n-   * Send an email notification.\n+   * Render a notification payload into a full email and deliver it.\n+   * Validates the recipient, renders templates, and retries on failure.\n    *\n-   * Stub implementation — stores the email in memory and returns success.\n-   * Replace the body of this method with real SMTP / API integration.\n+   * Per the NotificationAdapter contract this method never throws.\n    */\n   async send(payload: NotificationPayload): Promise<DeliveryResult> {\n     try {\n-      this.logger.info(`Sending email to ${payload.recipient}: ${payload.subject}`);\n+      // 1. Validate recipient\n+      const validationError = validateRecipient(payload.recipient);\n+      if (validationError) {\n+        this.logger.error(validationError);\n+        return { success: false, error: validationError };\n+      }\n \n-      const email: SentEmail = {\n-        to: payload.recipient,\n-        subject: payload.subject,\n-        body: payload.body,\n-        sentAt: new Date(),\n-      };\n-      this.sentEmails.push(email);\n+      // 2. Render template\n+      const rendered = this.renderEmail(payload);\n \n-      return { success: true };\n+      // 3. Attempt delivery with retries\n+      let lastError: string | undefined;\n+      for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {\n+        try {\n+          await this.transport.deliver(rendered);\n+          this.logger.info(\n+            `Email delivered to ${payload.recipient}: ${payload.subject}`,\n+          );\n+          return { success: true };\n+        } catch (err: unknown) {\n+          lastError = err instanceof Error ? err.message : 'Transport error';\n+          this.logger.warn(\n+            `Delivery attempt ${attempt + 1} failed for ${payload.recipient}: ${lastError}`,\n+          );\n+        }\n+      }\n+\n+      this.logger.error(\n+        `All delivery attempts exhausted for ${payload.recipient}: ${lastError}`,\n+      );\n+      return { success: false, error: lastError };\n     } catch (err: unknown) {\n       const message = err instanceof Error ? err.message : 'Unknown email error';\n-      this.logger.error(`Failed to send email to ${payload.recipient}: ${message}`);\n+      this.logger.error(`Unexpected error sending to ${payload.recipient}: ${message}`);\n       return { success: false, error: message };\n     }\n   }\n \n   /**\n-   * Get all emails sent through this adapter (useful for testing).\n+   * Render a NotificationPayload into a fully formed email using the\n+   * template for the payload's notificationType.\n+   */\n+  renderEmail(payload: NotificationPayload): RenderedEmail {\n+    const template = EMAIL_TEMPLATES[payload.notificationType];\n+    const { text, html } = template(payload);\n+\n+    return {\n+      to: payload.recipient,\n+      from: this.config.fromAddress,\n+      replyTo: this.config.replyTo ?? this.config.fromAddress,\n+      subject: payload.subject,\n+      textBody: text,\n+      htmlBody: html,\n+    };\n+  }\n+\n+  // -----------------------------------------------------------------------\n+  // Convenience accessors (primarily for testing)\n+  // -----------------------------------------------------------------------\n+\n+  /**\n+   * Get all emails sent through this adapter.\n+   * Only works when using InMemoryEmailTransport.\n    */\n   getSentEmails(): SentEmail[] {\n-    return [...this.sentEmails];\n+    if (this.transport instanceof InMemoryEmailTransport) {\n+      return this.transport.getDeliveredEmails();\n+    }\n+    return [];\n   }\n \n   /**\n-   * Clear sent email history (useful for testing).\n+   * Clear sent email history.\n+   * Only works when using InMemoryEmailTransport.\n    */\n   clearSentEmails(): void {\n-    this.sentEmails = [];\n+    if (this.transport instanceof InMemoryEmailTransport) {\n+      this.transport.clear();\n+    }\n+  }\n+\n+  /**\n+   * Get the current configuration (useful for testing).\n+   */\n+  getConfig(): Readonly<EmailConfig> {\n+    return { ...this.config };\n   }\n }\n",
+      "linesAdded": 296,
+      "linesRemoved": 25,
+      "path": "src/adapters/email.adapter.ts"
+    },
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/index.ts b/src/index.ts\nindex ee132f4..19f24c7 100644\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -52,7 +52,16 @@ export type {\n \n // Adapters\n export type { NotificationAdapter, DeliveryResult } from './adapters/notification.adapter.js';\n-export { EmailNotificationAdapter } from './adapters/email.adapter.js';\n+export {\n+  EmailNotificationAdapter,\n+  InMemoryEmailTransport,\n+} from './adapters/email.adapter.js';\n+export type {\n+  EmailConfig,\n+  EmailTransport,\n+  RenderedEmail,\n+  SentEmail,\n+} from './adapters/email.adapter.js';\n \n // Services\n export { UserService } from './services/user.service.js';\n",
+      "linesAdded": 10,
+      "linesRemoved": 1,
+      "path": "src/index.ts"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts\nnew file mode 100644\nindex 0000000..c764971\n--- /dev/null\n+++ b/tests/adapters/email.adapter.test.ts\n@@ -0,0 +1,305 @@\n+import { describe, it, expect, beforeEach } from 'vitest';\n+import {\n+  EmailNotificationAdapter,\n+  InMemoryEmailTransport,\n+} from '../../src/adapters/email.adapter.js';\n+import type {\n+  EmailTransport,\n+  RenderedEmail,\n+} from '../../src/adapters/email.adapter.js';\n+import type { NotificationPayload } from '../../src/models/notification.js';\n+\n+function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {\n+  return {\n+    recipient: 'alice@example.com',\n+    subject: 'Order Confirmation: order-1',\n+    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',\n+    channel: 'email',\n+    notificationType: 'order_confirmation',\n+    metadata: { orderId: 'order-1', userId: 'user-1' },\n+    ...overrides,\n+  };\n+}\n+\n+describe('EmailNotificationAdapter', () => {\n+  let adapter: EmailNotificationAdapter;\n+  let transport: InMemoryEmailTransport;\n+\n+  beforeEach(() => {\n+    transport = new InMemoryEmailTransport();\n+    adapter = new EmailNotificationAdapter(undefined, transport);\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Basic send\n+  // -----------------------------------------------------------------------\n+\n+  it('should deliver an email successfully', async () => {\n+    const result = await adapter.send(makePayload());\n+\n+    expect(result.success).toBe(true);\n+    const sent = adapter.getSentEmails();\n+    expect(sent).toHaveLength(1);\n+    expect(sent[0]?.to).toBe('alice@example.com');\n+    expect(sent[0]?.subject).toBe('Order Confirmation: order-1');\n+  });\n+\n+  it('should set from address from config', async () => {\n+    adapter = new EmailNotificationAdapter(\n+      { fromAddress: 'orders@taskflowpro.com' },\n+      transport,\n+    );\n+\n+    await adapter.send(makePayload());\n+\n+    const sent = adapter.getSentEmails();\n+    expect(sent[0]?.from).toBe('orders@taskflowpro.com');\n+  });\n+\n+  it('should use default from address when none provided', async () => {\n+    await adapter.send(makePayload());\n+\n+    const sent = adapter.getSentEmails();\n+    expect(sent[0]?.from).toBe('noreply@taskflowpro.com');\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Recipient validation\n+  // -----------------------------------------------------------------------\n+\n+  it('should reject empty recipient', async () => {\n+    const result = await adapter.send(makePayload({ recipient: '' }));\n+\n+    expect(result.success).toBe(false);\n+    expect(result.error).toContain('Invalid email address');\n+    expect(adapter.getSentEmails()).toHaveLength(0);\n+  });\n+\n+  it('should reject recipient without @ sign', async () => {\n+    const result = await adapter.send(makePayload({ recipient: 'not-an-email' }));\n+\n+    expect(result.success).toBe(false);\n+    expect(result.error).toContain('Invalid email address');\n+  });\n+\n+  it('should reject recipient without domain', async () => {\n+    const result = await adapter.send(makePayload({ recipient: 'user@' }));\n+\n+    expect(result.success).toBe(false);\n+    expect(result.error).toContain('Invalid email address');\n+  });\n+\n+  it('should accept valid email addresses', async () => {\n+    const result = await adapter.send(makePayload({ recipient: 'user@domain.co.uk' }));\n+    expect(result.success).toBe(true);\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Template rendering\n+  // -----------------------------------------------------------------------\n+\n+  it('should render order_confirmation template with HTML', () => {\n+    const rendered = adapter.renderEmail(makePayload());\n+\n+    expect(rendered.htmlBody).toContain('<h1>Order Confirmation</h1>');\n+    expect(rendered.htmlBody).toContain('Widget x2');\n+    expect(rendered.htmlBody).toContain('order-1');\n+    expect(rendered.textBody).toContain('Thank you for your order!');\n+  });\n+\n+  it('should render order_status_update template', () => {\n+    const rendered = adapter.renderEmail(\n+      makePayload({\n+        notificationType: 'order_status_update',\n+        subject: 'Order Update: order-1',\n+        body: 'Your order status has changed from pending to confirmed.',\n+      }),\n+    );\n+\n+    expect(rendered.htmlBody).toContain('<h1>Order Status Update</h1>');\n+    expect(rendered.textBody).toContain('pending to confirmed');\n+  });\n+\n+  it('should render user_welcome template', () => {\n+    const rendered = adapter.renderEmail(\n+      makePayload({\n+        notificationType: 'user_welcome',\n+        subject: 'Welcome!',\n+        body: 'Welcome aboard, Alice!',\n+        metadata: undefined,\n+      }),\n+    );\n+\n+    expect(rendered.htmlBody).toContain('Welcome to TaskFlow Pro!');\n+    expect(rendered.textBody).toContain('reply to this email');\n+  });\n+\n+  it('should render user_updated template', () => {\n+    const rendered = adapter.renderEmail(\n+      makePayload({\n+        notificationType: 'user_updated',\n+        subject: 'Account Updated',\n+        body: 'Your email address has been changed.',\n+        metadata: undefined,\n+      }),\n+    );\n+\n+    expect(rendered.htmlBody).toContain('Account Updated');\n+    expect(rendered.textBody).toContain('contact support immediately');\n+  });\n+\n+  it('should escape HTML in body text', () => {\n+    const rendered = adapter.renderEmail(\n+      makePayload({\n+        body: 'Items: <script>alert(\"xss\")</script>',\n+      }),\n+    );\n+\n+    expect(rendered.htmlBody).not.toContain('<script>');\n+    expect(rendered.htmlBody).toContain('&lt;script&gt;');\n+  });\n+\n+  it('should include metadata orderId in rendered email', () => {\n+    const rendered = adapter.renderEmail(makePayload());\n+\n+    expect(rendered.htmlBody).toContain('order-1');\n+    expect(rendered.textBody).toContain('Order ID: order-1');\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Retry logic\n+  // -----------------------------------------------------------------------\n+\n+  it('should retry on transport failure', async () => {\n+    let attempts = 0;\n+    const failingTransport: EmailTransport = {\n+      async deliver() {\n+        attempts++;\n+        if (attempts < 3) {\n+          throw new Error('Connection timeout');\n+        }\n+      },\n+    };\n+\n+    adapter = new EmailNotificationAdapter({ maxRetries: 2 }, failingTransport);\n+    const result = await adapter.send(makePayload());\n+\n+    expect(result.success).toBe(true);\n+    expect(attempts).toBe(3); // 1 initial + 2 retries\n+  });\n+\n+  it('should return failure after exhausting retries', async () => {\n+    const failingTransport: EmailTransport = {\n+      async deliver() {\n+        throw new Error('Permanent failure');\n+      },\n+    };\n+\n+    adapter = new EmailNotificationAdapter({ maxRetries: 1 }, failingTransport);\n+    const result = await adapter.send(makePayload());\n+\n+    expect(result.success).toBe(false);\n+    expect(result.error).toBe('Permanent failure');\n+  });\n+\n+  it('should succeed on first attempt when no errors', async () => {\n+    let attempts = 0;\n+    const countingTransport: EmailTransport = {\n+      async deliver() {\n+        attempts++;\n+      },\n+    };\n+\n+    adapter = new EmailNotificationAdapter({ maxRetries: 3 }, countingTransport);\n+    await adapter.send(makePayload());\n+\n+    expect(attempts).toBe(1);\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Configuration\n+  // -----------------------------------------------------------------------\n+\n+  it('should expose config via getConfig', () => {\n+    adapter = new EmailNotificationAdapter({\n+      fromAddress: 'custom@example.com',\n+      replyTo: 'support@example.com',\n+      maxRetries: 5,\n+    });\n+\n+    const config = adapter.getConfig();\n+    expect(config.fromAddress).toBe('custom@example.com');\n+    expect(config.replyTo).toBe('support@example.com');\n+    expect(config.maxRetries).toBe(5);\n+  });\n+\n+  it('should set replyTo to fromAddress when not specified', () => {\n+    const rendered = adapter.renderEmail(makePayload());\n+    expect(rendered.replyTo).toBe('noreply@taskflowpro.com');\n+  });\n+\n+  it('should use explicit replyTo when set', () => {\n+    adapter = new EmailNotificationAdapter(\n+      { replyTo: 'support@taskflowpro.com' },\n+      transport,\n+    );\n+\n+    const rendered = adapter.renderEmail(makePayload());\n+    expect(rendered.replyTo).toBe('support@taskflowpro.com');\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Clearing\n+  // -----------------------------------------------------------------------\n+\n+  it('should clear sent emails', async () => {\n+    await adapter.send(makePayload());\n+    expect(adapter.getSentEmails()).toHaveLength(1);\n+\n+    adapter.clearSentEmails();\n+    expect(adapter.getSentEmails()).toHaveLength(0);\n+  });\n+\n+  // -----------------------------------------------------------------------\n+  // Channel\n+  // -----------------------------------------------------------------------\n+\n+  it('should report email channel', () => {\n+    expect(adapter.channel).toBe('email');\n+  });\n+});\n+\n+describe('InMemoryEmailTransport', () => {\n+  it('should store and retrieve delivered emails', async () => {\n+    const transport = new InMemoryEmailTransport();\n+\n+    await transport.deliver({\n+      to: 'test@example.com',\n+      from: 'noreply@taskflowpro.com',\n+      replyTo: 'noreply@taskflowpro.com',\n+      subject: 'Test',\n+      textBody: 'Hello',\n+      htmlBody: '<p>Hello</p>',\n+    });\n+\n+    const emails = transport.getDeliveredEmails();\n+    expect(emails).toHaveLength(1);\n+    expect(emails[0]?.to).toBe('test@example.com');\n+  });\n+\n+  it('should clear delivered emails', async () => {\n+    const transport = new InMemoryEmailTransport();\n+\n+    await transport.deliver({\n+      to: 'test@example.com',\n+      from: 'noreply@taskflowpro.com',\n+      replyTo: 'noreply@taskflowpro.com',\n+      subject: 'Test',\n+      textBody: 'Hello',\n+      htmlBody: '<p>Hello</p>',\n+    });\n+\n+    transport.clear();\n+    expect(transport.getDeliveredEmails()).toHaveLength(0);\n+  });\n+});\n",
+      "linesAdded": 305,
+      "linesRemoved": 0,
+      "path": "tests/adapters/email.adapter.test.ts"
+    }
+  ],
+  "numTurns": 23,
+  "prompt": "You are Agent 2 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Implement the email notification adapter fully.\n\nSpecifically:\n1. Check the existing notification architecture from the previous session (check src/services/, src/adapters/, src/events/, and any design docs).\n2. Implement the email adapter with real logic: template rendering, recipient resolution, send method.\n3. Wire the email adapter into the notification service following the established pattern.\n4. Add basic unit tests for the email adapter.\n5. Make sure the codebase compiles and tests pass.\n\nImportant:\n- Follow the architecture from Session 1 exactly — do not change the notification pattern.\n- The email adapter must conform to whatever adapter interface was defined.",
+  "runId": "73972189-6f8b-4539-bb91-5a064255d39b",
+  "scenario": "sprint-simulation",
+  "sessionId": "60e49dac-1d0a-4ddd-9193-d6cb6af728e7",
+  "stopReason": "success",
+  "taskIndex": 1,
+  "timing": {
+    "durationMs": 275355,
+    "endTime": "2026-03-30T17:54:36.472Z",
+    "startTime": "2026-03-30T17:50:01.117Z",
+    "timeToFirstActionMs": 197062
+  },
+  "tokenUsage": {
+    "cacheCreation": 0,
+    "cacheRead": 0,
+    "costUsd": 0.7906145500000001,
+    "input": 0,
+    "output": 0,
+    "total": 0
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/COORDINATION.md"
+      },
+      "timestamp": "2026-03-30T17:50:36.881Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "description": "Explore codebase architecture",
+        "prompt": "Explore the codebase at /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU thoroughly. I need to understand:\n\n1. The notification architecture - check src/services/, src/adapters/, src/events/ for any notification-related files\n2. Any adapter interface definitions\n3. The existing adapter implementations (like webhook adapter)\n4. The notification service implementation\n5. Event definitions\n6. Test patterns used in the tests/ directory\n\nRead all relevant files fully. Give me complete file contents for any notification/adapter/event related files.",
+        "subagent_type": "Explore"
+      },
+      "timestamp": "2026-03-30T17:50:40.561Z",
+      "toolName": "Agent"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU -type f -name \"*.ts\" -o -name \"*.js\" -o -name \"*.json\" | head -50"
+      },
+      "timestamp": "2026-03-30T17:50:42.025Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "ls -la /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/"
+      },
+      "timestamp": "2026-03-30T17:50:43.447Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src -type f \\( -name \"*.ts\" -o -name \"*.js\" \\) | sort"
+      },
+      "timestamp": "2026-03-30T17:50:44.576Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests -type f \\( -name \"*.ts\" -o -name \"*.js\" \\) | sort"
+      },
+      "timestamp": "2026-03-30T17:50:52.221Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/adapters/notification.adapter.ts"
+      },
+      "timestamp": "2026-03-30T17:50:53.891Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-30T17:50:54.038Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-30T17:50:54.546Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-30T17:50:54.939Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-30T17:50:55.187Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/notification.ts"
+      },
+      "timestamp": "2026-03-30T17:50:55.428Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-30T17:51:27.893Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/order.ts"
+      },
+      "timestamp": "2026-03-30T17:51:27.894Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/user.ts"
+      },
+      "timestamp": "2026-03-30T17:51:27.895Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-30T17:51:30.338Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/utils/logger.ts"
+      },
+      "timestamp": "2026-03-30T17:51:30.449Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/index.ts"
+      },
+      "timestamp": "2026-03-30T17:51:30.641Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/config/app.config.ts"
+      },
+      "timestamp": "2026-03-30T17:51:32.979Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/services/order.service.test.ts"
+      },
+      "timestamp": "2026-03-30T17:51:33.086Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/COORDINATION.md"
+      },
+      "timestamp": "2026-03-30T17:51:35.111Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/package.json"
+      },
+      "timestamp": "2026-03-30T17:51:35.588Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/repositories/base.repository.ts"
+      },
+      "timestamp": "2026-03-30T17:51:37.791Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/repositories/order.repository.ts"
+      },
+      "timestamp": "2026-03-30T17:51:38.196Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/utils/callback-registry.ts"
+      },
+      "timestamp": "2026-03-30T17:51:38.399Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/services/user.service.ts"
+      },
+      "timestamp": "2026-03-30T17:51:40.552Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/utils/database.ts"
+      },
+      "timestamp": "2026-03-30T17:51:40.707Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-30T17:52:22.437Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/adapters/notification.adapter.ts"
+      },
+      "timestamp": "2026-03-30T17:52:22.848Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/notification.ts"
+      },
+      "timestamp": "2026-03-30T17:52:23.770Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-30T17:52:24.208Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/index.ts"
+      },
+      "timestamp": "2026-03-30T17:52:25.124Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-30T17:52:30.600Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/config/app.config.ts"
+      },
+      "timestamp": "2026-03-30T17:52:31.044Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/utils/logger.ts"
+      },
+      "timestamp": "2026-03-30T17:52:32.062Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU",
+        "pattern": "tests/adapters/**/*.ts"
+      },
+      "timestamp": "2026-03-30T17:52:32.914Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/user.ts"
+      },
+      "timestamp": "2026-03-30T17:52:41.484Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/models/order.ts"
+      },
+      "timestamp": "2026-03-30T17:52:41.997Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tsconfig.json"
+      },
+      "timestamp": "2026-03-30T17:52:42.611Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Email notification adapter.\n *\n * Implements NotificationAdapter for the 'email' channel with:\n * - Template rendering per notification type (HTML + plain text)\n * - Recipient email validation\n * - Configurable SMTP settings (from address, reply-to, etc.)\n * - Retry support with configurable max attempts\n *\n * In production the transport would integrate with SMTP / SendGrid / SES.\n * The default transport stores emails in memory for testing.\n */\n\nimport type { NotificationAdapter, DeliveryResult } from './notification.adapter.js';\nimport type {\n  NotificationPayload,\n  NotificationChannel,\n  NotificationType,\n} from '../models/notification.js';\nimport { Logger } from '../utils/logger.js';\n\n// ---------------------------------------------------------------------------\n// Configuration\n// ---------------------------------------------------------------------------\n\nexport interface EmailConfig {\n  /** Sender address shown in the \"From\" header. */\n  fromAddress: string;\n  /** Optional reply-to address. Defaults to fromAddress. */\n  replyTo?: string;\n  /** Maximum delivery attempts before giving up. */\n  maxRetries: number;\n}\n\nconst DEFAULT_EMAIL_CONFIG: EmailConfig = {\n  fromAddress: 'noreply@taskflowpro.com',\n  maxRetries: 2,\n};\n\n// ---------------------------------------------------------------------------\n// Email template types\n// ---------------------------------------------------------------------------\n\nexport interface RenderedEmail {\n  to: string;\n  from: string;\n  replyTo: string;\n  subject: string;\n  textBody: string;\n  htmlBody: string;\n}\n\n/**\n * Record of a successfully sent email — includes rendered content.\n */\nexport interface SentEmail {\n  to: string;\n  from: string;\n  subject: string;\n  textBody: string;\n  htmlBody: string;\n  sentAt: Date;\n}\n\n// ---------------------------------------------------------------------------\n// Transport abstraction\n// ---------------------------------------------------------------------------\n\n/**\n * Pluggable transport that actually delivers the email.\n * The default implementation stores emails in memory (for testing).\n * In production, swap this for an SMTP or API-backed transport.\n */\nexport interface EmailTransport {\n  deliver(email: RenderedEmail): Promise<void>;\n}\n\n/**\n * In-memory transport — stores delivered emails for inspection in tests.\n */\nexport class InMemoryEmailTransport implements EmailTransport {\n  private deliveredEmails: SentEmail[] = [];\n\n  async deliver(email: RenderedEmail): Promise<void> {\n    this.deliveredEmails.push({\n      to: email.to,\n      from: email.from,\n      subject: email.subject,\n      textBody: email.textBody,\n      htmlBody: email.htmlBody,\n      sentAt: new Date(),\n    });\n  }\n\n  getDeliveredEmails(): SentEmail[] {\n    return [...this.deliveredEmails];\n  }\n\n  clear(): void {\n    this.deliveredEmails = [];\n  }\n}\n\n// ---------------------------------------------------------------------------\n// Template rendering\n// ---------------------------------------------------------------------------\n\ntype TemplateRenderer = (payload: NotificationPayload) => { text: string; html: string };\n\nconst EMAIL_TEMPLATES: Record<NotificationType, TemplateRenderer> = {\n  order_confirmation(payload) {\n    const text = [\n      `Hi,`,\n      ``,\n      `${payload.body}`,\n      ``,\n      payload.metadata?.orderId ? `Order ID: ${payload.metadata.orderId}` : '',\n      ``,\n      `Thank you for your order!`,\n      `— The TaskFlow Pro Team`,\n    ]\n      .filter(Boolean)\n      .join('\\n');\n\n    const html = [\n      `<h1>Order Confirmation</h1>`,\n      `<p>${escapeHtml(payload.body)}</p>`,\n      payload.metadata?.orderId\n        ? `<p><strong>Order ID:</strong> ${escapeHtml(payload.metadata.orderId)}</p>`\n        : '',\n      `<p>Thank you for your order!</p>`,\n      `<p>&mdash; The TaskFlow Pro Team</p>`,\n    ]\n      .filter(Boolean)\n      .join('\\n');\n\n    return { text, html };\n  },\n\n  order_status_update(payload) {\n    const text = [\n      `Hi,`,\n      ``,\n      `${payload.body}`,\n      ``,\n      payload.metadata?.orderId ? `Order ID: ${payload.metadata.orderId}` : '',\n      ``,\n      `— The TaskFlow Pro Team`,\n    ]\n      .filter(Boolean)\n      .join('\\n');\n\n    const html = [\n      `<h1>Order Status Update</h1>`,\n      `<p>${escapeHtml(payload.body)}</p>`,\n      payload.metadata?.orderId\n        ? `<p><strong>Order ID:</strong> ${escapeHtml(payload.metadata.orderId)}</p>`\n        : '',\n      `<p>&mdash; The TaskFlow Pro Team</p>`,\n    ]\n      .filter(Boolean)\n      .join('\\n');\n\n    return { text, html };\n  },\n\n  user_welcome(payload) {\n    const text = [\n      `Welcome to TaskFlow Pro!`,\n      ``,\n      `${payload.body}`,\n      ``,\n      `If you have any questions, just reply to this email.`,\n      `— The TaskFlow Pro Team`,\n    ].join('\\n');\n\n    const html = [\n      `<h1>Welcome to TaskFlow Pro!</h1>`,\n      `<p>${escapeHtml(payload.body)}</p>`,\n      `<p>If you have any questions, just reply to this email.</p>`,\n      `<p>&mdash; The TaskFlow Pro Team</p>`,\n    ].join('\\n');\n\n    return { text, html };\n  },\n\n  user_updated(payload) {\n    const text = [\n      `Hi,`,\n      ``,\n      `${payload.body}`,\n      ``,\n      `If you did not make this change, please contact support immediately.`,\n      `— The TaskFlow Pro Team`,\n    ].join('\\n');\n\n    const html = [\n      `<h1>Account Updated</h1>`,\n      `<p>${escapeHtml(payload.body)}</p>`,\n      `<p>If you did not make this change, please contact support immediately.</p>`,\n      `<p>&mdash; The TaskFlow Pro Team</p>`,\n    ].join('\\n');\n\n    return { text, html };\n  },\n};\n\n// ---------------------------------------------------------------------------\n// Helpers\n// ---------------------------------------------------------------------------\n\nconst EMAIL_REGEX = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\n\nfunction validateRecipient(recipient: string): string | null {\n  if (!recipient || !EMAIL_REGEX.test(recipient)) {\n    return `Invalid email address: ${recipient}`;\n  }\n  return null;\n}\n\nfunction escapeHtml(str: string): string {\n  return str\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;')\n    .replace(/\"/g, '&quot;');\n}\n\n// ---------------------------------------------------------------------------\n// Adapter\n// ---------------------------------------------------------------------------\n\nexport class EmailNotificationAdapter implements NotificationAdapter {\n  readonly channel: NotificationChannel = 'email';\n\n  private logger = new Logger('EmailAdapter');\n  private config: EmailConfig;\n  private transport: EmailTransport;\n\n  constructor(config?: Partial<EmailConfig>, transport?: EmailTransport) {\n    this.config = { ...DEFAULT_EMAIL_CONFIG, ...config };\n    this.transport = transport ?? new InMemoryEmailTransport();\n  }\n\n  /**\n   * Render a notification payload into a full email and deliver it.\n   * Validates the recipient, renders templates, and retries on failure.\n   *\n   * Per the NotificationAdapter contract this method never throws.\n   */\n  async send(payload: NotificationPayload): Promise<DeliveryResult> {\n    try {\n      // 1. Validate recipient\n      const validationError = validateRecipient(payload.recipient);\n      if (validationError) {\n        this.logger.error(validationError);\n        return { success: false, error: validationError };\n      }\n\n      // 2. Render template\n      const rendered = this.renderEmail(payload);\n\n      // 3. Attempt delivery with retries\n      let lastError: string | undefined;\n      for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {\n        try {\n          await this.transport.deliver(rendered);\n          this.logger.info(\n            `Email delivered to ${payload.recipient}: ${payload.subject}`,\n          );\n          return { success: true };\n        } catch (err: unknown) {\n          lastError = err instanceof Error ? err.message : 'Transport error';\n          this.logger.warn(\n            `Delivery attempt ${attempt + 1} failed for ${payload.recipient}: ${lastError}`,\n          );\n        }\n      }\n\n      this.logger.error(\n        `All delivery attempts exhausted for ${payload.recipient}: ${lastError}`,\n      );\n      return { success: false, error: lastError };\n    } catch (err: unknown) {\n      const message = err instanceof Error ? err.message : 'Unknown email error';\n      this.logger.error(`Unexpected error sending to ${payload.recipient}: ${message}`);\n      return { success: false, error: message };\n    }\n  }\n\n  /**\n   * Render a NotificationPayload into a fully formed email using the\n   * template for the payload's notificationType.\n   */\n  renderEmail(payload: NotificationPayload): RenderedEmail {\n    const template = EMAIL_TEMPLATES[payload.notificationType];\n    const { text, html } = template(payload);\n\n    return {\n      to: payload.recipient,\n      from: this.config.fromAddress,\n      replyTo: this.config.replyTo ?? this.config.fromAddress,\n      subject: payload.subject,\n      textBody: text,\n      htmlBody: html,\n    };\n  }\n\n  // -----------------------------------------------------------------------\n  // Convenience accessors (primarily for testing)\n  // -----------------------------------------------------------------------\n\n  /**\n   * Get all emails sent through this adapter.\n   * Only works when using InMemoryEmailTransport.\n   */\n  getSentEmails(): SentEmail[] {\n    if (this.transport instanceof InMemoryEmailTransport) {\n      return this.transport.getDeliveredEmails();\n    }\n    return [];\n  }\n\n  /**\n   * Clear sent email history.\n   * Only works when using InMemoryEmailTransport.\n   */\n  clearSentEmails(): void {\n    if (this.transport instanceof InMemoryEmailTransport) {\n      this.transport.clear();\n    }\n  }\n\n  /**\n   * Get the current configuration (useful for testing).\n   */\n  getConfig(): Readonly<EmailConfig> {\n    return { ...this.config };\n  }\n}\n",
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-30T17:53:18.179Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/src/index.ts",
+        "new_string": "export {\n  EmailNotificationAdapter,\n  InMemoryEmailTransport,\n} from './adapters/email.adapter.js';\nexport type {\n  EmailConfig,\n  EmailTransport,\n  RenderedEmail,\n  SentEmail,\n} from './adapters/email.adapter.js';",
+        "old_string": "export { EmailNotificationAdapter } from './adapters/email.adapter.js';",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-30T17:53:23.353Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "ls /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/",
+        "description": "List test directories"
+      },
+      "timestamp": "2026-03-30T17:53:27.231Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "mkdir -p /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/adapters",
+        "description": "Create adapters test directory"
+      },
+      "timestamp": "2026-03-30T17:53:30.207Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "import { describe, it, expect, beforeEach } from 'vitest';\nimport {\n  EmailNotificationAdapter,\n  InMemoryEmailTransport,\n} from '../../src/adapters/email.adapter.js';\nimport type {\n  EmailTransport,\n  RenderedEmail,\n} from '../../src/adapters/email.adapter.js';\nimport type { NotificationPayload } from '../../src/models/notification.js';\n\nfunction makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {\n  return {\n    recipient: 'alice@example.com',\n    subject: 'Order Confirmation: order-1',\n    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',\n    channel: 'email',\n    notificationType: 'order_confirmation',\n    metadata: { orderId: 'order-1', userId: 'user-1' },\n    ...overrides,\n  };\n}\n\ndescribe('EmailNotificationAdapter', () => {\n  let adapter: EmailNotificationAdapter;\n  let transport: InMemoryEmailTransport;\n\n  beforeEach(() => {\n    transport = new InMemoryEmailTransport();\n    adapter = new EmailNotificationAdapter(undefined, transport);\n  });\n\n  // -----------------------------------------------------------------------\n  // Basic send\n  // -----------------------------------------------------------------------\n\n  it('should deliver an email successfully', async () => {\n    const result = await adapter.send(makePayload());\n\n    expect(result.success).toBe(true);\n    const sent = adapter.getSentEmails();\n    expect(sent).toHaveLength(1);\n    expect(sent[0]?.to).toBe('alice@example.com');\n    expect(sent[0]?.subject).toBe('Order Confirmation: order-1');\n  });\n\n  it('should set from address from config', async () => {\n    adapter = new EmailNotificationAdapter(\n      { fromAddress: 'orders@taskflowpro.com' },\n      transport,\n    );\n\n    await adapter.send(makePayload());\n\n    const sent = adapter.getSentEmails();\n    expect(sent[0]?.from).toBe('orders@taskflowpro.com');\n  });\n\n  it('should use default from address when none provided', async () => {\n    await adapter.send(makePayload());\n\n    const sent = adapter.getSentEmails();\n    expect(sent[0]?.from).toBe('noreply@taskflowpro.com');\n  });\n\n  // -----------------------------------------------------------------------\n  // Recipient validation\n  // -----------------------------------------------------------------------\n\n  it('should reject empty recipient', async () => {\n    const result = await adapter.send(makePayload({ recipient: '' }));\n\n    expect(result.success).toBe(false);\n    expect(result.error).toContain('Invalid email address');\n    expect(adapter.getSentEmails()).toHaveLength(0);\n  });\n\n  it('should reject recipient without @ sign', async () => {\n    const result = await adapter.send(makePayload({ recipient: 'not-an-email' }));\n\n    expect(result.success).toBe(false);\n    expect(result.error).toContain('Invalid email address');\n  });\n\n  it('should reject recipient without domain', async () => {\n    const result = await adapter.send(makePayload({ recipient: 'user@' }));\n\n    expect(result.success).toBe(false);\n    expect(result.error).toContain('Invalid email address');\n  });\n\n  it('should accept valid email addresses', async () => {\n    const result = await adapter.send(makePayload({ recipient: 'user@domain.co.uk' }));\n    expect(result.success).toBe(true);\n  });\n\n  // -----------------------------------------------------------------------\n  // Template rendering\n  // -----------------------------------------------------------------------\n\n  it('should render order_confirmation template with HTML', () => {\n    const rendered = adapter.renderEmail(makePayload());\n\n    expect(rendered.htmlBody).toContain('<h1>Order Confirmation</h1>');\n    expect(rendered.htmlBody).toContain('Widget x2');\n    expect(rendered.htmlBody).toContain('order-1');\n    expect(rendered.textBody).toContain('Thank you for your order!');\n  });\n\n  it('should render order_status_update template', () => {\n    const rendered = adapter.renderEmail(\n      makePayload({\n        notificationType: 'order_status_update',\n        subject: 'Order Update: order-1',\n        body: 'Your order status has changed from pending to confirmed.',\n      }),\n    );\n\n    expect(rendered.htmlBody).toContain('<h1>Order Status Update</h1>');\n    expect(rendered.textBody).toContain('pending to confirmed');\n  });\n\n  it('should render user_welcome template', () => {\n    const rendered = adapter.renderEmail(\n      makePayload({\n        notificationType: 'user_welcome',\n        subject: 'Welcome!',\n        body: 'Welcome aboard, Alice!',\n        metadata: undefined,\n      }),\n    );\n\n    expect(rendered.htmlBody).toContain('Welcome to TaskFlow Pro!');\n    expect(rendered.textBody).toContain('reply to this email');\n  });\n\n  it('should render user_updated template', () => {\n    const rendered = adapter.renderEmail(\n      makePayload({\n        notificationType: 'user_updated',\n        subject: 'Account Updated',\n        body: 'Your email address has been changed.',\n        metadata: undefined,\n      }),\n    );\n\n    expect(rendered.htmlBody).toContain('Account Updated');\n    expect(rendered.textBody).toContain('contact support immediately');\n  });\n\n  it('should escape HTML in body text', () => {\n    const rendered = adapter.renderEmail(\n      makePayload({\n        body: 'Items: <script>alert(\"xss\")</script>',\n      }),\n    );\n\n    expect(rendered.htmlBody).not.toContain('<script>');\n    expect(rendered.htmlBody).toContain('&lt;script&gt;');\n  });\n\n  it('should include metadata orderId in rendered email', () => {\n    const rendered = adapter.renderEmail(makePayload());\n\n    expect(rendered.htmlBody).toContain('order-1');\n    expect(rendered.textBody).toContain('Order ID: order-1');\n  });\n\n  // -----------------------------------------------------------------------\n  // Retry logic\n  // -----------------------------------------------------------------------\n\n  it('should retry on transport failure', async () => {\n    let attempts = 0;\n    const failingTransport: EmailTransport = {\n      async deliver() {\n        attempts++;\n        if (attempts < 3) {\n          throw new Error('Connection timeout');\n        }\n      },\n    };\n\n    adapter = new EmailNotificationAdapter({ maxRetries: 2 }, failingTransport);\n    const result = await adapter.send(makePayload());\n\n    expect(result.success).toBe(true);\n    expect(attempts).toBe(3); // 1 initial + 2 retries\n  });\n\n  it('should return failure after exhausting retries', async () => {\n    const failingTransport: EmailTransport = {\n      async deliver() {\n        throw new Error('Permanent failure');\n      },\n    };\n\n    adapter = new EmailNotificationAdapter({ maxRetries: 1 }, failingTransport);\n    const result = await adapter.send(makePayload());\n\n    expect(result.success).toBe(false);\n    expect(result.error).toBe('Permanent failure');\n  });\n\n  it('should succeed on first attempt when no errors', async () => {\n    let attempts = 0;\n    const countingTransport: EmailTransport = {\n      async deliver() {\n        attempts++;\n      },\n    };\n\n    adapter = new EmailNotificationAdapter({ maxRetries: 3 }, countingTransport);\n    await adapter.send(makePayload());\n\n    expect(attempts).toBe(1);\n  });\n\n  // -----------------------------------------------------------------------\n  // Configuration\n  // -----------------------------------------------------------------------\n\n  it('should expose config via getConfig', () => {\n    adapter = new EmailNotificationAdapter({\n      fromAddress: 'custom@example.com',\n      replyTo: 'support@example.com',\n      maxRetries: 5,\n    });\n\n    const config = adapter.getConfig();\n    expect(config.fromAddress).toBe('custom@example.com');\n    expect(config.replyTo).toBe('support@example.com');\n    expect(config.maxRetries).toBe(5);\n  });\n\n  it('should set replyTo to fromAddress when not specified', () => {\n    const rendered = adapter.renderEmail(makePayload());\n    expect(rendered.replyTo).toBe('noreply@taskflowpro.com');\n  });\n\n  it('should use explicit replyTo when set', () => {\n    adapter = new EmailNotificationAdapter(\n      { replyTo: 'support@taskflowpro.com' },\n      transport,\n    );\n\n    const rendered = adapter.renderEmail(makePayload());\n    expect(rendered.replyTo).toBe('support@taskflowpro.com');\n  });\n\n  // -----------------------------------------------------------------------\n  // Clearing\n  // -----------------------------------------------------------------------\n\n  it('should clear sent emails', async () => {\n    await adapter.send(makePayload());\n    expect(adapter.getSentEmails()).toHaveLength(1);\n\n    adapter.clearSentEmails();\n    expect(adapter.getSentEmails()).toHaveLength(0);\n  });\n\n  // -----------------------------------------------------------------------\n  // Channel\n  // -----------------------------------------------------------------------\n\n  it('should report email channel', () => {\n    expect(adapter.channel).toBe('email');\n  });\n});\n\ndescribe('InMemoryEmailTransport', () => {\n  it('should store and retrieve delivered emails', async () => {\n    const transport = new InMemoryEmailTransport();\n\n    await transport.deliver({\n      to: 'test@example.com',\n      from: 'noreply@taskflowpro.com',\n      replyTo: 'noreply@taskflowpro.com',\n      subject: 'Test',\n      textBody: 'Hello',\n      htmlBody: '<p>Hello</p>',\n    });\n\n    const emails = transport.getDeliveredEmails();\n    expect(emails).toHaveLength(1);\n    expect(emails[0]?.to).toBe('test@example.com');\n  });\n\n  it('should clear delivered emails', async () => {\n    const transport = new InMemoryEmailTransport();\n\n    await transport.deliver({\n      to: 'test@example.com',\n      from: 'noreply@taskflowpro.com',\n      replyTo: 'noreply@taskflowpro.com',\n      subject: 'Test',\n      textBody: 'Hello',\n      htmlBody: '<p>Hello</p>',\n    });\n\n    transport.clear();\n    expect(transport.getDeliveredEmails()).toHaveLength(0);\n  });\n});\n",
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/tests/adapters/email.adapter.test.ts"
+      },
+      "timestamp": "2026-03-30T17:54:00.587Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "npx tsc --noEmit 2>&1",
+        "description": "Type check the project",
+        "timeout": 30000
+      },
+      "timestamp": "2026-03-30T17:54:04.424Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "npx vitest run 2>&1",
+        "description": "Run all tests",
+        "timeout": 30000
+      },
+      "timestamp": "2026-03-30T17:54:08.159Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-iO3umU/COORDINATION.md",
+        "new_string": "### Files created/modified\n- **Created:** `src/models/notification.ts`, `src/adapters/notification.adapter.ts`, `src/adapters/email.adapter.ts`\n- **Modified:** `src/services/notification.service.ts`, `src/services/order.service.ts`, `src/index.ts`, `tests/services/notification.service.test.ts`, `tests/services/order.service.test.ts`\n\n---\n\n## Agent 2 — Email Notification Adapter (completed)\n\n### What was done\n\nReplaced the stub email adapter with a full implementation featuring:\n\n1. **Template rendering** — Each `NotificationType` (`order_confirmation`, `order_status_update`, `user_welcome`, `user_updated`) has its own template renderer producing both **plain text** and **HTML** bodies. HTML output is XSS-safe (escapes `<`, `>`, `&`, `\"`).\n\n2. **Recipient validation** — `send()` validates the recipient email format before attempting delivery. Invalid addresses return `{ success: false, error }` without touching the transport.\n\n3. **Pluggable transport abstraction** — Introduced `EmailTransport` interface with a default `InMemoryEmailTransport` for testing. Production code can swap in an SMTP/SendGrid/SES transport without changing the adapter.\n\n4. **Configurable settings** — `EmailConfig` with `fromAddress`, `replyTo`, and `maxRetries`. Defaults to `noreply@taskflowpro.com` and 2 retries.\n\n5. **Retry logic** — Transport failures are retried up to `maxRetries` times before returning failure.\n\n6. **`RenderedEmail` type** — Full email representation with `to`, `from`, `replyTo`, `subject`, `textBody`, `htmlBody`. The `renderEmail()` method is public for testing.\n\n7. **Updated `SentEmail`** — Now includes `from`, `textBody`, `htmlBody` fields (previously just `to`, `subject`, `body`).\n\n8. **23 unit tests** in `tests/adapters/email.adapter.test.ts` covering:\n   - Basic delivery\n   - From/replyTo configuration\n   - Recipient validation (empty, no @, no domain, valid)\n   - Template rendering for all 4 notification types\n   - HTML escaping (XSS prevention)\n   - Metadata inclusion in templates\n   - Retry logic (retry success, retry exhaustion, first-attempt success)\n   - Config access, clearing, channel identity\n   - InMemoryEmailTransport standalone tests\n\n### Constraints for other agents\n\n- **The adapter interface is unchanged.** `EmailNotificationAdapter` still implements `NotificationAdapter` with `channel` and `send()`.\n- **`getSentEmails()` still works** for existing tests but now returns `SentEmail` with `from`, `textBody`, `htmlBody` instead of the old `body` field.\n- **To use a custom transport:** Pass it as the second constructor arg: `new EmailNotificationAdapter(config, transport)`.\n- **To add a new notification type template:** Add an entry to the `EMAIL_TEMPLATES` record in `src/adapters/email.adapter.ts`.\n\n### Files created/modified\n- **Modified:** `src/adapters/email.adapter.ts` (full rewrite), `src/index.ts` (new exports)\n- **Created:** `tests/adapters/email.adapter.test.ts`\n\n### Test status\nAll 94 tests pass (71 existing + 23 new).",
+        "old_string": "### Files created/modified\n- **Created:** `src/models/notification.ts`, `src/adapters/notification.adapter.ts`, `src/adapters/email.adapter.ts`\n- **Modified:** `src/services/notification.service.ts`, `src/services/order.service.ts`, `src/index.ts`, `tests/services/notification.service.test.ts`, `tests/services/order.service.test.ts`",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-30T17:54:28.687Z",
+      "toolName": "Edit"
+    }
+  ],
+  "turnUsage": []
+}

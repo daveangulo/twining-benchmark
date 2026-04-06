@@ -1,0 +1,537 @@
+diff --git a/src/services/aggregation.service.ts b/src/services/aggregation.service.ts
+index 83cbca8..966a6c5 100644
+--- a/src/services/aggregation.service.ts
++++ b/src/services/aggregation.service.ts
+@@ -159,16 +159,16 @@ export class AggregationService {
+     const orders = this.orderRepository.findAll();
+     const bucketMap = new Map<string, { count: number; revenue: number }>();
+ 
+-    // Initialize all days in the range
++    // Initialize all days in the range using UTC to avoid timezone drift
+     const current = new Date(startDate);
+-    current.setHours(0, 0, 0, 0);
++    current.setUTCHours(0, 0, 0, 0);
+     const end = new Date(endDate);
+-    end.setHours(0, 0, 0, 0);
++    end.setUTCHours(0, 0, 0, 0);
+ 
+     while (current <= end) {
+       const key = current.toISOString().split('T')[0]!;
+       bucketMap.set(key, { count: 0, revenue: 0 });
+-      current.setDate(current.getDate() + 1);
++      current.setUTCDate(current.getUTCDate() + 1);
+     }
+ 
+     // Fill in order data
+diff --git a/tests/integration/analytics-pipeline.integration.test.ts b/tests/integration/analytics-pipeline.integration.test.ts
+new file mode 100644
+index 0000000..2eaef74
+--- /dev/null
++++ b/tests/integration/analytics-pipeline.integration.test.ts
+@@ -0,0 +1,506 @@
++/**
++ * Integration tests for the full analytics pipeline.
++ *
++ * Tests the complete flow: UserService → OrderService → AggregationService → AnalyticsRoutes.
++ * All layers use real implementations (no mocks) wired to a fresh in-memory database.
++ */
++
++import { describe, it, expect, beforeEach } from 'vitest';
++import { Database } from '../../src/utils/database.js';
++import { UserRepository } from '../../src/repositories/user.repository.js';
++import { OrderRepository } from '../../src/repositories/order.repository.js';
++import { UserService, resetUserIdCounter } from '../../src/services/user.service.js';
++import { OrderService, resetOrderIdCounter } from '../../src/services/order.service.js';
++import { AggregationService } from '../../src/services/aggregation.service.js';
++import { AnalyticsRoutes } from '../../src/routes/analytics.routes.js';
++import { EventBus } from '../../src/events/event-bus.js';
++import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
++import type { User } from '../../src/models/user.js';
++import type { Order } from '../../src/models/order.js';
++
++describe('Analytics Pipeline Integration', () => {
++  let db: Database;
++  let userRepo: UserRepository;
++  let orderRepo: OrderRepository;
++  let eventBus: EventBus;
++  let userService: UserService;
++  let orderService: OrderService;
++  let aggregationService: AggregationService;
++  let routes: AnalyticsRoutes;
++
++  beforeEach(() => {
++    // Reset all shared state
++    resetUserIdCounter();
++    resetOrderIdCounter();
++    statusChangeCallbacks.clear();
++
++    // Wire the full stack
++    db = new Database();
++    userRepo = new UserRepository(db);
++    orderRepo = new OrderRepository(db);
++    eventBus = new EventBus();
++    userService = new UserService(userRepo, eventBus);
++    orderService = new OrderService(orderRepo, userRepo, eventBus);
++    aggregationService = new AggregationService(orderRepo);
++    routes = new AnalyticsRoutes(aggregationService);
++  });
++
++  // ── Helpers ──────────────────────────────────────────────────
++
++  async function createUser(name: string, email: string, role: User['role'] = 'member'): Promise<User> {
++    return userService.createUser({ name, email, role });
++  }
++
++  async function createOrderForUser(
++    userId: string,
++    items: { productId: string; name: string; quantity: number; unitPrice: number }[],
++  ): Promise<Order> {
++    return orderService.createOrder({ userId, items });
++  }
++
++  // ── Dashboard data (order summary) ──────────────────────────
++
++  describe('Dashboard: Order Summary', () => {
++    it('should return zeros when no orders exist', () => {
++      const result = routes.getOrderSummary();
++      expect(result.success).toBe(true);
++      expect(result.data).toEqual({
++        totalOrders: 0,
++        totalRevenue: 0,
++        averageOrderValue: 0,
++        minOrderValue: 0,
++        maxOrderValue: 0,
++      });
++    });
++
++    it('should reflect orders created through the service layer', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 25 },
++      ]);
++      await createOrderForUser(user.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 100 },
++      ]);
++
++      const result = routes.getOrderSummary();
++      expect(result.success).toBe(true);
++      expect(result.data!.totalOrders).toBe(2);
++      expect(result.data!.totalRevenue).toBe(150); // 50 + 100
++      expect(result.data!.averageOrderValue).toBe(75);
++      expect(result.data!.minOrderValue).toBe(50);
++      expect(result.data!.maxOrderValue).toBe(100);
++    });
++
++    it('should include orders from multiple users', async () => {
++      const alice = await createUser('Alice', 'alice@test.com');
++      const bob = await createUser('Bob', 'bob@test.com');
++
++      await createOrderForUser(alice.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 30 },
++      ]);
++      await createOrderForUser(bob.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 3, unitPrice: 20 },
++      ]);
++
++      const result = routes.getOrderSummary();
++      expect(result.success).toBe(true);
++      expect(result.data!.totalOrders).toBe(2);
++      expect(result.data!.totalRevenue).toBe(90); // 30 + 60
++    });
++  });
++
++  // ── Status breakdown ────────────────────────────────────────
++
++  describe('Dashboard: Status Breakdown', () => {
++    it('should return empty array when no orders exist', () => {
++      const result = routes.getStatusBreakdown();
++      expect(result.success).toBe(true);
++      expect(result.data).toEqual([]);
++    });
++
++    it('should reflect status changes made through OrderService', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      const order1 = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 100 },
++      ]);
++      const order2 = await createOrderForUser(user.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 200 },
++      ]);
++
++      // Advance order1 to confirmed, order2 stays pending
++      await orderService.updateOrderStatus(order1.id, 'confirmed');
++
++      const result = routes.getStatusBreakdown();
++      expect(result.success).toBe(true);
++
++      const pending = result.data!.find((b) => b.status === 'pending');
++      const confirmed = result.data!.find((b) => b.status === 'confirmed');
++
++      expect(pending).toEqual({ status: 'pending', count: 1, revenue: 200 });
++      expect(confirmed).toEqual({ status: 'confirmed', count: 1, revenue: 100 });
++    });
++
++    it('should track orders through full lifecycle', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      const order = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 50 },
++      ]);
++
++      await orderService.updateOrderStatus(order.id, 'confirmed');
++      await orderService.updateOrderStatus(order.id, 'shipped');
++      await orderService.updateOrderStatus(order.id, 'delivered');
++
++      const result = routes.getStatusBreakdown();
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(1);
++      expect(result.data![0]).toEqual({ status: 'delivered', count: 1, revenue: 50 });
++    });
++  });
++
++  // ── User stats ──────────────────────────────────────────────
++
++  describe('User Stats', () => {
++    it('should return per-user statistics', async () => {
++      const alice = await createUser('Alice', 'alice@test.com');
++      const bob = await createUser('Bob', 'bob@test.com');
++
++      await createOrderForUser(alice.id, [
++        { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 25 },
++      ]);
++      await createOrderForUser(alice.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 100 },
++      ]);
++      await createOrderForUser(bob.id, [
++        { productId: 'p3', name: 'Doohickey', quantity: 5, unitPrice: 10 },
++      ]);
++
++      const result = routes.getUserStats({});
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(2);
++
++      const aliceStats = result.data!.find((s) => s.userId === alice.id);
++      expect(aliceStats!.orderCount).toBe(2);
++      expect(aliceStats!.totalSpent).toBe(150); // 50 + 100
++      expect(aliceStats!.averageOrderValue).toBe(75);
++
++      const bobStats = result.data!.find((s) => s.userId === bob.id);
++      expect(bobStats!.orderCount).toBe(1);
++      expect(bobStats!.totalSpent).toBe(50);
++    });
++
++    it('should filter stats by userId', async () => {
++      const alice = await createUser('Alice', 'alice@test.com');
++      const bob = await createUser('Bob', 'bob@test.com');
++
++      await createOrderForUser(alice.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 30 },
++      ]);
++      await createOrderForUser(bob.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 70 },
++      ]);
++
++      const result = routes.getUserStats({ userId: alice.id });
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(1);
++      expect(result.data![0].userId).toBe(alice.id);
++      expect(result.data![0].totalSpent).toBe(30);
++    });
++
++    it('should return empty for a user with no orders', async () => {
++      await createUser('Alice', 'alice@test.com');
++
++      const result = routes.getUserStats({ userId: 'user-0001' });
++      expect(result.success).toBe(true);
++      expect(result.data).toEqual([]);
++    });
++  });
++
++  // ── Revenue by status ───────────────────────────────────────
++
++  describe('Revenue by Status', () => {
++    it('should return revenue for a specific status after transitions', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++
++      const order1 = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 100 },
++      ]);
++      const order2 = await createOrderForUser(user.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 250 },
++      ]);
++      await createOrderForUser(user.id, [
++        { productId: 'p3', name: 'Doohickey', quantity: 1, unitPrice: 50 },
++      ]);
++
++      // Move two orders to confirmed
++      await orderService.updateOrderStatus(order1.id, 'confirmed');
++      await orderService.updateOrderStatus(order2.id, 'confirmed');
++
++      const result = routes.getRevenueByStatus({ status: 'confirmed' });
++      expect(result.success).toBe(true);
++      expect(result.data!.status).toBe('confirmed');
++      expect(result.data!.revenue).toBe(350); // 100 + 250
++
++      // Pending should have only the third order
++      const pendingResult = routes.getRevenueByStatus({ status: 'pending' });
++      expect(pendingResult.data!.revenue).toBe(50);
++    });
++
++    it('should return zero revenue for status with no orders', async () => {
++      const result = routes.getRevenueByStatus({ status: 'delivered' });
++      expect(result.success).toBe(true);
++      expect(result.data!.revenue).toBe(0);
++    });
++  });
++
++  // ── Daily aggregation / time-range filtering ────────────────
++
++  describe('Daily Aggregation', () => {
++    it('should bucket orders by creation date', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++
++      // Create orders and manually set their createdAt dates via the repo
++      const order1 = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 100 },
++      ]);
++      const order2 = await createOrderForUser(user.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 200 },
++      ]);
++      const order3 = await createOrderForUser(user.id, [
++        { productId: 'p3', name: 'Doohickey', quantity: 1, unitPrice: 50 },
++      ]);
++
++      // Update createdAt dates directly in the repository
++      orderRepo.update(order1.id, { createdAt: new Date('2025-03-10T12:00:00Z') });
++      orderRepo.update(order2.id, { createdAt: new Date('2025-03-10T18:00:00Z') });
++      orderRepo.update(order3.id, { createdAt: new Date('2025-03-12T09:00:00Z') });
++
++      const result = routes.getDailyAggregation({
++        startDate: '2025-03-10',
++        endDate: '2025-03-12',
++      });
++
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(3); // 10th, 11th, 12th
++
++      const mar10 = result.data!.find((b) => b.period === '2025-03-10');
++      expect(mar10!.orderCount).toBe(2);
++      expect(mar10!.revenue).toBe(300);
++
++      const mar11 = result.data!.find((b) => b.period === '2025-03-11');
++      expect(mar11!.orderCount).toBe(0);
++      expect(mar11!.revenue).toBe(0);
++
++      const mar12 = result.data!.find((b) => b.period === '2025-03-12');
++      expect(mar12!.orderCount).toBe(1);
++      expect(mar12!.revenue).toBe(50);
++    });
++
++    it('should return empty buckets for date range with no orders', () => {
++      const result = routes.getDailyAggregation({
++        startDate: '2025-06-01',
++        endDate: '2025-06-03',
++      });
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(3);
++      expect(result.data!.every((b) => b.orderCount === 0 && b.revenue === 0)).toBe(true);
++    });
++  });
++
++  // ── Top users ───────────────────────────────────────────────
++
++  describe('Top Users', () => {
++    it('should rank users by total spending', async () => {
++      const alice = await createUser('Alice', 'alice@test.com');
++      const bob = await createUser('Bob', 'bob@test.com');
++      const carol = await createUser('Carol', 'carol@test.com');
++
++      await createOrderForUser(alice.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 50 },
++      ]);
++      await createOrderForUser(bob.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 300 },
++      ]);
++      await createOrderForUser(carol.id, [
++        { productId: 'p3', name: 'Doohickey', quantity: 1, unitPrice: 150 },
++      ]);
++
++      const result = routes.getTopUsers({});
++      expect(result.success).toBe(true);
++      expect(result.data![0].userId).toBe(bob.id);
++      expect(result.data![1].userId).toBe(carol.id);
++      expect(result.data![2].userId).toBe(alice.id);
++    });
++
++    it('should respect the limit parameter', async () => {
++      const alice = await createUser('Alice', 'alice@test.com');
++      const bob = await createUser('Bob', 'bob@test.com');
++      const carol = await createUser('Carol', 'carol@test.com');
++
++      await createOrderForUser(alice.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 50 },
++      ]);
++      await createOrderForUser(bob.id, [
++        { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 300 },
++      ]);
++      await createOrderForUser(carol.id, [
++        { productId: 'p3', name: 'Doohickey', quantity: 1, unitPrice: 150 },
++      ]);
++
++      const result = routes.getTopUsers({ limit: 2 });
++      expect(result.success).toBe(true);
++      expect(result.data).toHaveLength(2);
++      expect(result.data![0].userId).toBe(bob.id);
++      expect(result.data![1].userId).toBe(carol.id);
++    });
++  });
++
++  // ── Error scenarios ─────────────────────────────────────────
++
++  describe('Error Scenarios', () => {
++    it('should reject order creation for non-existent user', async () => {
++      await expect(
++        createOrderForUser('nonexistent-user', [
++          { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++        ]),
++      ).rejects.toThrow('User not found');
++    });
++
++    it('should reject order creation with empty items', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      await expect(createOrderForUser(user.id, [])).rejects.toThrow(
++        'at least one item',
++      );
++    });
++
++    it('should reject invalid status transitions', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      const order = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++      ]);
++
++      // pending -> delivered is not a valid transition
++      await expect(
++        orderService.updateOrderStatus(order.id, 'delivered'),
++      ).rejects.toThrow('Invalid status transition');
++    });
++
++    it('should reject status change on terminal status (delivered)', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      const order = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++      ]);
++
++      await orderService.updateOrderStatus(order.id, 'confirmed');
++      await orderService.updateOrderStatus(order.id, 'shipped');
++      await orderService.updateOrderStatus(order.id, 'delivered');
++
++      await expect(
++        orderService.updateOrderStatus(order.id, 'cancelled'),
++      ).rejects.toThrow('Invalid status transition');
++    });
++
++    it('should return error for empty userId query param', () => {
++      const result = routes.getUserStats({ userId: '' });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('must not be empty');
++    });
++
++    it('should return error for missing revenue status param', () => {
++      const result = routes.getRevenueByStatus({});
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('required');
++    });
++
++    it('should return error for invalid revenue status param', () => {
++      const result = routes.getRevenueByStatus({ status: 'bogus' });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid status');
++    });
++
++    it('should return error for missing daily aggregation dates', () => {
++      const result = routes.getDailyAggregation({});
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('required');
++    });
++
++    it('should return error for invalid daily aggregation dates', () => {
++      const result = routes.getDailyAggregation({
++        startDate: 'garbage',
++        endDate: '2025-01-01',
++      });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid startDate');
++    });
++
++    it('should return error for reversed date range', () => {
++      const result = routes.getDailyAggregation({
++        startDate: '2025-12-31',
++        endDate: '2025-01-01',
++      });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('before or equal');
++    });
++
++    it('should return error for invalid top-users limit', () => {
++      const result = routes.getTopUsers({ limit: 'xyz' });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Invalid limit');
++    });
++
++    it('should return error for zero top-users limit', () => {
++      const result = routes.getTopUsers({ limit: 0 });
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('at least 1');
++    });
++  });
++
++  // ── Event integration ───────────────────────────────────────
++
++  describe('Event Integration', () => {
++    it('should emit order:created events on the EventBus', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++      ]);
++
++      const log = eventBus.getEventLog();
++      const orderEvents = log.filter((e) => e.type === 'order:created');
++      expect(orderEvents).toHaveLength(1);
++    });
++
++    it('should trigger status-change callbacks on status update', async () => {
++      const notifications: string[] = [];
++      statusChangeCallbacks.register((event) => {
++        notifications.push(`${event.previousStatus}->${event.newStatus}`);
++      });
++
++      const user = await createUser('Alice', 'alice@test.com');
++      const order = await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 },
++      ]);
++
++      await orderService.updateOrderStatus(order.id, 'confirmed');
++      await orderService.updateOrderStatus(order.id, 'shipped');
++
++      expect(notifications).toEqual(['pending->confirmed', 'confirmed->shipped']);
++    });
++  });
++
++  // ── Multi-item order totals ─────────────────────────────────
++
++  describe('Multi-Item Order Totals', () => {
++    it('should correctly calculate totals for multi-item orders', async () => {
++      const user = await createUser('Alice', 'alice@test.com');
++      await createOrderForUser(user.id, [
++        { productId: 'p1', name: 'Widget', quantity: 3, unitPrice: 10 },
++        { productId: 'p2', name: 'Gadget', quantity: 2, unitPrice: 25 },
++        { productId: 'p3', name: 'Doohickey', quantity: 1, unitPrice: 5 },
++      ]);
++      // Expected total: 30 + 50 + 5 = 85
++
++      const result = routes.getOrderSummary();
++      expect(result.success).toBe(true);
++      expect(result.data!.totalRevenue).toBe(85);
++    });
++  });
++});

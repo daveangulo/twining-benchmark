@@ -1,0 +1,657 @@
+diff --git a/COORDINATION.md b/COORDINATION.md
+index 82f7fc5..600298c 100644
+--- a/COORDINATION.md
++++ b/COORDINATION.md
+@@ -46,3 +46,37 @@ Write your updates below. There is no enforced format — use whatever structure
+ - The `NotificationService` constructor auto-subscribes to events. Make sure it's instantiated AFTER the EventBus is created.
+ - All 73 tests pass, build compiles clean.
+ 
++## Agent 2 — Email Notification Adapter (completed)
++
++### What I did
++1. **Replaced the stub `EmailAdapter`** in `src/adapters/email.adapter.ts` with a full implementation:
++   - **Template rendering**: `EMAIL_TEMPLATES` map keyed by `NotificationType`, each producing HTML + plaintext bodies with proper escaping (XSS-safe via `escapeHtml`)
++   - **Recipient resolution**: `resolveRecipient()` validates non-empty, warns on non-email recipients, trims whitespace
++   - **Pluggable transport**: `EmailTransport` interface so production providers (SendGrid, SES, SMTP) can be swapped in; ships with `InMemoryTransport` for testing/dev
++   - **Retry logic**: configurable `maxRetries` (default 2) with sequential retry on transient transport failures
++   - **Structured rendered email**: `RenderedEmail` type with `from`, `to`, `subject`, `html`, `text` fields
++2. **Updated `src/index.ts`** barrel exports to include `InMemoryTransport`, `EmailTransport`, and `RenderedEmail`
++3. **Added 21 unit tests** in `tests/adapters/email.adapter.test.ts` covering:
++   - Channel identity, availability checks (including transport failure)
++   - Successful send + payload tracking, rendered email structure
++   - Transport failure handling, empty recipient rejection
++   - Retry logic (success after retries, exhaustion)
++   - Template rendering for all 5 notification types
++   - HTML escaping (XSS prevention)
++   - getSentEmails/clearSentEmails immutability
++   - InMemoryTransport unit tests
++
++### Architecture decisions
++- **Kept the `NotificationAdapter` interface exactly as-is** — no changes to the contract from Agent 1
++- **`EmailAdapter` constructor is backward-compatible**: `new EmailAdapter(config)` still works (defaults to `InMemoryTransport`), but now also accepts an optional second `transport` argument
++- **Templates are internal** — the `renderTemplate` method is public for testing but the template map is private. Adapters own their formatting.
++
++### Files modified/created
++- **Modified**: `src/adapters/email.adapter.ts` (full rewrite), `src/index.ts` (added exports)
++- **Created**: `tests/adapters/email.adapter.test.ts`
++
++### For future agents
++- The email adapter is already wired into `NotificationService` via `registerAdapter()` — no wiring changes needed
++- To add a production transport, implement `EmailTransport` and pass it as the second arg to `EmailAdapter`
++- All 94 tests pass, build compiles clean
++
+diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts
+index 3ab47e3..eb83d27 100644
+--- a/src/adapters/email.adapter.ts
++++ b/src/adapters/email.adapter.ts
+@@ -2,15 +2,16 @@
+  * Email notification adapter.
+  *
+  * Implements NotificationAdapter for the 'email' channel.
+- * Currently a stub that logs email delivery — replace the send()
+- * internals with a real email provider (SendGrid, SES, SMTP, etc.)
+- * while keeping the interface contract.
++ * Provides template rendering, recipient resolution, and structured
++ * email delivery. Uses an in-memory transport by default; inject a
++ * custom EmailTransport for production use (SendGrid, SES, SMTP, etc.).
+  */
+ 
+ import type { NotificationAdapter } from './notification.adapter.js';
+ import type {
+   NotificationPayload,
+   NotificationResult,
++  NotificationType,
+ } from '../models/notification.js';
+ import { Logger } from '../utils/logger.js';
+ 
+@@ -19,47 +20,239 @@ export interface EmailConfig {
+   fromAddress: string;
+   /** Sender display name (e.g., "TaskFlow Pro") */
+   fromName: string;
++  /** Maximum retries on transient failure */
++  maxRetries?: number;
++}
++
++/**
++ * A rendered email ready for delivery.
++ */
++export interface RenderedEmail {
++  from: string;
++  to: string;
++  subject: string;
++  html: string;
++  text: string;
++}
++
++/**
++ * Transport interface for sending emails.
++ * Swap this out for production providers (SendGrid, SES, SMTP, etc.).
++ */
++export interface EmailTransport {
++  send(email: RenderedEmail): Promise<{ success: boolean; error?: string }>;
++  isConnected(): Promise<boolean>;
++}
++
++/**
++ * Default in-memory transport — stores sent emails for testing/dev.
++ */
++export class InMemoryTransport implements EmailTransport {
++  private sent: RenderedEmail[] = [];
++
++  async send(email: RenderedEmail): Promise<{ success: boolean; error?: string }> {
++    this.sent.push(email);
++    return { success: true };
++  }
++
++  async isConnected(): Promise<boolean> {
++    return true;
++  }
++
++  getSentEmails(): RenderedEmail[] {
++    return [...this.sent];
++  }
++
++  clearSentEmails(): void {
++    this.sent = [];
++  }
++}
++
++/**
++ * Email templates keyed by notification type.
++ * Each template receives the NotificationPayload and returns HTML + text bodies.
++ */
++type TemplateRenderer = (payload: NotificationPayload, fromName: string) => { html: string; text: string };
++
++const EMAIL_TEMPLATES: Record<NotificationType, TemplateRenderer> = {
++  'order-confirmation': (payload, fromName) => ({
++    html: [
++      `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">`,
++      `<h2>Order Confirmation</h2>`,
++      `<p>Hi,</p>`,
++      `<p>${escapeHtml(payload.body)}</p>`,
++      `<p>If you have questions, reply to this email.</p>`,
++      `<hr/><p style="color:#888;font-size:12px;">${escapeHtml(fromName)}</p>`,
++      `</div>`,
++    ].join('\n'),
++    text: `Order Confirmation\n\n${payload.body}\n\n-- ${fromName}`,
++  }),
++
++  'order-status-update': (payload, fromName) => ({
++    html: [
++      `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">`,
++      `<h2>Order Status Update</h2>`,
++      `<p>${escapeHtml(payload.body)}</p>`,
++      `<hr/><p style="color:#888;font-size:12px;">${escapeHtml(fromName)}</p>`,
++      `</div>`,
++    ].join('\n'),
++    text: `Order Status Update\n\n${payload.body}\n\n-- ${fromName}`,
++  }),
++
++  'user-welcome': (payload, fromName) => ({
++    html: [
++      `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">`,
++      `<h2>${escapeHtml(payload.subject)}</h2>`,
++      `<p>${escapeHtml(payload.body)}</p>`,
++      `<p>Get started by creating your first task or order.</p>`,
++      `<hr/><p style="color:#888;font-size:12px;">${escapeHtml(fromName)}</p>`,
++      `</div>`,
++    ].join('\n'),
++    text: `${payload.subject}\n\n${payload.body}\n\nGet started by creating your first task or order.\n\n-- ${fromName}`,
++  }),
++
++  'user-updated': (payload, fromName) => ({
++    html: [
++      `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto;">`,
++      `<h2>Account Updated</h2>`,
++      `<p>${escapeHtml(payload.body)}</p>`,
++      `<hr/><p style="color:#888;font-size:12px;">${escapeHtml(fromName)}</p>`,
++      `</div>`,
++    ].join('\n'),
++    text: `Account Updated\n\n${payload.body}\n\n-- ${fromName}`,
++  }),
++
++  'system-alert': (payload, fromName) => ({
++    html: [
++      `<div style="font-family: sans-serif; max-width: 600px; margin: 0 auto; border-left: 4px solid #e53e3e; padding-left: 16px;">`,
++      `<h2 style="color:#e53e3e;">System Alert</h2>`,
++      `<p>${escapeHtml(payload.body)}</p>`,
++      `<hr/><p style="color:#888;font-size:12px;">${escapeHtml(fromName)}</p>`,
++      `</div>`,
++    ].join('\n'),
++    text: `[ALERT] ${payload.subject}\n\n${payload.body}\n\n-- ${fromName}`,
++  }),
++};
++
++function escapeHtml(str: string): string {
++  return str
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;');
++}
++
++/**
++ * Resolve the recipient email address from a NotificationPayload.
++ * The payload.recipient may be a raw email or a user ID that needs lookup.
++ * For now, we treat any value containing '@' as a valid email address;
++ * otherwise we log a warning and use it as-is (the calling service is
++ * responsible for providing the correct email via the event data).
++ */
++function resolveRecipient(recipient: string, logger: Logger): string {
++  const trimmed = recipient.trim();
++  if (!trimmed) {
++    throw new Error('Recipient is empty');
++  }
++  if (!trimmed.includes('@')) {
++    logger.warn(
++      `Recipient "${trimmed}" does not look like an email address — delivering as-is`,
++    );
++  }
++  return trimmed;
+ }
+ 
+ export class EmailAdapter implements NotificationAdapter {
+   readonly channel = 'email' as const;
+   private logger = new Logger('EmailAdapter');
++  private transport: EmailTransport;
+   private sent: NotificationPayload[] = [];
++  private maxRetries: number;
+ 
+-  constructor(private config: EmailConfig) {}
++  constructor(
++    private config: EmailConfig,
++    transport?: EmailTransport,
++  ) {
++    this.transport = transport ?? new InMemoryTransport();
++    this.maxRetries = config.maxRetries ?? 2;
++  }
+ 
+   /**
+-   * Send an email notification.
+-   *
+-   * Currently stores the email in-memory for testing/development.
+-   * Replace internals with a real provider for production use.
++   * Render the payload into a full email via the template system,
++   * resolve the recipient, and deliver through the transport.
+    */
+   async send(payload: NotificationPayload): Promise<NotificationResult> {
+     this.logger.info(
+       `Sending email to ${payload.recipient}: "${payload.subject}"`,
+     );
+ 
+-    // Stub: store in memory instead of actually sending
+-    this.sent.push(payload);
++    try {
++      const to = resolveRecipient(payload.recipient, this.logger);
++      const rendered = this.renderTemplate(payload);
++
++      const email: RenderedEmail = {
++        from: `${this.config.fromName} <${this.config.fromAddress}>`,
++        to,
++        subject: payload.subject,
++        html: rendered.html,
++        text: rendered.text,
++      };
++
++      const transportResult = await this.sendWithRetry(email);
++
++      if (!transportResult.success) {
++        return {
++          notificationId: payload.id,
++          channel: 'email',
++          success: false,
++          error: transportResult.error ?? 'Transport delivery failed',
++          deliveredAt: new Date(),
++        };
++      }
++
++      // Track for testing / audit
++      this.sent.push(payload);
+ 
+-    return {
+-      notificationId: payload.id,
+-      channel: 'email',
+-      success: true,
+-      deliveredAt: new Date(),
+-    };
++      return {
++        notificationId: payload.id,
++        channel: 'email',
++        success: true,
++        deliveredAt: new Date(),
++      };
++    } catch (err) {
++      const message = err instanceof Error ? err.message : String(err);
++      this.logger.error(`Email send failed: ${message}`);
++      return {
++        notificationId: payload.id,
++        channel: 'email',
++        success: false,
++        error: message,
++        deliveredAt: new Date(),
++      };
++    }
+   }
+ 
+   /**
+-   * Check if the email adapter is available.
++   * Check if the email transport is available.
+    */
+   async isAvailable(): Promise<boolean> {
+-    // In production, this would check SMTP connection / API key validity
+-    return true;
++    try {
++      return await this.transport.isConnected();
++    } catch {
++      return false;
++    }
++  }
++
++  /**
++   * Render an email body using the template for the notification type.
++   */
++  renderTemplate(payload: NotificationPayload): { html: string; text: string } {
++    const renderer = EMAIL_TEMPLATES[payload.type];
++    return renderer(payload, this.config.fromName);
+   }
+ 
+   /**
+-   * Get all sent emails. Useful for testing.
++   * Get all successfully sent payloads. Useful for testing.
+    */
+   getSentEmails(): NotificationPayload[] {
+     return [...this.sent];
+@@ -71,4 +264,33 @@ export class EmailAdapter implements NotificationAdapter {
+   clearSentEmails(): void {
+     this.sent = [];
+   }
++
++  /**
++   * Get the underlying transport (useful for testing with InMemoryTransport).
++   */
++  getTransport(): EmailTransport {
++    return this.transport;
++  }
++
++  /**
++   * Attempt to send with retries on transient failure.
++   */
++  private async sendWithRetry(
++    email: RenderedEmail,
++  ): Promise<{ success: boolean; error?: string }> {
++    let lastError: string | undefined;
++
++    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
++      const result = await this.transport.send(email);
++      if (result.success) {
++        return result;
++      }
++      lastError = result.error;
++      this.logger.warn(
++        `Email delivery attempt ${attempt + 1} failed: ${lastError}`,
++      );
++    }
++
++    return { success: false, error: lastError };
++  }
+ }
+diff --git a/src/index.ts b/src/index.ts
+index 196dddd..0f6cd68 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -55,8 +55,8 @@ export type {
+ 
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+-export { EmailAdapter } from './adapters/email.adapter.js';
+-export type { EmailConfig } from './adapters/email.adapter.js';
++export { EmailAdapter, InMemoryTransport } from './adapters/email.adapter.js';
++export type { EmailConfig, EmailTransport, RenderedEmail } from './adapters/email.adapter.js';
+ 
+ // Services
+ export { UserService } from './services/user.service.js';
+diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts
+new file mode 100644
+index 0000000..e971306
+--- /dev/null
++++ b/tests/adapters/email.adapter.test.ts
+@@ -0,0 +1,279 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  EmailAdapter,
++  InMemoryTransport,
++} from '../../src/adapters/email.adapter.js';
++import type {
++  EmailTransport,
++  RenderedEmail,
++} from '../../src/adapters/email.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides?: Partial<NotificationPayload>): NotificationPayload {
++  return {
++    id: 'notif-0001',
++    type: 'order-confirmation',
++    channel: 'email',
++    recipient: 'alice@example.com',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    priority: 'normal',
++    metadata: {},
++    createdAt: new Date(),
++    ...overrides,
++  };
++}
++
++describe('EmailAdapter', () => {
++  let adapter: EmailAdapter;
++  let transport: InMemoryTransport;
++
++  beforeEach(() => {
++    transport = new InMemoryTransport();
++    adapter = new EmailAdapter(
++      { fromAddress: 'noreply@taskflow.io', fromName: 'TaskFlow Pro' },
++      transport,
++    );
++  });
++
++  describe('channel', () => {
++    it('should report channel as email', () => {
++      expect(adapter.channel).toBe('email');
++    });
++  });
++
++  describe('isAvailable', () => {
++    it('should return true when transport is connected', async () => {
++      expect(await adapter.isAvailable()).toBe(true);
++    });
++
++    it('should return false when transport throws', async () => {
++      const failTransport: EmailTransport = {
++        send: async () => ({ success: true }),
++        isConnected: async () => { throw new Error('connection lost'); },
++      };
++      const failAdapter = new EmailAdapter(
++        { fromAddress: 'a@b.com', fromName: 'Test' },
++        failTransport,
++      );
++      expect(await failAdapter.isAvailable()).toBe(false);
++    });
++  });
++
++  describe('send', () => {
++    it('should send successfully and track the payload', async () => {
++      const payload = makePayload();
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.notificationId).toBe('notif-0001');
++      expect(result.channel).toBe('email');
++      expect(result.deliveredAt).toBeInstanceOf(Date);
++
++      expect(adapter.getSentEmails()).toHaveLength(1);
++      expect(adapter.getSentEmails()[0]?.id).toBe('notif-0001');
++    });
++
++    it('should construct a proper rendered email sent to transport', async () => {
++      const payload = makePayload();
++      await adapter.send(payload);
++
++      const sent = transport.getSentEmails();
++      expect(sent).toHaveLength(1);
++      expect(sent[0]?.from).toBe('TaskFlow Pro <noreply@taskflow.io>');
++      expect(sent[0]?.to).toBe('alice@example.com');
++      expect(sent[0]?.subject).toBe('Order Confirmation: order-1');
++      expect(sent[0]?.html).toContain('Order Confirmation');
++      expect(sent[0]?.text).toContain('Widget x2');
++    });
++
++    it('should return failure when transport fails', async () => {
++      const failTransport: EmailTransport = {
++        send: async () => ({ success: false, error: 'SMTP timeout' }),
++        isConnected: async () => true,
++      };
++      const failAdapter = new EmailAdapter(
++        { fromAddress: 'a@b.com', fromName: 'Test', maxRetries: 0 },
++        failTransport,
++      );
++
++      const result = await failAdapter.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('SMTP timeout');
++    });
++
++    it('should return failure when recipient is empty', async () => {
++      const payload = makePayload({ recipient: '  ' });
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Recipient is empty');
++    });
++
++    it('should still deliver when recipient has no @ sign', async () => {
++      const payload = makePayload({ recipient: 'user-123' });
++      const result = await adapter.send(payload);
++
++      // Delivers as-is (the service is responsible for providing correct email)
++      expect(result.success).toBe(true);
++      const sent = transport.getSentEmails();
++      expect(sent[0]?.to).toBe('user-123');
++    });
++  });
++
++  describe('retry logic', () => {
++    it('should retry on failure up to maxRetries', async () => {
++      let attempts = 0;
++      const flakyTransport: EmailTransport = {
++        send: async () => {
++          attempts++;
++          if (attempts < 3) {
++            return { success: false, error: 'transient' };
++          }
++          return { success: true };
++        },
++        isConnected: async () => true,
++      };
++
++      const retryAdapter = new EmailAdapter(
++        { fromAddress: 'a@b.com', fromName: 'Test', maxRetries: 2 },
++        flakyTransport,
++      );
++
++      const result = await retryAdapter.send(makePayload());
++      expect(result.success).toBe(true);
++      expect(attempts).toBe(3); // 1 initial + 2 retries
++    });
++
++    it('should give up after maxRetries exhausted', async () => {
++      const failTransport: EmailTransport = {
++        send: async () => ({ success: false, error: 'always fails' }),
++        isConnected: async () => true,
++      };
++
++      const retryAdapter = new EmailAdapter(
++        { fromAddress: 'a@b.com', fromName: 'Test', maxRetries: 1 },
++        failTransport,
++      );
++
++      const result = await retryAdapter.send(makePayload());
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('always fails');
++    });
++  });
++
++  describe('template rendering', () => {
++    it('should render order-confirmation template', () => {
++      const payload = makePayload({ type: 'order-confirmation' });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).toContain('Order Confirmation');
++      expect(rendered.html).toContain('Widget x2');
++      expect(rendered.text).toContain('Order Confirmation');
++      expect(rendered.text).toContain('TaskFlow Pro');
++    });
++
++    it('should render order-status-update template', () => {
++      const payload = makePayload({
++        type: 'order-status-update',
++        body: 'Status changed from pending to confirmed.',
++      });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).toContain('Order Status Update');
++      expect(rendered.html).toContain('pending to confirmed');
++      expect(rendered.text).toContain('pending to confirmed');
++    });
++
++    it('should render user-welcome template', () => {
++      const payload = makePayload({
++        type: 'user-welcome',
++        subject: 'Welcome to TaskFlow Pro, Alice!',
++        body: 'Your account has been created.',
++      });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).toContain('Welcome to TaskFlow Pro, Alice!');
++      expect(rendered.html).toContain('Get started');
++      expect(rendered.text).toContain('Get started');
++    });
++
++    it('should render user-updated template', () => {
++      const payload = makePayload({
++        type: 'user-updated',
++        body: 'Your profile was updated.',
++      });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).toContain('Account Updated');
++      expect(rendered.text).toContain('Your profile was updated.');
++    });
++
++    it('should render system-alert template with alert styling', () => {
++      const payload = makePayload({
++        type: 'system-alert',
++        subject: 'High CPU Usage',
++        body: 'Server load exceeded threshold.',
++      });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).toContain('System Alert');
++      expect(rendered.html).toContain('#e53e3e');
++      expect(rendered.text).toContain('[ALERT]');
++    });
++
++    it('should escape HTML in body content', () => {
++      const payload = makePayload({
++        body: '<script>alert("xss")</script>',
++      });
++      const rendered = adapter.renderTemplate(payload);
++
++      expect(rendered.html).not.toContain('<script>');
++      expect(rendered.html).toContain('&lt;script&gt;');
++    });
++  });
++
++  describe('getSentEmails / clearSentEmails', () => {
++    it('should return a copy of sent emails', async () => {
++      await adapter.send(makePayload());
++      const sent = adapter.getSentEmails();
++      sent.pop(); // mutate the copy
++      expect(adapter.getSentEmails()).toHaveLength(1);
++    });
++
++    it('should clear sent emails', async () => {
++      await adapter.send(makePayload());
++      adapter.clearSentEmails();
++      expect(adapter.getSentEmails()).toHaveLength(0);
++    });
++  });
++
++  describe('InMemoryTransport', () => {
++    it('should store and return sent emails', async () => {
++      const email: RenderedEmail = {
++        from: 'a@b.com',
++        to: 'c@d.com',
++        subject: 'Test',
++        html: '<p>Hi</p>',
++        text: 'Hi',
++      };
++
++      const result = await transport.send(email);
++      expect(result.success).toBe(true);
++      expect(transport.getSentEmails()).toHaveLength(1);
++      expect(transport.getSentEmails()[0]?.to).toBe('c@d.com');
++    });
++
++    it('should clear stored emails', async () => {
++      await transport.send({
++        from: 'a@b.com', to: 'c@d.com', subject: 'X', html: '', text: '',
++      });
++      transport.clearSentEmails();
++      expect(transport.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should report connected', async () => {
++      expect(await transport.isConnected()).toBe(true);
++    });
++  });
++});

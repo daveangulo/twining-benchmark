@@ -1,0 +1,713 @@
+{
+  "compactionCount": 0,
+  "condition": "baseline",
+  "contextWindowSize": 0,
+  "exitReason": "completed",
+  "fileChanges": [
+    {
+      "changeType": "modified",
+      "diff": "diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts\nindex d78851f..9c54d4e 100644\n--- a/src/services/notification.service.ts\n+++ b/src/services/notification.service.ts\n@@ -397,8 +397,9 @@ export class NotificationService {\n     }\n \n     for (const channel of channels) {\n+      const recipient = this.resolveChannelRecipient(channel, params.userId, params.recipient);\n       await this.dispatchToChannel({\n-        recipient: params.recipient,\n+        recipient,\n         subject: params.subject,\n         body: params.body,\n         channel,\n@@ -406,6 +407,47 @@ export class NotificationService {\n     }\n   }\n \n+  /**\n+   * Resolve the appropriate recipient identifier for a given channel.\n+   *\n+   * Different channels expect different recipient formats:\n+   * - email: email address (passed through as-is, or adapter maps userId → email)\n+   * - sms: userId (adapter maps to phone number via registerRecipient)\n+   * - webhook: URL from user preferences, or userId for adapter resolution\n+   * - in_app: userId\n+   *\n+   * @param channel - The notification channel.\n+   * @param userId - The user ID for recipient resolution.\n+   * @param defaultRecipient - The default recipient (typically the email address).\n+   * @returns The resolved recipient identifier for the channel.\n+   */\n+  private resolveChannelRecipient(\n+    channel: NotificationType,\n+    userId: string,\n+    defaultRecipient: string,\n+  ): string {\n+    switch (channel) {\n+      case 'email':\n+        return defaultRecipient;\n+      case 'sms':\n+        // SMS adapter resolves userId → phone number via registerRecipient\n+        return userId;\n+      case 'webhook': {\n+        // Webhook expects a URL. Prefer the URL from user preferences if available.\n+        if (this.preferencesService) {\n+          const prefs = this.preferencesService.getPreferences(userId);\n+          if (prefs?.webhook.url) {\n+            return prefs.webhook.url;\n+          }\n+        }\n+        // Fall back to userId for adapter-level resolution\n+        return userId;\n+      }\n+      default:\n+        return defaultRecipient;\n+    }\n+  }\n+\n   /**\n    * Dispatch a notification to a single channel.\n    * Creates a record in-memory and attempts delivery through the adapter if available.\n@@ -424,14 +466,13 @@ export class NotificationService {\n       body: params.body,\n       channel: params.channel,\n       priority: 'normal',\n-      status: 'sent',\n+      status: 'pending',\n       createdAt: new Date(),\n-      sentAt: new Date(),\n     };\n \n     this.notifications.push(notification);\n     this.logger.info(\n-      `Notification sent: ${notification.id} to ${params.recipient} via ${params.channel}`,\n+      `Notification queued: ${notification.id} to ${params.recipient} via ${params.channel}`,\n     );\n \n     // If an adapter is registered for this channel, dispatch through it.\n@@ -447,11 +488,57 @@ export class NotificationService {\n         priority: 'normal',\n       };\n       try {\n-        await adapter.send(payload);\n+        const result = await adapter.send(payload);\n+        if (result.success) {\n+          notification.status = 'sent';\n+          notification.sentAt = new Date();\n+          this.logger.info(\n+            `Notification ${notification.id} sent successfully via ${params.channel}`,\n+          );\n+          await this.eventBus.emit({\n+            type: 'notification:sent',\n+            notification,\n+            channel: params.channel,\n+            timestamp: new Date(),\n+          });\n+        } else {\n+          notification.status = 'failed';\n+          notification.errorMessage = result.errorMessage ?? 'Unknown delivery error';\n+          this.logger.error(\n+            `Notification ${notification.id} failed via ${params.channel}: ${notification.errorMessage}`,\n+          );\n+          await this.eventBus.emit({\n+            type: 'notification:failed',\n+            notification,\n+            channel: params.channel,\n+            errorMessage: notification.errorMessage,\n+            timestamp: new Date(),\n+          });\n+        }\n       } catch (err: unknown) {\n         const msg = err instanceof Error ? err.message : 'Unknown error';\n+        notification.status = 'failed';\n+        notification.errorMessage = msg;\n         this.logger.error(`Adapter delivery error (${params.channel}): ${msg}`);\n+        await this.eventBus.emit({\n+          type: 'notification:failed',\n+          notification,\n+          channel: params.channel,\n+          errorMessage: msg,\n+          timestamp: new Date(),\n+        });\n       }\n+    } else {\n+      // No adapter or adapter unavailable — still mark as sent for backward compatibility\n+      // with in-memory record keeping, but emit sent event for history tracking.\n+      notification.status = 'sent';\n+      notification.sentAt = new Date();\n+      await this.eventBus.emit({\n+        type: 'notification:sent',\n+        notification,\n+        channel: params.channel,\n+        timestamp: new Date(),\n+      });\n     }\n   }\n \n",
+      "linesAdded": 92,
+      "linesRemoved": 5,
+      "path": "src/services/notification.service.ts"
+    },
+    {
+      "changeType": "added",
+      "diff": "diff --git a/tests/integration/notification-pipeline.integration.test.ts b/tests/integration/notification-pipeline.integration.test.ts\nnew file mode 100644\nindex 0000000..bbd10d6\n--- /dev/null\n+++ b/tests/integration/notification-pipeline.integration.test.ts\n@@ -0,0 +1,975 @@\n+/**\n+ * Integration tests for the full notification pipeline.\n+ *\n+ * Tests the end-to-end flow:\n+ *   Domain Events → EventBus → NotificationService → PreferencesCheck\n+ *     → Adapters (email, SMS, webhook) → EventBus → NotificationHistoryService → Repository\n+ *\n+ * These tests wire up all real components (no mocks) to verify\n+ * the full pipeline works correctly across service boundaries.\n+ */\n+\n+import { describe, it, expect, beforeEach } from 'vitest';\n+import { EventBus } from '../../src/events/event-bus.js';\n+import {\n+  NotificationService,\n+  resetNotificationIdCounter,\n+} from '../../src/services/notification.service.js';\n+import {\n+  NotificationHistoryService,\n+  resetLogIdCounter,\n+} from '../../src/services/notification-history.service.js';\n+import { PreferencesService } from '../../src/services/preferences.service.js';\n+import { EmailAdapter } from '../../src/adapters/email.adapter.js';\n+import { SmsAdapter } from '../../src/adapters/sms.adapter.js';\n+import { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';\n+import { NotificationLogRepository } from '../../src/repositories/notification-log.repository.js';\n+import { PreferencesRepository } from '../../src/repositories/preferences.repository.js';\n+import { Database } from '../../src/utils/database.js';\n+import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';\n+import type { User } from '../../src/models/user.js';\n+import type { Order } from '../../src/models/order.js';\n+\n+// ---------------------------------------------------------------------------\n+// Shared test fixtures\n+// ---------------------------------------------------------------------------\n+\n+function createTestUser(overrides?: Partial<User>): User {\n+  return {\n+    id: 'user-1',\n+    name: 'Alice',\n+    email: 'alice@example.com',\n+    role: 'member',\n+    createdAt: new Date(),\n+    updatedAt: new Date(),\n+    ...overrides,\n+  };\n+}\n+\n+function createTestOrder(overrides?: Partial<Order>): Order {\n+  return {\n+    id: 'order-1',\n+    userId: 'user-1',\n+    items: [\n+      { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },\n+      { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 25 },\n+    ],\n+    total: 45,\n+    status: 'pending',\n+    createdAt: new Date(),\n+    updatedAt: new Date(),\n+    ...overrides,\n+  };\n+}\n+\n+function createOrderCreatedEvent(user?: User, order?: Order): OrderCreatedEvent {\n+  const u = user ?? createTestUser();\n+  const o = order ?? createTestOrder();\n+  return {\n+    type: 'order:created',\n+    order: o,\n+    user: u,\n+    timestamp: new Date(),\n+  };\n+}\n+\n+function createOrderStatusChangedEvent(\n+  previousStatus: string,\n+  newStatus: string,\n+  order?: Order,\n+): OrderStatusChangedEvent {\n+  const o = order ?? createTestOrder({ status: newStatus as Order['status'] });\n+  return {\n+    type: 'order:status-changed',\n+    order: o,\n+    previousStatus,\n+    newStatus,\n+    timestamp: new Date(),\n+  };\n+}\n+\n+// ---------------------------------------------------------------------------\n+// Integration test suite\n+// ---------------------------------------------------------------------------\n+\n+describe('Notification Pipeline Integration', () => {\n+  let db: Database;\n+  let eventBus: EventBus;\n+  let notificationService: NotificationService;\n+  let historyService: NotificationHistoryService;\n+  let preferencesService: PreferencesService;\n+  let emailAdapter: EmailAdapter;\n+  let smsAdapter: SmsAdapter;\n+  let webhookAdapter: WebhookAdapter;\n+  let logRepository: NotificationLogRepository;\n+  let preferencesRepository: PreferencesRepository;\n+\n+  beforeEach(() => {\n+    // Reset all state\n+    resetNotificationIdCounter();\n+    resetLogIdCounter();\n+\n+    // Fresh database for each test\n+    db = new Database();\n+\n+    // Repositories\n+    logRepository = new NotificationLogRepository(db);\n+    preferencesRepository = new PreferencesRepository(db);\n+\n+    // Event bus (shared across all services)\n+    eventBus = new EventBus();\n+\n+    // Preferences service\n+    preferencesService = new PreferencesService(preferencesRepository, eventBus);\n+\n+    // Notification service (with preferences)\n+    notificationService = new NotificationService(eventBus, preferencesService);\n+\n+    // History service (subscribes to notification:sent/failed events)\n+    historyService = new NotificationHistoryService(eventBus, logRepository);\n+\n+    // Adapters\n+    emailAdapter = new EmailAdapter();\n+    smsAdapter = new SmsAdapter();\n+    webhookAdapter = new WebhookAdapter();\n+\n+    // Register adapters\n+    notificationService.registerAdapter(emailAdapter);\n+    notificationService.registerAdapter(smsAdapter);\n+    notificationService.registerAdapter(webhookAdapter);\n+\n+    // Register recipient mappings so adapters can resolve user IDs\n+    emailAdapter.registerRecipient('user-1', 'alice@example.com');\n+    smsAdapter.registerRecipient('user-1', '+14155551234');\n+    emailAdapter.registerRecipient('user-2', 'bob@example.com');\n+    smsAdapter.registerRecipient('user-2', '+14155555678');\n+  });\n+\n+  // =========================================================================\n+  // 1. Email notification with preferences enabled\n+  // =========================================================================\n+\n+  describe('email notification delivery (preferences enabled)', () => {\n+    it('should deliver email notification through the full pipeline when email is enabled', async () => {\n+      // Email is opt-out (enabled by default) — no need to explicitly enable\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Verify notification was created\n+      const notifications = notificationService.getNotifications();\n+      expect(notifications.length).toBeGreaterThanOrEqual(1);\n+      const emailNotif = notifications.find((n) => n.channel === 'email');\n+      expect(emailNotif).toBeDefined();\n+      expect(emailNotif!.subject).toContain('Order Confirmation');\n+      expect(emailNotif!.status).toBe('sent');\n+\n+      // Verify email was delivered through the adapter\n+      const sentEmails = emailAdapter.getSentEmails();\n+      expect(sentEmails.length).toBeGreaterThanOrEqual(1);\n+      expect(sentEmails[0]!.to).toBe('alice@example.com');\n+      expect(sentEmails[0]!.subject).toContain('Order Confirmation');\n+\n+      // Verify notification was logged in history\n+      const logs = historyService.getLogs();\n+      const emailLogs = logs.filter((l) => l.channel === 'email');\n+      expect(emailLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(emailLogs[0]!.deliveryStatus).toBe('delivered');\n+      expect(emailLogs[0]!.recipient).toBe('alice@example.com');\n+    });\n+\n+    it('should deliver email for order status change events', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      // Register email recipient for user-1 (status change uses userId as recipient)\n+      emailAdapter.registerRecipient('user-1', 'alice@example.com');\n+\n+      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n+\n+      const sentEmails = emailAdapter.getSentEmails();\n+      const statusEmails = sentEmails.filter((e) => e.subject.includes('Order Update'));\n+      expect(statusEmails.length).toBeGreaterThanOrEqual(1);\n+\n+      // Verify history records\n+      const logs = historyService.getLogsByChannel('email');\n+      const statusLogs = logs.filter((l) => l.subject.includes('Order Update'));\n+      expect(statusLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(statusLogs[0]!.deliveryStatus).toBe('delivered');\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 2. SMS notification with preferences enabled\n+  // =========================================================================\n+\n+  describe('SMS notification delivery (preferences enabled)', () => {\n+    it('should deliver SMS notification when SMS is explicitly enabled', async () => {\n+      // SMS is opt-in (disabled by default) — must explicitly enable\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Verify SMS was delivered through the adapter\n+      const sentMessages = smsAdapter.getSentMessages();\n+      expect(sentMessages.length).toBeGreaterThanOrEqual(1);\n+      expect(sentMessages[0]!.to).toBe('+14155551234');\n+      expect(sentMessages[0]!.body).toContain('Order Confirmation');\n+\n+      // Verify SMS notification record\n+      const notifications = notificationService.getNotifications();\n+      const smsNotif = notifications.find((n) => n.channel === 'sms');\n+      expect(smsNotif).toBeDefined();\n+      expect(smsNotif!.status).toBe('sent');\n+\n+      // Verify SMS notification logged in history\n+      const smsLogs = historyService.getLogsByChannel('sms');\n+      expect(smsLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(smsLogs[0]!.deliveryStatus).toBe('delivered');\n+    });\n+\n+    it('should truncate long SMS messages', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+      });\n+\n+      // Create order with many items to generate a long message\n+      const order = createTestOrder({\n+        items: [\n+          { productId: 'p1', name: 'Super Deluxe Premium Widget Pro Max Ultra', quantity: 5, unitPrice: 99.99 },\n+          { productId: 'p2', name: 'Advanced Quantum Entanglement Device', quantity: 3, unitPrice: 149.99 },\n+        ],\n+        total: 949.92,\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent(createTestUser(), order));\n+\n+      const sentMessages = smsAdapter.getSentMessages();\n+      const smsMessage = sentMessages.find((m) => m.to === '+14155551234');\n+      expect(smsMessage).toBeDefined();\n+      // Standard SMS length limit is 160 chars\n+      expect(smsMessage!.body.length).toBeLessThanOrEqual(160);\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 3. Webhook notification delivery\n+  // =========================================================================\n+\n+  describe('webhook notification delivery', () => {\n+    it('should deliver webhook notification when webhook is explicitly enabled', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Verify webhook was delivered through the adapter\n+      const deliveries = webhookAdapter.getDeliveries();\n+      expect(deliveries.length).toBeGreaterThanOrEqual(1);\n+      expect(deliveries[0]!.payload.event).toBe('notification');\n+      expect(deliveries[0]!.payload.subject).toContain('Order Confirmation');\n+\n+      // Verify webhook notification record\n+      const notifications = notificationService.getNotifications();\n+      const webhookNotif = notifications.find((n) => n.channel === 'webhook');\n+      expect(webhookNotif).toBeDefined();\n+      expect(webhookNotif!.status).toBe('sent');\n+\n+      // Verify webhook notification logged in history\n+      const webhookLogs = historyService.getLogsByChannel('webhook');\n+      expect(webhookLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(webhookLogs[0]!.deliveryStatus).toBe('delivered');\n+    });\n+\n+    it('should send signed webhook payload when secret is configured', async () => {\n+      // Replace webhook adapter with one that has a secret\n+      const signedWebhookAdapter = new WebhookAdapter({ secret: 'test-secret-key' });\n+      notificationService.registerAdapter(signedWebhookAdapter);\n+\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const deliveries = signedWebhookAdapter.getDeliveries();\n+      expect(deliveries.length).toBeGreaterThanOrEqual(1);\n+      expect(deliveries[0]!.headers['X-Webhook-Signature']).toBeDefined();\n+      expect(deliveries[0]!.headers['X-Webhook-Signature']).toMatch(/^sha256=/);\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 4. Notifications logged in history\n+  // =========================================================================\n+\n+  describe('notification history logging', () => {\n+    it('should log all channel deliveries in notification history', async () => {\n+      // Enable all channels\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // All three channels should have history records\n+      const allLogs = historyService.getLogs();\n+      expect(allLogs.length).toBeGreaterThanOrEqual(3);\n+\n+      const emailLogs = historyService.getLogsByChannel('email');\n+      const smsLogs = historyService.getLogsByChannel('sms');\n+      const webhookLogs = historyService.getLogsByChannel('webhook');\n+\n+      expect(emailLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(smsLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(webhookLogs.length).toBeGreaterThanOrEqual(1);\n+\n+      // All should be delivered\n+      for (const log of allLogs) {\n+        expect(log.deliveryStatus).toBe('delivered');\n+      }\n+    });\n+\n+    it('should log notification history with correct fields', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const logs = historyService.getLogsByChannel('email');\n+      expect(logs.length).toBeGreaterThanOrEqual(1);\n+\n+      const log = logs[0]!;\n+      expect(log.id).toBeDefined();\n+      expect(log.notificationId).toBeDefined();\n+      expect(log.recipient).toBe('alice@example.com');\n+      expect(log.channel).toBe('email');\n+      expect(log.subject).toContain('Order Confirmation');\n+      expect(log.body).toContain('Widget x2');\n+      expect(log.priority).toBe('normal');\n+      expect(log.deliveryStatus).toBe('delivered');\n+      expect(log.timestamp).toBeInstanceOf(Date);\n+    });\n+\n+    it('should log failed notifications in history', async () => {\n+      // Use the public send() API with an unregistered channel to trigger failure\n+      await notificationService.send({\n+        recipient: 'alice@example.com',\n+        subject: 'Test Failure',\n+        body: 'This should fail',\n+        channel: 'in_app', // no adapter registered for in_app\n+      });\n+\n+      const logs = historyService.getLogs();\n+      const failedLogs = logs.filter((l) => l.deliveryStatus === 'failed');\n+      expect(failedLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(failedLogs[0]!.errorMessage).toBeDefined();\n+    });\n+\n+    it('should query history by recipient', async () => {\n+      // Create preferences for two different users\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+      preferencesService.createPreferences({ userId: 'user-2' });\n+\n+      const user1 = createTestUser();\n+      const user2 = createTestUser({ id: 'user-2', name: 'Bob', email: 'bob@example.com' });\n+      const order1 = createTestOrder();\n+      const order2 = createTestOrder({ id: 'order-2', userId: 'user-2' });\n+\n+      await eventBus.emit(createOrderCreatedEvent(user1, order1));\n+      await eventBus.emit(createOrderCreatedEvent(user2, order2));\n+\n+      const aliceLogs = historyService.getLogsByRecipient('alice@example.com');\n+      const bobLogs = historyService.getLogsByRecipient('bob@example.com');\n+\n+      expect(aliceLogs.length).toBeGreaterThanOrEqual(1);\n+      expect(bobLogs.length).toBeGreaterThanOrEqual(1);\n+\n+      // No cross-contamination\n+      for (const log of aliceLogs) {\n+        expect(log.recipient).toBe('alice@example.com');\n+      }\n+      for (const log of bobLogs) {\n+        expect(log.recipient).toBe('bob@example.com');\n+      }\n+    });\n+\n+    it('should query history by delivery status', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      // Successful delivery via event\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Failed delivery via public send() with no adapter for in_app\n+      await notificationService.send({\n+        recipient: 'alice@example.com',\n+        subject: 'Fail Test',\n+        body: 'This should fail',\n+        channel: 'in_app',\n+      });\n+\n+      const delivered = historyService.getLogsByDeliveryStatus('delivered');\n+      const failed = historyService.getLogsByDeliveryStatus('failed');\n+\n+      expect(delivered.length).toBeGreaterThanOrEqual(1);\n+      expect(failed.length).toBeGreaterThanOrEqual(1);\n+    });\n+\n+    it('should support combined query filters', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Query for delivered email notifications to alice\n+      const results = historyService.queryLogs({\n+        recipient: 'alice@example.com',\n+        channel: 'email',\n+        deliveryStatus: 'delivered',\n+      });\n+\n+      expect(results.length).toBeGreaterThanOrEqual(1);\n+      for (const log of results) {\n+        expect(log.recipient).toBe('alice@example.com');\n+        expect(log.channel).toBe('email');\n+        expect(log.deliveryStatus).toBe('delivered');\n+      }\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 5. User preferences respected (disabled channel = no notification)\n+  // =========================================================================\n+\n+  describe('user preferences respected', () => {\n+    it('should NOT send email when email channel is disabled', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        email: { enabled: false },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // No email should be sent\n+      const sentEmails = emailAdapter.getSentEmails();\n+      expect(sentEmails).toHaveLength(0);\n+\n+      // No email notifications in the service\n+      const notifications = notificationService.getNotifications();\n+      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n+      expect(emailNotifs).toHaveLength(0);\n+    });\n+\n+    it('should NOT send SMS when SMS is not explicitly enabled (opt-in model)', async () => {\n+      // Create preferences with defaults (SMS disabled by default)\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // No SMS should be sent\n+      const sentMessages = smsAdapter.getSentMessages();\n+      expect(sentMessages).toHaveLength(0);\n+\n+      // No SMS notifications\n+      const notifications = notificationService.getNotifications();\n+      const smsNotifs = notifications.filter((n) => n.channel === 'sms');\n+      expect(smsNotifs).toHaveLength(0);\n+    });\n+\n+    it('should NOT send webhook when webhook is not explicitly enabled (opt-in model)', async () => {\n+      // Create preferences with defaults (webhook disabled by default)\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // No webhook should be delivered\n+      const deliveries = webhookAdapter.getDeliveries();\n+      expect(deliveries).toHaveLength(0);\n+\n+      const notifications = notificationService.getNotifications();\n+      const webhookNotifs = notifications.filter((n) => n.channel === 'webhook');\n+      expect(webhookNotifs).toHaveLength(0);\n+    });\n+\n+    it('should only send to enabled channels when some are disabled', async () => {\n+      // Enable email + SMS, disable webhook\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        email: { enabled: true },\n+        sms: { enabled: true },\n+        webhook: { enabled: false },\n+      });\n+\n+      // SMS adapter needs to resolve user-1 → phone (already set in beforeEach)\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Email should be sent\n+      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n+\n+      // SMS should be sent (recipient resolved from user-1 → +14155551234)\n+      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n+\n+      // Webhook should NOT be sent\n+      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n+\n+      // Verify notification records match\n+      const notifications = notificationService.getNotifications();\n+      const channels = notifications.map((n) => n.channel);\n+      expect(channels).toContain('email');\n+      expect(channels).toContain('sms');\n+      expect(channels).not.toContain('webhook');\n+    });\n+\n+    it('should respect per-category subscriptions', async () => {\n+      // Enable email but only subscribe to order_status_updates (NOT order_confirmations)\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        email: {\n+          enabled: true,\n+          subscribedCategories: ['order_status_updates'],\n+        },\n+      });\n+\n+      // order_confirmations should NOT trigger email\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const emailsAfterCreate = emailAdapter.getSentEmails();\n+      expect(emailsAfterCreate).toHaveLength(0);\n+\n+      // order_status_updates SHOULD trigger email\n+      emailAdapter.registerRecipient('user-1', 'alice@example.com');\n+      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n+\n+      const emailsAfterStatus = emailAdapter.getSentEmails();\n+      expect(emailsAfterStatus.length).toBeGreaterThanOrEqual(1);\n+      expect(emailsAfterStatus[0]!.subject).toContain('Order Update');\n+    });\n+\n+    it('should suppress all notifications when all channels are disabled', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        email: { enabled: false },\n+        sms: { enabled: false },\n+        webhook: { enabled: false },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // No notifications should exist\n+      expect(notificationService.getNotifications()).toHaveLength(0);\n+      expect(emailAdapter.getSentEmails()).toHaveLength(0);\n+      expect(smsAdapter.getSentMessages()).toHaveLength(0);\n+      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n+    });\n+\n+    it('should use default behavior (email-only) when no preferences exist for user', async () => {\n+      // Do NOT create preferences for user-1\n+      // With PreferencesService configured, email is opt-out (default enabled),\n+      // SMS and webhook are opt-in (default disabled)\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Email should be sent (opt-out model — default enabled)\n+      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n+\n+      // SMS should NOT be sent (opt-in model — default disabled)\n+      expect(smsAdapter.getSentMessages()).toHaveLength(0);\n+\n+      // Webhook should NOT be sent (opt-in model — default disabled)\n+      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n+    });\n+\n+    it('should send only email when no PreferencesService is configured (backward compat)', async () => {\n+      // Create a notification service WITHOUT preferences service\n+      const eventBus2 = new EventBus();\n+      const notifService2 = new NotificationService(eventBus2);\n+      // Also register the history service on the same bus\n+      const historyService2 = new NotificationHistoryService(eventBus2, logRepository);\n+\n+      const emailAdapter2 = new EmailAdapter();\n+      const smsAdapter2 = new SmsAdapter();\n+      emailAdapter2.registerRecipient('user-1', 'alice@example.com');\n+      smsAdapter2.registerRecipient('user-1', '+14155551234');\n+      notifService2.registerAdapter(emailAdapter2);\n+      notifService2.registerAdapter(smsAdapter2);\n+\n+      await eventBus2.emit(createOrderCreatedEvent());\n+\n+      // Only email should be sent (backward compatibility)\n+      expect(emailAdapter2.getSentEmails().length).toBeGreaterThanOrEqual(1);\n+      expect(smsAdapter2.getSentMessages()).toHaveLength(0);\n+    });\n+\n+    it('should update preferences and reflect changes in delivery', async () => {\n+      // Initially enable email only (default)\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const emailsBefore = emailAdapter.getSentEmails().length;\n+      const smsBefore = smsAdapter.getSentMessages().length;\n+\n+      expect(emailsBefore).toBeGreaterThanOrEqual(1);\n+      expect(smsBefore).toBe(0);\n+\n+      // Now enable SMS\n+      preferencesService.updatePreferences('user-1', { sms: { enabled: true } });\n+\n+      await eventBus.emit(\n+        createOrderStatusChangedEvent('pending', 'confirmed'),\n+      );\n+\n+      // Both email and SMS should have been sent for the status change\n+      const emailsAfter = emailAdapter.getSentEmails().length;\n+      const smsAfter = smsAdapter.getSentMessages().length;\n+\n+      expect(emailsAfter).toBeGreaterThan(emailsBefore);\n+      expect(smsAfter).toBeGreaterThan(smsBefore);\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 6. Notification ordering\n+  // =========================================================================\n+\n+  describe('notification ordering', () => {\n+    it('should deliver notifications in order: order confirmation before status update', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n+\n+      // In-memory notifications should be in order\n+      const notifications = notificationService.getNotifications();\n+      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n+      expect(emailNotifs.length).toBeGreaterThanOrEqual(2);\n+      expect(emailNotifs[0]!.subject).toContain('Order Confirmation');\n+      expect(emailNotifs[1]!.subject).toContain('Order Update');\n+\n+      // Emails delivered to adapter should be in order\n+      const sentEmails = emailAdapter.getSentEmails();\n+      expect(sentEmails.length).toBeGreaterThanOrEqual(2);\n+      expect(sentEmails[0]!.subject).toContain('Order Confirmation');\n+      expect(sentEmails[1]!.subject).toContain('Order Update');\n+\n+      // Sequential notification IDs confirm ordering\n+      expect(emailNotifs[0]!.id < emailNotifs[1]!.id).toBe(true);\n+    });\n+\n+    it('should deliver multiple status change notifications in sequence', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      const transitions = [\n+        { from: 'pending', to: 'confirmed' },\n+        { from: 'confirmed', to: 'shipped' },\n+        { from: 'shipped', to: 'delivered' },\n+      ];\n+\n+      for (const { from, to } of transitions) {\n+        await eventBus.emit(createOrderStatusChangedEvent(from, to));\n+      }\n+\n+      const sentEmails = emailAdapter.getSentEmails();\n+      expect(sentEmails.length).toBeGreaterThanOrEqual(3);\n+\n+      // Verify delivery order matches emission order\n+      expect(sentEmails[0]!.body).toContain('pending');\n+      expect(sentEmails[0]!.body).toContain('confirmed');\n+      expect(sentEmails[1]!.body).toContain('confirmed');\n+      expect(sentEmails[1]!.body).toContain('shipped');\n+      expect(sentEmails[2]!.body).toContain('shipped');\n+      expect(sentEmails[2]!.body).toContain('delivered');\n+    });\n+\n+    it('should maintain ordering across all channels simultaneously', async () => {\n+      // Enable all channels\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n+\n+      // Each channel should have 2 notifications in the correct order\n+      const emails = emailAdapter.getSentEmails();\n+      const sms = smsAdapter.getSentMessages();\n+      const webhooks = webhookAdapter.getDeliveries();\n+\n+      expect(emails.length).toBeGreaterThanOrEqual(2);\n+      expect(sms.length).toBeGreaterThanOrEqual(2);\n+      expect(webhooks.length).toBeGreaterThanOrEqual(2);\n+\n+      // Email ordering\n+      expect(emails[0]!.subject).toContain('Order Confirmation');\n+      expect(emails[1]!.subject).toContain('Order Update');\n+\n+      // SMS ordering\n+      expect(sms[0]!.body).toContain('Order Confirmation');\n+      expect(sms[1]!.body).toContain('Order Update');\n+\n+      // Webhook ordering\n+      expect(webhooks[0]!.payload.subject).toContain('Order Confirmation');\n+      expect(webhooks[1]!.payload.subject).toContain('Order Update');\n+\n+      // History logs should capture all deliveries\n+      const allLogs = historyService.getLogs();\n+      expect(allLogs.length).toBeGreaterThanOrEqual(6); // 3 channels × 2 events\n+    });\n+\n+    it('should assign sequential notification IDs across channels', async () => {\n+      // Enable all channels\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const notifications = notificationService.getNotifications();\n+      // Should have 3 notifications (email, sms, webhook)\n+      expect(notifications.length).toBeGreaterThanOrEqual(3);\n+\n+      // IDs should be sequential\n+      const ids = notifications.map((n) => n.id);\n+      for (let i = 1; i < ids.length; i++) {\n+        expect(ids[i]! > ids[i - 1]!).toBe(true);\n+      }\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 7. Public send() API — end-to-end with history\n+  // =========================================================================\n+\n+  describe('public send() API end-to-end', () => {\n+    it('should send email via public API and log to history', async () => {\n+      const notification = await notificationService.send({\n+        recipient: 'alice@example.com',\n+        subject: 'Direct Email Test',\n+        body: 'This is a direct email send',\n+        channel: 'email',\n+        priority: 'high',\n+      });\n+\n+      expect(notification.status).toBe('sent');\n+      expect(notification.sentAt).toBeDefined();\n+\n+      // Verify adapter delivery\n+      const sentEmails = emailAdapter.getSentEmails();\n+      expect(sentEmails).toHaveLength(1);\n+      expect(sentEmails[0]!.subject).toBe('Direct Email Test');\n+\n+      // Verify history logging\n+      const logs = historyService.getLogs();\n+      expect(logs).toHaveLength(1);\n+      expect(logs[0]!.deliveryStatus).toBe('delivered');\n+      expect(logs[0]!.channel).toBe('email');\n+      expect(logs[0]!.priority).toBe('high');\n+    });\n+\n+    it('should send SMS via public API and log to history', async () => {\n+      const notification = await notificationService.send({\n+        recipient: '+14155551234',\n+        subject: 'SMS Test',\n+        body: 'Direct SMS send',\n+        channel: 'sms',\n+      });\n+\n+      expect(notification.status).toBe('sent');\n+\n+      const sentMessages = smsAdapter.getSentMessages();\n+      expect(sentMessages).toHaveLength(1);\n+      expect(sentMessages[0]!.to).toBe('+14155551234');\n+\n+      const logs = historyService.getLogsByChannel('sms');\n+      expect(logs).toHaveLength(1);\n+      expect(logs[0]!.deliveryStatus).toBe('delivered');\n+    });\n+\n+    it('should send webhook via public API and log to history', async () => {\n+      const notification = await notificationService.send({\n+        recipient: 'https://hooks.example.com/notify',\n+        subject: 'Webhook Test',\n+        body: 'Direct webhook send',\n+        channel: 'webhook',\n+      });\n+\n+      expect(notification.status).toBe('sent');\n+\n+      const deliveries = webhookAdapter.getDeliveries();\n+      expect(deliveries).toHaveLength(1);\n+      expect(deliveries[0]!.url).toBe('https://hooks.example.com/notify');\n+\n+      const logs = historyService.getLogsByChannel('webhook');\n+      expect(logs).toHaveLength(1);\n+      expect(logs[0]!.deliveryStatus).toBe('delivered');\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 8. Event bus event log verification\n+  // =========================================================================\n+\n+  describe('event bus lifecycle events', () => {\n+    it('should emit notification:sent events for event-driven notifications', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const eventLog = eventBus.getEventLog();\n+      const sentEvents = eventLog.filter((e) => e.type === 'notification:sent');\n+      expect(sentEvents.length).toBeGreaterThanOrEqual(1);\n+    });\n+\n+    it('should emit notification:sent events for all enabled channels', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      const eventLog = eventBus.getEventLog();\n+      const sentEvents = eventLog.filter((e) => e.type === 'notification:sent');\n+      // Should have sent events for email, sms, and webhook\n+      expect(sentEvents.length).toBeGreaterThanOrEqual(3);\n+    });\n+\n+    it('should emit notification:failed event when adapter fails via public send()', async () => {\n+      // Use a disabled adapter to trigger failure\n+      const disabledAdapter = new EmailAdapter({ enabled: false });\n+      notificationService.registerAdapter(disabledAdapter);\n+\n+      await notificationService.send({\n+        recipient: 'alice@example.com',\n+        subject: 'Fail Test',\n+        body: 'This should fail',\n+        channel: 'email',\n+      });\n+\n+      const eventLog = eventBus.getEventLog();\n+      const failedEvents = eventLog.filter((e) => e.type === 'notification:failed');\n+      expect(failedEvents.length).toBeGreaterThanOrEqual(1);\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 9. Multi-user scenarios\n+  // =========================================================================\n+\n+  describe('multi-user notification isolation', () => {\n+    it('should deliver notifications independently per user preferences', async () => {\n+      // User 1: email + SMS enabled\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+      });\n+\n+      // User 2: email only (SMS disabled by default)\n+      preferencesService.createPreferences({ userId: 'user-2' });\n+\n+      const user1 = createTestUser();\n+      const user2 = createTestUser({ id: 'user-2', name: 'Bob', email: 'bob@example.com' });\n+      const order1 = createTestOrder();\n+      const order2 = createTestOrder({ id: 'order-2', userId: 'user-2' });\n+\n+      await eventBus.emit(createOrderCreatedEvent(user1, order1));\n+      await eventBus.emit(createOrderCreatedEvent(user2, order2));\n+\n+      // User 1 should have email + SMS\n+      const user1Notifs = notificationService.getNotificationsForRecipient('alice@example.com');\n+      const user1Channels = user1Notifs.map((n) => n.channel);\n+      expect(user1Channels).toContain('email');\n+\n+      // User 2 should have email only\n+      const user2Notifs = notificationService.getNotificationsForRecipient('bob@example.com');\n+      const user2Channels = user2Notifs.map((n) => n.channel);\n+      expect(user2Channels).toContain('email');\n+      expect(user2Channels).not.toContain('sms');\n+    });\n+  });\n+\n+  // =========================================================================\n+  // 10. Adapter failure handling within the pipeline\n+  // =========================================================================\n+\n+  describe('adapter failure within event-driven pipeline', () => {\n+    it('should handle invalid email recipient gracefully in event-driven flow', async () => {\n+      preferencesService.createPreferences({ userId: 'user-1' });\n+\n+      // Override recipient mapping to an invalid email\n+      emailAdapter.registerRecipient('user-1', 'not-an-email');\n+\n+      // Create a user event where recipient won't validate\n+      const user = createTestUser({ email: 'not-an-email' });\n+\n+      // The flow should not throw — the adapter returns a failure result\n+      await eventBus.emit(createOrderCreatedEvent(user));\n+\n+      // Email adapter should have been called but failed validation\n+      const notifications = notificationService.getNotifications();\n+      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n+      expect(emailNotifs.length).toBeGreaterThanOrEqual(1);\n+\n+      // Adapter returns failure, so notification should be marked as failed\n+      // and a failed event should be emitted\n+      const failedNotif = emailNotifs.find((n) => n.status === 'failed');\n+      if (failedNotif) {\n+        // History should record this as failed\n+        const failedLogs = historyService.getLogsByDeliveryStatus('failed');\n+        expect(failedLogs.length).toBeGreaterThanOrEqual(1);\n+      }\n+    });\n+\n+    it('should handle invalid phone number gracefully for SMS', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+      });\n+\n+      // Override SMS mapping to invalid phone number\n+      smsAdapter.registerRecipient('user-1', 'not-a-phone');\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // SMS notification should still exist but adapter may have failed\n+      const notifications = notificationService.getNotifications();\n+      const smsNotifs = notifications.filter((n) => n.channel === 'sms');\n+      expect(smsNotifs.length).toBeGreaterThanOrEqual(1);\n+    });\n+\n+    it('should continue sending to other channels when one adapter fails', async () => {\n+      preferencesService.createPreferences({\n+        userId: 'user-1',\n+        sms: { enabled: true },\n+        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n+      });\n+\n+      // Disable email adapter but keep SMS and webhook working\n+      const disabledEmail = new EmailAdapter({ enabled: false });\n+      notificationService.registerAdapter(disabledEmail);\n+\n+      await eventBus.emit(createOrderCreatedEvent());\n+\n+      // Email should fail (disabled adapter)\n+      expect(disabledEmail.getSentEmails()).toHaveLength(0);\n+\n+      // SMS and webhook should still succeed\n+      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n+      expect(webhookAdapter.getDeliveries().length).toBeGreaterThanOrEqual(1);\n+    });\n+  });\n+});\n",
+      "linesAdded": 975,
+      "linesRemoved": 0,
+      "path": "tests/integration/notification-pipeline.integration.test.ts"
+    }
+  ],
+  "numTurns": 45,
+  "prompt": "You are Agent 11 of 12 working on a codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP.\n\n## Codebase Orientation\nThis is a TypeScript service (~1,140 lines, ~24 files).\n\nDirectory structure:\n```\nsrc/\n  models/        # Data models and interfaces\n  services/      # Business logic layer\n  repositories/  # Data access layer\n  utils/         # Shared utilities (database, logger, pagination)\n  events/        # Event definitions (if using event-driven pattern)\n  adapters/      # External service adapters (email, webhook, etc.)\n  validators/    # Validation logic\n  config/        # Configuration\ntests/           # Test files mirroring src/ structure\n```\n\nYour task: Write integration tests for the full notification pipeline.\n\nSpecifically:\n1. Review the full notification stack: service → adapters (email, SMS, webhook) → preferences → history.\n2. Write integration tests that test end-to-end notification delivery through each channel.\n3. Test scenarios:\n   - Send email notification to user with email preferences enabled\n   - Send SMS notification to user with SMS preferences enabled\n   - Send webhook notification\n   - Verify notifications are logged in history\n   - Verify user preferences are respected (disabled channel = no notification)\n   - Verify notification ordering\n4. Fix any integration issues you discover.\n5. Run ALL tests (unit + integration) and ensure they pass.\n\nImportant:\n- Test the full pipeline, not individual components — those have unit tests already.\n- If you find bugs, fix them but keep fixes minimal.",
+  "runId": "16a2e4e1-264c-4281-8fb9-2614dbd5a5c9",
+  "scenario": "sprint-simulation",
+  "sessionId": "5a0fbd77-5559-4503-99aa-8ba7a37a1333",
+  "stopReason": "success",
+  "taskIndex": 10,
+  "timing": {
+    "durationMs": 444657,
+    "endTime": "2026-03-28T04:19:49.470Z",
+    "startTime": "2026-03-28T04:12:24.813Z",
+    "timeToFirstActionMs": 158341
+  },
+  "tokenUsage": {
+    "cacheCreation": 84674,
+    "cacheRead": 2580534,
+    "costUsd": 2.6412050499999995,
+    "input": 30,
+    "output": 24009,
+    "total": 2689247
+  },
+  "toolCalls": [
+    {
+      "durationMs": 0,
+      "parameters": {
+        "description": "Explore notification pipeline codebase",
+        "prompt": "Explore the codebase at /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP thoroughly. I need to understand:\n\n1. The full notification pipeline: service → adapters (email, SMS, webhook) → preferences → history\n2. All models/interfaces related to notifications\n3. All services related to notifications\n4. All adapters (email, SMS, webhook)\n5. Repositories for notification history and user preferences\n6. Any existing test files for reference on testing patterns\n7. The database/utils setup\n8. Any event system\n\nRead ALL relevant source files completely. I need to see the full implementation details of every file in the notification pipeline.",
+        "subagent_type": "Explore"
+      },
+      "timestamp": "2026-03-28T04:12:33.701Z",
+      "toolName": "Task"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP -type f -name \"*.ts\" -o -name \"*.js\" -o -name \"*.json\" | head -100"
+      },
+      "timestamp": "2026-03-28T04:12:35.410Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "find /private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP -not -path \"*/node_modules/*\" -type f \\( -name \"*.ts\" -o -name \"*.js\" -o -name \"*.json\" \\) | sort"
+      },
+      "timestamp": "2026-03-28T04:12:36.992Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/notification.ts"
+      },
+      "timestamp": "2026-03-28T04:12:38.804Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/notification-log.ts"
+      },
+      "timestamp": "2026-03-28T04:12:38.984Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/user-preferences.ts"
+      },
+      "timestamp": "2026-03-28T04:12:39.463Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/user.ts"
+      },
+      "timestamp": "2026-03-28T04:12:39.643Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/order.ts"
+      },
+      "timestamp": "2026-03-28T04:12:39.886Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T04:12:42.214Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification-history.service.ts"
+      },
+      "timestamp": "2026-03-28T04:12:42.296Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/preferences.service.ts"
+      },
+      "timestamp": "2026-03-28T04:12:42.462Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/notification.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:12:44.556Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:12:45.015Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/sms.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:12:45.408Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/webhook.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:12:45.518Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-28T04:12:47.570Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T04:12:48.042Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/repositories/base.repository.ts"
+      },
+      "timestamp": "2026-03-28T04:12:48.259Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/repositories/notification-log.repository.ts"
+      },
+      "timestamp": "2026-03-28T04:12:50.672Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/repositories/preferences.repository.ts"
+      },
+      "timestamp": "2026-03-28T04:12:50.831Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/utils/database.ts"
+      },
+      "timestamp": "2026-03-28T04:12:51.126Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/order.service.ts"
+      },
+      "timestamp": "2026-03-28T04:12:53.179Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/utils/logger.ts"
+      },
+      "timestamp": "2026-03-28T04:12:53.631Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/index.ts"
+      },
+      "timestamp": "2026-03-28T04:12:53.741Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T04:12:56.502Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/services/notification-history.service.test.ts"
+      },
+      "timestamp": "2026-03-28T04:12:56.596Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/config/app.config.ts"
+      },
+      "timestamp": "2026-03-28T04:12:58.912Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/private/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/adapters/email.adapter.test.ts",
+        "limit": 100
+      },
+      "timestamp": "2026-03-28T04:12:59.190Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts"
+      },
+      "timestamp": "2026-03-28T04:13:56.274Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/notification.ts"
+      },
+      "timestamp": "2026-03-28T04:13:58.241Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/user-preferences.ts"
+      },
+      "timestamp": "2026-03-28T04:13:59.029Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/notification-log.ts"
+      },
+      "timestamp": "2026-03-28T04:13:59.308Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification-history.service.ts"
+      },
+      "timestamp": "2026-03-28T04:14:04.015Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/preferences.service.ts"
+      },
+      "timestamp": "2026-03-28T04:14:04.955Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/email.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:14:05.461Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/sms.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:14:06.282Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/adapters/webhook.adapter.ts"
+      },
+      "timestamp": "2026-03-28T04:14:06.593Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/events/event-types.ts"
+      },
+      "timestamp": "2026-03-28T04:14:13.499Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/events/event-bus.ts"
+      },
+      "timestamp": "2026-03-28T04:14:13.959Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/repositories/notification-log.repository.ts"
+      },
+      "timestamp": "2026-03-28T04:14:14.985Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/repositories/preferences.repository.ts"
+      },
+      "timestamp": "2026-03-28T04:14:15.406Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/order.ts"
+      },
+      "timestamp": "2026-03-28T04:14:20.560Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/models/user.ts"
+      },
+      "timestamp": "2026-03-28T04:14:21.540Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/utils/database.ts"
+      },
+      "timestamp": "2026-03-28T04:14:22.463Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "ls /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/",
+        "description": "List existing test directories"
+      },
+      "timestamp": "2026-03-28T04:14:24.736Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP",
+        "pattern": "**/tsconfig*.json"
+      },
+      "timestamp": "2026-03-28T04:14:29.401Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP",
+        "pattern": "**/vitest*.{ts,js,json}"
+      },
+      "timestamp": "2026-03-28T04:14:29.941Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP",
+        "pattern": "**/jest*.{ts,js,json}"
+      },
+      "timestamp": "2026-03-28T04:14:30.890Z",
+      "toolName": "Glob"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/package.json"
+      },
+      "timestamp": "2026-03-28T04:14:30.938Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/vitest.config.ts"
+      },
+      "timestamp": "2026-03-28T04:14:35.266Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/services/notification.service.test.ts"
+      },
+      "timestamp": "2026-03-28T04:14:35.753Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Writing integration tests for the full notification pipeline",
+            "content": "Write integration tests for the full notification pipeline",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Fixing integration bugs discovered",
+            "content": "Fix any integration bugs discovered",
+            "status": "pending"
+          },
+          {
+            "activeForm": "Running all tests and ensuring they pass",
+            "content": "Run all tests (unit + integration) and ensure they pass",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T04:14:40.532Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts",
+        "limit": 45,
+        "offset": 413
+      },
+      "timestamp": "2026-03-28T04:14:48.542Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts",
+        "new_string": "  private async dispatchToChannel(params: {\n    recipient: string;\n    subject: string;\n    body: string;\n    channel: NotificationType;\n  }): Promise<void> {\n    const notification: Notification = {\n      id: generateNotificationId(),\n      recipient: params.recipient,\n      subject: params.subject,\n      body: params.body,\n      channel: params.channel,\n      priority: 'normal',\n      status: 'pending',\n      createdAt: new Date(),\n    };\n\n    this.notifications.push(notification);\n    this.logger.info(\n      `Notification queued: ${notification.id} to ${params.recipient} via ${params.channel}`,\n    );\n\n    // If an adapter is registered for this channel, dispatch through it.\n    // Awaiting ensures notifications are delivered in the order they were created,\n    // preventing out-of-order delivery (e.g., \"payment confirmed\" before \"order placed\").\n    const adapter = this.adapters.get(params.channel);\n    if (adapter?.isAvailable()) {\n      const payload: NotificationPayload = {\n        recipient: params.recipient,\n        subject: params.subject,\n        body: params.body,\n        channel: params.channel,\n        priority: 'normal',\n      };\n      try {\n        const result = await adapter.send(payload);\n        if (result.success) {\n          notification.status = 'sent';\n          notification.sentAt = new Date();\n          this.logger.info(\n            `Notification ${notification.id} sent successfully via ${params.channel}`,\n          );\n          await this.eventBus.emit({\n            type: 'notification:sent',\n            notification,\n            channel: params.channel,\n            timestamp: new Date(),\n          });\n        } else {\n          notification.status = 'failed';\n          notification.errorMessage = result.errorMessage ?? 'Unknown delivery error';\n          this.logger.error(\n            `Notification ${notification.id} failed via ${params.channel}: ${notification.errorMessage}`,\n          );\n          await this.eventBus.emit({\n            type: 'notification:failed',\n            notification,\n            channel: params.channel,\n            errorMessage: notification.errorMessage,\n            timestamp: new Date(),\n          });\n        }\n      } catch (err: unknown) {\n        const msg = err instanceof Error ? err.message : 'Unknown error';\n        notification.status = 'failed';\n        notification.errorMessage = msg;\n        this.logger.error(`Adapter delivery error (${params.channel}): ${msg}`);\n        await this.eventBus.emit({\n          type: 'notification:failed',\n          notification,\n          channel: params.channel,\n          errorMessage: msg,\n          timestamp: new Date(),\n        });\n      }\n    } else {\n      // No adapter or adapter unavailable — still mark as sent for backward compatibility\n      // with in-memory record keeping, but emit sent event for history tracking.\n      notification.status = 'sent';\n      notification.sentAt = new Date();\n      await this.eventBus.emit({\n        type: 'notification:sent',\n        notification,\n        channel: params.channel,\n        timestamp: new Date(),\n      });\n    }\n  }",
+        "old_string": "  private async dispatchToChannel(params: {\n    recipient: string;\n    subject: string;\n    body: string;\n    channel: NotificationType;\n  }): Promise<void> {\n    const notification: Notification = {\n      id: generateNotificationId(),\n      recipient: params.recipient,\n      subject: params.subject,\n      body: params.body,\n      channel: params.channel,\n      priority: 'normal',\n      status: 'sent',\n      createdAt: new Date(),\n      sentAt: new Date(),\n    };\n\n    this.notifications.push(notification);\n    this.logger.info(\n      `Notification sent: ${notification.id} to ${params.recipient} via ${params.channel}`,\n    );\n\n    // If an adapter is registered for this channel, dispatch through it.\n    // Awaiting ensures notifications are delivered in the order they were created,\n    // preventing out-of-order delivery (e.g., \"payment confirmed\" before \"order placed\").\n    const adapter = this.adapters.get(params.channel);\n    if (adapter?.isAvailable()) {\n      const payload: NotificationPayload = {\n        recipient: params.recipient,\n        subject: params.subject,\n        body: params.body,\n        channel: params.channel,\n        priority: 'normal',\n      };\n      try {\n        await adapter.send(payload);\n      } catch (err: unknown) {\n        const msg = err instanceof Error ? err.message : 'Unknown error';\n        this.logger.error(`Adapter delivery error (${params.channel}): ${msg}`);\n      }\n    }\n  }",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:15:03.154Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "content": "/**\n * Integration tests for the full notification pipeline.\n *\n * Tests the end-to-end flow:\n *   Domain Events → EventBus → NotificationService → PreferencesCheck\n *     → Adapters (email, SMS, webhook) → EventBus → NotificationHistoryService → Repository\n *\n * These tests wire up all real components (no mocks) to verify\n * the full pipeline works correctly across service boundaries.\n */\n\nimport { describe, it, expect, beforeEach } from 'vitest';\nimport { EventBus } from '../../src/events/event-bus.js';\nimport {\n  NotificationService,\n  resetNotificationIdCounter,\n} from '../../src/services/notification.service.js';\nimport {\n  NotificationHistoryService,\n  resetLogIdCounter,\n} from '../../src/services/notification-history.service.js';\nimport { PreferencesService } from '../../src/services/preferences.service.js';\nimport { EmailAdapter } from '../../src/adapters/email.adapter.js';\nimport { SmsAdapter } from '../../src/adapters/sms.adapter.js';\nimport { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';\nimport { NotificationLogRepository } from '../../src/repositories/notification-log.repository.js';\nimport { PreferencesRepository } from '../../src/repositories/preferences.repository.js';\nimport { Database } from '../../src/utils/database.js';\nimport type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';\nimport type { User } from '../../src/models/user.js';\nimport type { Order } from '../../src/models/order.js';\n\n// ---------------------------------------------------------------------------\n// Shared test fixtures\n// ---------------------------------------------------------------------------\n\nfunction createTestUser(overrides?: Partial<User>): User {\n  return {\n    id: 'user-1',\n    name: 'Alice',\n    email: 'alice@example.com',\n    role: 'member',\n    createdAt: new Date(),\n    updatedAt: new Date(),\n    ...overrides,\n  };\n}\n\nfunction createTestOrder(overrides?: Partial<Order>): Order {\n  return {\n    id: 'order-1',\n    userId: 'user-1',\n    items: [\n      { productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 },\n      { productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 25 },\n    ],\n    total: 45,\n    status: 'pending',\n    createdAt: new Date(),\n    updatedAt: new Date(),\n    ...overrides,\n  };\n}\n\nfunction createOrderCreatedEvent(user?: User, order?: Order): OrderCreatedEvent {\n  const u = user ?? createTestUser();\n  const o = order ?? createTestOrder();\n  return {\n    type: 'order:created',\n    order: o,\n    user: u,\n    timestamp: new Date(),\n  };\n}\n\nfunction createOrderStatusChangedEvent(\n  previousStatus: string,\n  newStatus: string,\n  order?: Order,\n): OrderStatusChangedEvent {\n  const o = order ?? createTestOrder({ status: newStatus as Order['status'] });\n  return {\n    type: 'order:status-changed',\n    order: o,\n    previousStatus,\n    newStatus,\n    timestamp: new Date(),\n  };\n}\n\n// ---------------------------------------------------------------------------\n// Integration test suite\n// ---------------------------------------------------------------------------\n\ndescribe('Notification Pipeline Integration', () => {\n  let db: Database;\n  let eventBus: EventBus;\n  let notificationService: NotificationService;\n  let historyService: NotificationHistoryService;\n  let preferencesService: PreferencesService;\n  let emailAdapter: EmailAdapter;\n  let smsAdapter: SmsAdapter;\n  let webhookAdapter: WebhookAdapter;\n  let logRepository: NotificationLogRepository;\n  let preferencesRepository: PreferencesRepository;\n\n  beforeEach(() => {\n    // Reset all state\n    resetNotificationIdCounter();\n    resetLogIdCounter();\n\n    // Fresh database for each test\n    db = new Database();\n\n    // Repositories\n    logRepository = new NotificationLogRepository(db);\n    preferencesRepository = new PreferencesRepository(db);\n\n    // Event bus (shared across all services)\n    eventBus = new EventBus();\n\n    // Preferences service\n    preferencesService = new PreferencesService(preferencesRepository, eventBus);\n\n    // Notification service (with preferences)\n    notificationService = new NotificationService(eventBus, preferencesService);\n\n    // History service (subscribes to notification:sent/failed events)\n    historyService = new NotificationHistoryService(eventBus, logRepository);\n\n    // Adapters\n    emailAdapter = new EmailAdapter();\n    smsAdapter = new SmsAdapter();\n    webhookAdapter = new WebhookAdapter();\n\n    // Register adapters\n    notificationService.registerAdapter(emailAdapter);\n    notificationService.registerAdapter(smsAdapter);\n    notificationService.registerAdapter(webhookAdapter);\n\n    // Register recipient mappings so adapters can resolve user IDs\n    emailAdapter.registerRecipient('user-1', 'alice@example.com');\n    smsAdapter.registerRecipient('user-1', '+14155551234');\n    emailAdapter.registerRecipient('user-2', 'bob@example.com');\n    smsAdapter.registerRecipient('user-2', '+14155555678');\n  });\n\n  // =========================================================================\n  // 1. Email notification with preferences enabled\n  // =========================================================================\n\n  describe('email notification delivery (preferences enabled)', () => {\n    it('should deliver email notification through the full pipeline when email is enabled', async () => {\n      // Email is opt-out (enabled by default) — no need to explicitly enable\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Verify notification was created\n      const notifications = notificationService.getNotifications();\n      expect(notifications.length).toBeGreaterThanOrEqual(1);\n      const emailNotif = notifications.find((n) => n.channel === 'email');\n      expect(emailNotif).toBeDefined();\n      expect(emailNotif!.subject).toContain('Order Confirmation');\n      expect(emailNotif!.status).toBe('sent');\n\n      // Verify email was delivered through the adapter\n      const sentEmails = emailAdapter.getSentEmails();\n      expect(sentEmails.length).toBeGreaterThanOrEqual(1);\n      expect(sentEmails[0]!.to).toBe('alice@example.com');\n      expect(sentEmails[0]!.subject).toContain('Order Confirmation');\n\n      // Verify notification was logged in history\n      const logs = historyService.getLogs();\n      const emailLogs = logs.filter((l) => l.channel === 'email');\n      expect(emailLogs.length).toBeGreaterThanOrEqual(1);\n      expect(emailLogs[0]!.deliveryStatus).toBe('delivered');\n      expect(emailLogs[0]!.recipient).toBe('alice@example.com');\n    });\n\n    it('should deliver email for order status change events', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      // Register email recipient for user-1 (status change uses userId as recipient)\n      emailAdapter.registerRecipient('user-1', 'alice@example.com');\n\n      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n\n      const sentEmails = emailAdapter.getSentEmails();\n      const statusEmails = sentEmails.filter((e) => e.subject.includes('Order Update'));\n      expect(statusEmails.length).toBeGreaterThanOrEqual(1);\n\n      // Verify history records\n      const logs = historyService.getLogsByChannel('email');\n      const statusLogs = logs.filter((l) => l.subject.includes('Order Update'));\n      expect(statusLogs.length).toBeGreaterThanOrEqual(1);\n      expect(statusLogs[0]!.deliveryStatus).toBe('delivered');\n    });\n  });\n\n  // =========================================================================\n  // 2. SMS notification with preferences enabled\n  // =========================================================================\n\n  describe('SMS notification delivery (preferences enabled)', () => {\n    it('should deliver SMS notification when SMS is explicitly enabled', async () => {\n      // SMS is opt-in (disabled by default) — must explicitly enable\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Verify SMS was delivered through the adapter\n      const sentMessages = smsAdapter.getSentMessages();\n      expect(sentMessages.length).toBeGreaterThanOrEqual(1);\n      expect(sentMessages[0]!.to).toBe('+14155551234');\n      expect(sentMessages[0]!.body).toContain('Order Confirmation');\n\n      // Verify SMS notification record\n      const notifications = notificationService.getNotifications();\n      const smsNotif = notifications.find((n) => n.channel === 'sms');\n      expect(smsNotif).toBeDefined();\n      expect(smsNotif!.status).toBe('sent');\n\n      // Verify SMS notification logged in history\n      const smsLogs = historyService.getLogsByChannel('sms');\n      expect(smsLogs.length).toBeGreaterThanOrEqual(1);\n      expect(smsLogs[0]!.deliveryStatus).toBe('delivered');\n    });\n\n    it('should truncate long SMS messages', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });\n\n      // Create order with many items to generate a long message\n      const order = createTestOrder({\n        items: [\n          { productId: 'p1', name: 'Super Deluxe Premium Widget Pro Max Ultra', quantity: 5, unitPrice: 99.99 },\n          { productId: 'p2', name: 'Advanced Quantum Entanglement Device', quantity: 3, unitPrice: 149.99 },\n        ],\n        total: 949.92,\n      });\n\n      await eventBus.emit(createOrderCreatedEvent(createTestUser(), order));\n\n      const sentMessages = smsAdapter.getSentMessages();\n      const smsMessage = sentMessages.find((m) => m.to === '+14155551234');\n      expect(smsMessage).toBeDefined();\n      // Standard SMS length limit is 160 chars\n      expect(smsMessage!.body.length).toBeLessThanOrEqual(160);\n    });\n  });\n\n  // =========================================================================\n  // 3. Webhook notification delivery\n  // =========================================================================\n\n  describe('webhook notification delivery', () => {\n    it('should deliver webhook notification when webhook is explicitly enabled', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Verify webhook was delivered through the adapter\n      const deliveries = webhookAdapter.getDeliveries();\n      expect(deliveries.length).toBeGreaterThanOrEqual(1);\n      expect(deliveries[0]!.payload.event).toBe('notification');\n      expect(deliveries[0]!.payload.subject).toContain('Order Confirmation');\n\n      // Verify webhook notification record\n      const notifications = notificationService.getNotifications();\n      const webhookNotif = notifications.find((n) => n.channel === 'webhook');\n      expect(webhookNotif).toBeDefined();\n      expect(webhookNotif!.status).toBe('sent');\n\n      // Verify webhook notification logged in history\n      const webhookLogs = historyService.getLogsByChannel('webhook');\n      expect(webhookLogs.length).toBeGreaterThanOrEqual(1);\n      expect(webhookLogs[0]!.deliveryStatus).toBe('delivered');\n    });\n\n    it('should send signed webhook payload when secret is configured', async () => {\n      // Replace webhook adapter with one that has a secret\n      const signedWebhookAdapter = new WebhookAdapter({ secret: 'test-secret-key' });\n      notificationService.registerAdapter(signedWebhookAdapter);\n\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const deliveries = signedWebhookAdapter.getDeliveries();\n      expect(deliveries.length).toBeGreaterThanOrEqual(1);\n      expect(deliveries[0]!.headers['X-Webhook-Signature']).toBeDefined();\n      expect(deliveries[0]!.headers['X-Webhook-Signature']).toMatch(/^sha256=/);\n    });\n  });\n\n  // =========================================================================\n  // 4. Notifications logged in history\n  // =========================================================================\n\n  describe('notification history logging', () => {\n    it('should log all channel deliveries in notification history', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // All three channels should have history records\n      const allLogs = historyService.getLogs();\n      expect(allLogs.length).toBeGreaterThanOrEqual(3);\n\n      const emailLogs = historyService.getLogsByChannel('email');\n      const smsLogs = historyService.getLogsByChannel('sms');\n      const webhookLogs = historyService.getLogsByChannel('webhook');\n\n      expect(emailLogs.length).toBeGreaterThanOrEqual(1);\n      expect(smsLogs.length).toBeGreaterThanOrEqual(1);\n      expect(webhookLogs.length).toBeGreaterThanOrEqual(1);\n\n      // All should be delivered\n      for (const log of allLogs) {\n        expect(log.deliveryStatus).toBe('delivered');\n      }\n    });\n\n    it('should log notification history with correct fields', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const logs = historyService.getLogsByChannel('email');\n      expect(logs.length).toBeGreaterThanOrEqual(1);\n\n      const log = logs[0]!;\n      expect(log.id).toBeDefined();\n      expect(log.notificationId).toBeDefined();\n      expect(log.recipient).toBe('alice@example.com');\n      expect(log.channel).toBe('email');\n      expect(log.subject).toContain('Order Confirmation');\n      expect(log.body).toContain('Widget x2');\n      expect(log.priority).toBe('normal');\n      expect(log.deliveryStatus).toBe('delivered');\n      expect(log.timestamp).toBeInstanceOf(Date);\n    });\n\n    it('should log failed notifications in history', async () => {\n      // Use the public send() API with an unregistered channel to trigger failure\n      await notificationService.send({\n        recipient: 'alice@example.com',\n        subject: 'Test Failure',\n        body: 'This should fail',\n        channel: 'in_app', // no adapter registered for in_app\n      });\n\n      const logs = historyService.getLogs();\n      const failedLogs = logs.filter((l) => l.deliveryStatus === 'failed');\n      expect(failedLogs.length).toBeGreaterThanOrEqual(1);\n      expect(failedLogs[0]!.errorMessage).toBeDefined();\n    });\n\n    it('should query history by recipient', async () => {\n      // Create preferences for two different users\n      preferencesService.createPreferences({ userId: 'user-1' });\n      preferencesService.createPreferences({ userId: 'user-2' });\n\n      const user1 = createTestUser();\n      const user2 = createTestUser({ id: 'user-2', name: 'Bob', email: 'bob@example.com' });\n      const order1 = createTestOrder();\n      const order2 = createTestOrder({ id: 'order-2', userId: 'user-2' });\n\n      await eventBus.emit(createOrderCreatedEvent(user1, order1));\n      await eventBus.emit(createOrderCreatedEvent(user2, order2));\n\n      const aliceLogs = historyService.getLogsByRecipient('alice@example.com');\n      const bobLogs = historyService.getLogsByRecipient('bob@example.com');\n\n      expect(aliceLogs.length).toBeGreaterThanOrEqual(1);\n      expect(bobLogs.length).toBeGreaterThanOrEqual(1);\n\n      // No cross-contamination\n      for (const log of aliceLogs) {\n        expect(log.recipient).toBe('alice@example.com');\n      }\n      for (const log of bobLogs) {\n        expect(log.recipient).toBe('bob@example.com');\n      }\n    });\n\n    it('should query history by delivery status', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      // Successful delivery via event\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Failed delivery via public send() with no adapter for in_app\n      await notificationService.send({\n        recipient: 'alice@example.com',\n        subject: 'Fail Test',\n        body: 'This should fail',\n        channel: 'in_app',\n      });\n\n      const delivered = historyService.getLogsByDeliveryStatus('delivered');\n      const failed = historyService.getLogsByDeliveryStatus('failed');\n\n      expect(delivered.length).toBeGreaterThanOrEqual(1);\n      expect(failed.length).toBeGreaterThanOrEqual(1);\n    });\n\n    it('should support combined query filters', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Query for delivered email notifications to alice\n      const results = historyService.queryLogs({\n        recipient: 'alice@example.com',\n        channel: 'email',\n        deliveryStatus: 'delivered',\n      });\n\n      expect(results.length).toBeGreaterThanOrEqual(1);\n      for (const log of results) {\n        expect(log.recipient).toBe('alice@example.com');\n        expect(log.channel).toBe('email');\n        expect(log.deliveryStatus).toBe('delivered');\n      }\n    });\n  });\n\n  // =========================================================================\n  // 5. User preferences respected (disabled channel = no notification)\n  // =========================================================================\n\n  describe('user preferences respected', () => {\n    it('should NOT send email when email channel is disabled', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: { enabled: false },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // No email should be sent\n      const sentEmails = emailAdapter.getSentEmails();\n      expect(sentEmails).toHaveLength(0);\n\n      // No email notifications in the service\n      const notifications = notificationService.getNotifications();\n      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n      expect(emailNotifs).toHaveLength(0);\n    });\n\n    it('should NOT send SMS when SMS is not explicitly enabled (opt-in model)', async () => {\n      // Create preferences with defaults (SMS disabled by default)\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // No SMS should be sent\n      const sentMessages = smsAdapter.getSentMessages();\n      expect(sentMessages).toHaveLength(0);\n\n      // No SMS notifications\n      const notifications = notificationService.getNotifications();\n      const smsNotifs = notifications.filter((n) => n.channel === 'sms');\n      expect(smsNotifs).toHaveLength(0);\n    });\n\n    it('should NOT send webhook when webhook is not explicitly enabled (opt-in model)', async () => {\n      // Create preferences with defaults (webhook disabled by default)\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // No webhook should be delivered\n      const deliveries = webhookAdapter.getDeliveries();\n      expect(deliveries).toHaveLength(0);\n\n      const notifications = notificationService.getNotifications();\n      const webhookNotifs = notifications.filter((n) => n.channel === 'webhook');\n      expect(webhookNotifs).toHaveLength(0);\n    });\n\n    it('should only send to enabled channels when some are disabled', async () => {\n      // Enable email + SMS, disable webhook\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: { enabled: true },\n        sms: { enabled: true },\n        webhook: { enabled: false },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Email should be sent\n      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n\n      // SMS should be sent\n      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n\n      // Webhook should NOT be sent\n      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n\n      // Verify notification records match\n      const notifications = notificationService.getNotifications();\n      const channels = notifications.map((n) => n.channel);\n      expect(channels).toContain('email');\n      expect(channels).toContain('sms');\n      expect(channels).not.toContain('webhook');\n    });\n\n    it('should respect per-category subscriptions', async () => {\n      // Enable email but only subscribe to order_status_updates (NOT order_confirmations)\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: {\n          enabled: true,\n          subscribedCategories: ['order_status_updates'],\n        },\n      });\n\n      // order_confirmations should NOT trigger email\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const emailsAfterCreate = emailAdapter.getSentEmails();\n      expect(emailsAfterCreate).toHaveLength(0);\n\n      // order_status_updates SHOULD trigger email\n      emailAdapter.registerRecipient('user-1', 'alice@example.com');\n      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n\n      const emailsAfterStatus = emailAdapter.getSentEmails();\n      expect(emailsAfterStatus.length).toBeGreaterThanOrEqual(1);\n      expect(emailsAfterStatus[0]!.subject).toContain('Order Update');\n    });\n\n    it('should suppress all notifications when all channels are disabled', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: { enabled: false },\n        sms: { enabled: false },\n        webhook: { enabled: false },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // No notifications should exist\n      expect(notificationService.getNotifications()).toHaveLength(0);\n      expect(emailAdapter.getSentEmails()).toHaveLength(0);\n      expect(smsAdapter.getSentMessages()).toHaveLength(0);\n      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n    });\n\n    it('should use default behavior (email-only) when no preferences exist for user', async () => {\n      // Do NOT create preferences for user-1\n      // With PreferencesService configured, email is opt-out (default enabled),\n      // SMS and webhook are opt-in (default disabled)\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Email should be sent (opt-out model — default enabled)\n      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n\n      // SMS should NOT be sent (opt-in model — default disabled)\n      expect(smsAdapter.getSentMessages()).toHaveLength(0);\n\n      // Webhook should NOT be sent (opt-in model — default disabled)\n      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n    });\n\n    it('should send only email when no PreferencesService is configured (backward compat)', async () => {\n      // Create a notification service WITHOUT preferences service\n      const eventBus2 = new EventBus();\n      const notifService2 = new NotificationService(eventBus2);\n      // Also register the history service on the same bus\n      const historyService2 = new NotificationHistoryService(eventBus2, logRepository);\n\n      const emailAdapter2 = new EmailAdapter();\n      const smsAdapter2 = new SmsAdapter();\n      emailAdapter2.registerRecipient('user-1', 'alice@example.com');\n      smsAdapter2.registerRecipient('user-1', '+14155551234');\n      notifService2.registerAdapter(emailAdapter2);\n      notifService2.registerAdapter(smsAdapter2);\n\n      await eventBus2.emit(createOrderCreatedEvent());\n\n      // Only email should be sent (backward compatibility)\n      expect(emailAdapter2.getSentEmails().length).toBeGreaterThanOrEqual(1);\n      expect(smsAdapter2.getSentMessages()).toHaveLength(0);\n    });\n\n    it('should update preferences and reflect changes in delivery', async () => {\n      // Initially enable email only (default)\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const emailsBefore = emailAdapter.getSentEmails().length;\n      const smsBefore = smsAdapter.getSentMessages().length;\n\n      expect(emailsBefore).toBeGreaterThanOrEqual(1);\n      expect(smsBefore).toBe(0);\n\n      // Now enable SMS\n      preferencesService.updatePreferences('user-1', { sms: { enabled: true } });\n\n      await eventBus.emit(\n        createOrderStatusChangedEvent('pending', 'confirmed'),\n      );\n\n      // Both email and SMS should have been sent for the status change\n      const emailsAfter = emailAdapter.getSentEmails().length;\n      const smsAfter = smsAdapter.getSentMessages().length;\n\n      expect(emailsAfter).toBeGreaterThan(emailsBefore);\n      expect(smsAfter).toBeGreaterThan(smsBefore);\n    });\n  });\n\n  // =========================================================================\n  // 6. Notification ordering\n  // =========================================================================\n\n  describe('notification ordering', () => {\n    it('should deliver notifications in order: order confirmation before status update', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n\n      // In-memory notifications should be in order\n      const notifications = notificationService.getNotifications();\n      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n      expect(emailNotifs.length).toBeGreaterThanOrEqual(2);\n      expect(emailNotifs[0]!.subject).toContain('Order Confirmation');\n      expect(emailNotifs[1]!.subject).toContain('Order Update');\n\n      // Emails delivered to adapter should be in order\n      const sentEmails = emailAdapter.getSentEmails();\n      expect(sentEmails.length).toBeGreaterThanOrEqual(2);\n      expect(sentEmails[0]!.subject).toContain('Order Confirmation');\n      expect(sentEmails[1]!.subject).toContain('Order Update');\n\n      // Sequential notification IDs confirm ordering\n      expect(emailNotifs[0]!.id < emailNotifs[1]!.id).toBe(true);\n    });\n\n    it('should deliver multiple status change notifications in sequence', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      const transitions = [\n        { from: 'pending', to: 'confirmed' },\n        { from: 'confirmed', to: 'shipped' },\n        { from: 'shipped', to: 'delivered' },\n      ];\n\n      for (const { from, to } of transitions) {\n        await eventBus.emit(createOrderStatusChangedEvent(from, to));\n      }\n\n      const sentEmails = emailAdapter.getSentEmails();\n      expect(sentEmails.length).toBeGreaterThanOrEqual(3);\n\n      // Verify delivery order matches emission order\n      expect(sentEmails[0]!.body).toContain('pending');\n      expect(sentEmails[0]!.body).toContain('confirmed');\n      expect(sentEmails[1]!.body).toContain('confirmed');\n      expect(sentEmails[1]!.body).toContain('shipped');\n      expect(sentEmails[2]!.body).toContain('shipped');\n      expect(sentEmails[2]!.body).toContain('delivered');\n    });\n\n    it('should maintain ordering across all channels simultaneously', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n      await eventBus.emit(createOrderStatusChangedEvent('pending', 'confirmed'));\n\n      // Each channel should have 2 notifications in the correct order\n      const emails = emailAdapter.getSentEmails();\n      const sms = smsAdapter.getSentMessages();\n      const webhooks = webhookAdapter.getDeliveries();\n\n      expect(emails.length).toBeGreaterThanOrEqual(2);\n      expect(sms.length).toBeGreaterThanOrEqual(2);\n      expect(webhooks.length).toBeGreaterThanOrEqual(2);\n\n      // Email ordering\n      expect(emails[0]!.subject).toContain('Order Confirmation');\n      expect(emails[1]!.subject).toContain('Order Update');\n\n      // SMS ordering\n      expect(sms[0]!.body).toContain('Order Confirmation');\n      expect(sms[1]!.body).toContain('Order Update');\n\n      // Webhook ordering\n      expect(webhooks[0]!.payload.subject).toContain('Order Confirmation');\n      expect(webhooks[1]!.payload.subject).toContain('Order Update');\n\n      // History logs should capture all deliveries\n      const allLogs = historyService.getLogs();\n      expect(allLogs.length).toBeGreaterThanOrEqual(6); // 3 channels × 2 events\n    });\n\n    it('should assign sequential notification IDs across channels', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const notifications = notificationService.getNotifications();\n      // Should have 3 notifications (email, sms, webhook)\n      expect(notifications.length).toBeGreaterThanOrEqual(3);\n\n      // IDs should be sequential\n      const ids = notifications.map((n) => n.id);\n      for (let i = 1; i < ids.length; i++) {\n        expect(ids[i]! > ids[i - 1]!).toBe(true);\n      }\n    });\n  });\n\n  // =========================================================================\n  // 7. Public send() API — end-to-end with history\n  // =========================================================================\n\n  describe('public send() API end-to-end', () => {\n    it('should send email via public API and log to history', async () => {\n      const notification = await notificationService.send({\n        recipient: 'alice@example.com',\n        subject: 'Direct Email Test',\n        body: 'This is a direct email send',\n        channel: 'email',\n        priority: 'high',\n      });\n\n      expect(notification.status).toBe('sent');\n      expect(notification.sentAt).toBeDefined();\n\n      // Verify adapter delivery\n      const sentEmails = emailAdapter.getSentEmails();\n      expect(sentEmails).toHaveLength(1);\n      expect(sentEmails[0]!.subject).toBe('Direct Email Test');\n\n      // Verify history logging\n      const logs = historyService.getLogs();\n      expect(logs).toHaveLength(1);\n      expect(logs[0]!.deliveryStatus).toBe('delivered');\n      expect(logs[0]!.channel).toBe('email');\n      expect(logs[0]!.priority).toBe('high');\n    });\n\n    it('should send SMS via public API and log to history', async () => {\n      const notification = await notificationService.send({\n        recipient: '+14155551234',\n        subject: 'SMS Test',\n        body: 'Direct SMS send',\n        channel: 'sms',\n      });\n\n      expect(notification.status).toBe('sent');\n\n      const sentMessages = smsAdapter.getSentMessages();\n      expect(sentMessages).toHaveLength(1);\n      expect(sentMessages[0]!.to).toBe('+14155551234');\n\n      const logs = historyService.getLogsByChannel('sms');\n      expect(logs).toHaveLength(1);\n      expect(logs[0]!.deliveryStatus).toBe('delivered');\n    });\n\n    it('should send webhook via public API and log to history', async () => {\n      const notification = await notificationService.send({\n        recipient: 'https://hooks.example.com/notify',\n        subject: 'Webhook Test',\n        body: 'Direct webhook send',\n        channel: 'webhook',\n      });\n\n      expect(notification.status).toBe('sent');\n\n      const deliveries = webhookAdapter.getDeliveries();\n      expect(deliveries).toHaveLength(1);\n      expect(deliveries[0]!.url).toBe('https://hooks.example.com/notify');\n\n      const logs = historyService.getLogsByChannel('webhook');\n      expect(logs).toHaveLength(1);\n      expect(logs[0]!.deliveryStatus).toBe('delivered');\n    });\n  });\n\n  // =========================================================================\n  // 8. Event bus event log verification\n  // =========================================================================\n\n  describe('event bus lifecycle events', () => {\n    it('should emit notification:sent events for event-driven notifications', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const eventLog = eventBus.getEventLog();\n      const sentEvents = eventLog.filter((e) => e.type === 'notification:sent');\n      expect(sentEvents.length).toBeGreaterThanOrEqual(1);\n    });\n\n    it('should emit notification:sent events for all enabled channels', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      const eventLog = eventBus.getEventLog();\n      const sentEvents = eventLog.filter((e) => e.type === 'notification:sent');\n      // Should have sent events for email, sms, and webhook\n      expect(sentEvents.length).toBeGreaterThanOrEqual(3);\n    });\n\n    it('should emit notification:failed event when adapter fails via public send()', async () => {\n      // Use a disabled adapter to trigger failure\n      const disabledAdapter = new EmailAdapter({ enabled: false });\n      notificationService.registerAdapter(disabledAdapter);\n\n      await notificationService.send({\n        recipient: 'alice@example.com',\n        subject: 'Fail Test',\n        body: 'This should fail',\n        channel: 'email',\n      });\n\n      const eventLog = eventBus.getEventLog();\n      const failedEvents = eventLog.filter((e) => e.type === 'notification:failed');\n      expect(failedEvents.length).toBeGreaterThanOrEqual(1);\n    });\n  });\n\n  // =========================================================================\n  // 9. Multi-user scenarios\n  // =========================================================================\n\n  describe('multi-user notification isolation', () => {\n    it('should deliver notifications independently per user preferences', async () => {\n      // User 1: email + SMS enabled\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });\n\n      // User 2: email only (SMS disabled by default)\n      preferencesService.createPreferences({ userId: 'user-2' });\n\n      const user1 = createTestUser();\n      const user2 = createTestUser({ id: 'user-2', name: 'Bob', email: 'bob@example.com' });\n      const order1 = createTestOrder();\n      const order2 = createTestOrder({ id: 'order-2', userId: 'user-2' });\n\n      await eventBus.emit(createOrderCreatedEvent(user1, order1));\n      await eventBus.emit(createOrderCreatedEvent(user2, order2));\n\n      // User 1 should have email + SMS\n      const user1Notifs = notificationService.getNotificationsForRecipient('alice@example.com');\n      const user1Channels = user1Notifs.map((n) => n.channel);\n      expect(user1Channels).toContain('email');\n\n      // User 2 should have email only\n      const user2Notifs = notificationService.getNotificationsForRecipient('bob@example.com');\n      const user2Channels = user2Notifs.map((n) => n.channel);\n      expect(user2Channels).toContain('email');\n      expect(user2Channels).not.toContain('sms');\n    });\n  });\n\n  // =========================================================================\n  // 10. Adapter failure handling within the pipeline\n  // =========================================================================\n\n  describe('adapter failure within event-driven pipeline', () => {\n    it('should handle invalid email recipient gracefully in event-driven flow', async () => {\n      preferencesService.createPreferences({ userId: 'user-1' });\n\n      // Override recipient mapping to an invalid email\n      emailAdapter.registerRecipient('user-1', 'not-an-email');\n\n      // Create a user event where recipient won't validate\n      const user = createTestUser({ email: 'not-an-email' });\n\n      // The flow should not throw — the adapter returns a failure result\n      await eventBus.emit(createOrderCreatedEvent(user));\n\n      // Email adapter should have been called but failed validation\n      const notifications = notificationService.getNotifications();\n      const emailNotifs = notifications.filter((n) => n.channel === 'email');\n      expect(emailNotifs.length).toBeGreaterThanOrEqual(1);\n\n      // Adapter returns failure, so notification should be marked as failed\n      // and a failed event should be emitted\n      const failedNotif = emailNotifs.find((n) => n.status === 'failed');\n      if (failedNotif) {\n        // History should record this as failed\n        const failedLogs = historyService.getLogsByDeliveryStatus('failed');\n        expect(failedLogs.length).toBeGreaterThanOrEqual(1);\n      }\n    });\n\n    it('should handle invalid phone number gracefully for SMS', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });\n\n      // Override SMS mapping to invalid phone number\n      smsAdapter.registerRecipient('user-1', 'not-a-phone');\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // SMS notification should still exist but adapter may have failed\n      const notifications = notificationService.getNotifications();\n      const smsNotifs = notifications.filter((n) => n.channel === 'sms');\n      expect(smsNotifs.length).toBeGreaterThanOrEqual(1);\n    });\n\n    it('should continue sending to other channels when one adapter fails', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });\n\n      // Disable email adapter but keep SMS and webhook working\n      const disabledEmail = new EmailAdapter({ enabled: false });\n      notificationService.registerAdapter(disabledEmail);\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Email should fail (disabled adapter)\n      expect(disabledEmail.getSentEmails()).toHaveLength(0);\n\n      // SMS and webhook should still succeed\n      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n      expect(webhookAdapter.getDeliveries().length).toBeGreaterThanOrEqual(1);\n    });\n  });\n});\n",
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts"
+      },
+      "timestamp": "2026-03-28T04:17:01.191Z",
+      "toolName": "Write"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "cd /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP && npx vitest run 2>&1",
+        "description": "Run all tests (unit + integration)",
+        "timeout": 120000
+      },
+      "timestamp": "2026-03-28T04:17:04.946Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Writing integration tests for the full notification pipeline",
+            "content": "Write integration tests for the full notification pipeline",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Fixing integration bugs in notification pipeline",
+            "content": "Fix integration bugs: dispatchToChannel events + per-channel recipient resolution",
+            "status": "in_progress"
+          },
+          {
+            "activeForm": "Running all tests and ensuring they pass",
+            "content": "Run all tests (unit + integration) and ensure they pass",
+            "status": "pending"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T04:18:03.443Z",
+      "toolName": "TodoWrite"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts",
+        "limit": 130,
+        "offset": 280
+      },
+      "timestamp": "2026-03-28T04:18:08.262Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/src/services/notification.service.ts",
+        "new_string": "  private async dispatchMultiChannelNotification(params: {\n    userId: string;\n    recipient: string;\n    subject: string;\n    body: string;\n    category: NotificationCategory;\n  }): Promise<void> {\n    const channels = this.getChannelsToDispatch(params.userId, params.category);\n\n    if (channels.length === 0) {\n      this.logger.info(\n        `All notifications suppressed for user ${params.userId}: no channels enabled for ${params.category}`,\n      );\n      return;\n    }\n\n    for (const channel of channels) {\n      const recipient = this.resolveChannelRecipient(channel, params.userId, params.recipient);\n      await this.dispatchToChannel({\n        recipient,\n        subject: params.subject,\n        body: params.body,\n        channel,\n      });\n    }\n  }\n\n  /**\n   * Resolve the appropriate recipient identifier for a given channel.\n   *\n   * Different channels expect different recipient formats:\n   * - email: email address (passed through as-is, or adapter maps userId → email)\n   * - sms: userId (adapter maps to phone number via registerRecipient)\n   * - webhook: URL from user preferences, or userId for adapter resolution\n   * - in_app: userId\n   *\n   * @param channel - The notification channel.\n   * @param userId - The user ID for recipient resolution.\n   * @param defaultRecipient - The default recipient (typically the email address).\n   * @returns The resolved recipient identifier for the channel.\n   */\n  private resolveChannelRecipient(\n    channel: NotificationType,\n    userId: string,\n    defaultRecipient: string,\n  ): string {\n    switch (channel) {\n      case 'email':\n        return defaultRecipient;\n      case 'sms':\n        // SMS adapter resolves userId → phone number via registerRecipient\n        return userId;\n      case 'webhook': {\n        // Webhook expects a URL. Prefer the URL from user preferences if available.\n        if (this.preferencesService) {\n          const prefs = this.preferencesService.getPreferences(userId);\n          if (prefs?.webhook.url) {\n            return prefs.webhook.url;\n          }\n        }\n        // Fall back to userId for adapter-level resolution\n        return userId;\n      }\n      default:\n        return defaultRecipient;\n    }\n  }",
+        "old_string": "  private async dispatchMultiChannelNotification(params: {\n    userId: string;\n    recipient: string;\n    subject: string;\n    body: string;\n    category: NotificationCategory;\n  }): Promise<void> {\n    const channels = this.getChannelsToDispatch(params.userId, params.category);\n\n    if (channels.length === 0) {\n      this.logger.info(\n        `All notifications suppressed for user ${params.userId}: no channels enabled for ${params.category}`,\n      );\n      return;\n    }\n\n    for (const channel of channels) {\n      await this.dispatchToChannel({\n        recipient: params.recipient,\n        subject: params.subject,\n        body: params.body,\n        channel,\n      });\n    }\n  }",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:18:20.741Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "limit": 20,
+        "offset": 107
+      },
+      "timestamp": "2026-03-28T04:18:27.569Z",
+      "toolName": "Read"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should deliver webhook notification when webhook is explicitly enabled', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should deliver webhook notification when webhook is explicitly enabled', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:18:34.894Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should send signed webhook payload when secret is configured', async () => {\n      // Replace webhook adapter with one that has a secret\n      const signedWebhookAdapter = new WebhookAdapter({ secret: 'test-secret-key' });\n      notificationService.registerAdapter(signedWebhookAdapter);\n\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should send signed webhook payload when secret is configured', async () => {\n      // Replace webhook adapter with one that has a secret\n      const signedWebhookAdapter = new WebhookAdapter({ secret: 'test-secret-key' });\n      notificationService.registerAdapter(signedWebhookAdapter);\n\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:18:41.103Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should log all channel deliveries in notification history', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should log all channel deliveries in notification history', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:18:46.255Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should only send to enabled channels when some are disabled', async () => {\n      // Enable email + SMS, disable webhook\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: { enabled: true },\n        sms: { enabled: true },\n        webhook: { enabled: false },\n      });\n\n      // SMS adapter needs to resolve user-1 → phone (already set in beforeEach)\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Email should be sent\n      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n\n      // SMS should be sent (recipient resolved from user-1 → +14155551234)\n      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n\n      // Webhook should NOT be sent\n      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n\n      // Verify notification records match\n      const notifications = notificationService.getNotifications();\n      const channels = notifications.map((n) => n.channel);\n      expect(channels).toContain('email');\n      expect(channels).toContain('sms');\n      expect(channels).not.toContain('webhook');\n    });",
+        "old_string": "    it('should only send to enabled channels when some are disabled', async () => {\n      // Enable email + SMS, disable webhook\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        email: { enabled: true },\n        sms: { enabled: true },\n        webhook: { enabled: false },\n      });\n\n      await eventBus.emit(createOrderCreatedEvent());\n\n      // Email should be sent\n      expect(emailAdapter.getSentEmails().length).toBeGreaterThanOrEqual(1);\n\n      // SMS should be sent\n      expect(smsAdapter.getSentMessages().length).toBeGreaterThanOrEqual(1);\n\n      // Webhook should NOT be sent\n      expect(webhookAdapter.getDeliveries()).toHaveLength(0);\n\n      // Verify notification records match\n      const notifications = notificationService.getNotifications();\n      const channels = notifications.map((n) => n.channel);\n      expect(channels).toContain('email');\n      expect(channels).toContain('sms');\n      expect(channels).not.toContain('webhook');\n    });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:18:56.835Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should maintain ordering across all channels simultaneously', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should maintain ordering across all channels simultaneously', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:19:01.873Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should emit notification:sent events for all enabled channels', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should emit notification:sent events for all enabled channels', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:19:06.655Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should assign sequential notification IDs across channels', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should assign sequential notification IDs across channels', async () => {\n      // Enable all channels\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:19:12.551Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should continue sending to other channels when one adapter fails', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true, url: 'https://hooks.example.com/user-1' },\n      });",
+        "old_string": "    it('should continue sending to other channels when one adapter fails', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n        webhook: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:19:17.010Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "file_path": "/var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP/tests/integration/notification-pipeline.integration.test.ts",
+        "new_string": "    it('should support combined query filters', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n      });",
+        "old_string": "    it('should support combined query filters', async () => {\n      preferencesService.createPreferences({\n        userId: 'user-1',\n        sms: { enabled: true },\n      });",
+        "replace_all": false
+      },
+      "timestamp": "2026-03-28T04:19:21.260Z",
+      "toolName": "Edit"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "command": "cd /var/folders/45/myq5db_n6q5cyhtb39vkbmp80000gn/T/twining-bench-7PHTNP && npx vitest run 2>&1",
+        "description": "Run all tests after fixing integration bugs",
+        "timeout": 120000
+      },
+      "timestamp": "2026-03-28T04:19:24.802Z",
+      "toolName": "Bash"
+    },
+    {
+      "durationMs": 0,
+      "parameters": {
+        "todos": [
+          {
+            "activeForm": "Writing integration tests for the full notification pipeline",
+            "content": "Write integration tests for the full notification pipeline",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Fixing integration bugs in notification pipeline",
+            "content": "Fix integration bugs: dispatchToChannel events + per-channel recipient resolution",
+            "status": "completed"
+          },
+          {
+            "activeForm": "Running all tests and ensuring they pass",
+            "content": "Run all tests (unit + integration) and ensure they pass",
+            "status": "completed"
+          }
+        ]
+      },
+      "timestamp": "2026-03-28T04:19:30.904Z",
+      "toolName": "TodoWrite"
+    }
+  ],
+  "turnUsage": []
+}

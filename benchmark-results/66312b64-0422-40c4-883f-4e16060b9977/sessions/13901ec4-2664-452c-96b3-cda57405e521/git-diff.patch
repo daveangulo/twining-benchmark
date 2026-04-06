@@ -1,0 +1,664 @@
+diff --git a/src/services/audit.service.ts b/src/services/audit.service.ts
+new file mode 100644
+index 0000000..7d62d4d
+--- /dev/null
++++ b/src/services/audit.service.ts
+@@ -0,0 +1,71 @@
++/**
++ * Audit logging service — records every notification dispatched through the system.
++ *
++ * Subscribes to `notification:requested` events on the EventBus and keeps
++ * a timestamped log of all dispatched notifications for compliance and debugging.
++ */
++
++import type { EventBus } from '../events/event-bus.js';
++import type { NotificationRequestedEvent, NotificationPriority } from '../events/event-types.js';
++
++export interface AuditLogEntry {
++  id: string;
++  channel: string;
++  priority: NotificationPriority;
++  recipient: string;
++  subject: string;
++  timestamp: Date;
++  recordedAt: Date;
++}
++
++let nextAuditId = 1;
++
++function generateAuditId(): string {
++  return `audit-${String(nextAuditId++).padStart(4, '0')}`;
++}
++
++export function resetAuditIdCounter(): void {
++  nextAuditId = 1;
++}
++
++export class AuditService {
++  private entries: AuditLogEntry[] = [];
++
++  constructor(private eventBus: EventBus) {
++    this.eventBus.on<NotificationRequestedEvent>('notification:requested', (event) => {
++      this.record(event);
++    });
++  }
++
++  private record(event: NotificationRequestedEvent): void {
++    this.entries.push({
++      id: generateAuditId(),
++      channel: event.channel,
++      priority: event.priority,
++      recipient: event.recipient,
++      subject: event.subject,
++      timestamp: event.timestamp,
++      recordedAt: new Date(),
++    });
++  }
++
++  getEntries(): AuditLogEntry[] {
++    return [...this.entries];
++  }
++
++  getEntriesByRecipient(recipient: string): AuditLogEntry[] {
++    return this.entries.filter((e) => e.recipient === recipient);
++  }
++
++  getEntriesByChannel(channel: string): AuditLogEntry[] {
++    return this.entries.filter((e) => e.channel === channel);
++  }
++
++  getEntryCount(): number {
++    return this.entries.length;
++  }
++
++  clear(): void {
++    this.entries = [];
++  }
++}
+diff --git a/src/services/notification-preferences.service.ts b/src/services/notification-preferences.service.ts
+new file mode 100644
+index 0000000..e5f439d
+--- /dev/null
++++ b/src/services/notification-preferences.service.ts
+@@ -0,0 +1,50 @@
++/**
++ * Notification preferences service — allows per-user channel overrides.
++ *
++ * When a user has a preferred channel set, it overrides the default
++ * priority-based routing from the PriorityRouter. If no preference
++ * is set, the priority router's default channel is used.
++ */
++
++import type { NotificationPriority } from '../events/event-types.js';
++import { PriorityRouter } from './priority-router.js';
++
++export type NotificationChannel = 'email' | 'sms' | 'webhook';
++
++export interface UserChannelPreference {
++  userId: string;
++  channel: NotificationChannel;
++}
++
++export class NotificationPreferencesService {
++  private preferences: Map<string, NotificationChannel> = new Map();
++  private router = new PriorityRouter();
++
++  setPreference(userId: string, channel: NotificationChannel): void {
++    this.preferences.set(userId, channel);
++  }
++
++  getPreference(userId: string): NotificationChannel | undefined {
++    return this.preferences.get(userId);
++  }
++
++  removePreference(userId: string): boolean {
++    return this.preferences.delete(userId);
++  }
++
++  /**
++   * Resolve the channel for a notification. If the user has a preference,
++   * use it; otherwise fall back to priority-based routing.
++   */
++  resolveChannel(userId: string, priority: NotificationPriority): string {
++    const preference = this.preferences.get(userId);
++    if (preference) {
++      return preference;
++    }
++    return this.router.route(priority);
++  }
++
++  clear(): void {
++    this.preferences.clear();
++  }
++}
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 86728ad..a050a9e 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -24,6 +24,7 @@ import type {
+ import { statusChangeCallbacks } from '../utils/callback-registry.js';
+ import { Logger } from '../utils/logger.js';
+ import { PriorityRouter } from './priority-router.js';
++import type { NotificationPreferencesService } from './notification-preferences.service.js';
+ 
+ export interface Notification {
+   id: string;
+@@ -181,11 +182,16 @@ export class NotificationService {
+   private logger = new Logger('NotificationService');
+   private notifications: Notification[] = [];
+   private router = new PriorityRouter();
++  private preferencesService?: NotificationPreferencesService;
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerHandlers();
+   }
+ 
++  setPreferencesService(preferencesService: NotificationPreferencesService): void {
++    this.preferencesService = preferencesService;
++  }
++
+   /**
+    * Register event handlers for notification triggers.
+    *
+@@ -264,8 +270,12 @@ export class NotificationService {
+     recipient: string;
+     subject: string;
+     body: string;
++    userId?: string;
+   }): void {
+-    const channel = this.router.route(params.priority);
++    const channel =
++      params.userId && this.preferencesService
++        ? this.preferencesService.resolveChannel(params.userId, params.priority)
++        : this.router.route(params.priority);
+     const event: NotificationRequestedEvent = {
+       type: 'notification:requested',
+       channel,
+diff --git a/tests/services/notification-flow.integration.test.ts b/tests/services/notification-flow.integration.test.ts
+new file mode 100644
+index 0000000..ca4326c
+--- /dev/null
++++ b/tests/services/notification-flow.integration.test.ts
+@@ -0,0 +1,482 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { EventBus } from '../../src/events/event-bus.js';
++import {
++  NotificationService,
++  EmailChannelHandler,
++  SmsChannelHandler,
++  WebhookChannelHandler,
++  resetNotificationIdCounter,
++} from '../../src/services/notification.service.js';
++import { AuditService, resetAuditIdCounter } from '../../src/services/audit.service.js';
++import { NotificationPreferencesService } from '../../src/services/notification-preferences.service.js';
++import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
++import type { OrderCreatedEvent } from '../../src/events/event-types.js';
++
++describe('Notification flow integration', () => {
++  let eventBus: EventBus;
++  let service: NotificationService;
++  let emailHandler: EmailChannelHandler;
++  let smsHandler: SmsChannelHandler;
++  let webhookHandler: WebhookChannelHandler;
++  let auditService: AuditService;
++  let preferencesService: NotificationPreferencesService;
++
++  beforeEach(() => {
++    eventBus = new EventBus();
++    statusChangeCallbacks.clear();
++    resetNotificationIdCounter();
++    resetAuditIdCounter();
++
++    // Set up channel handlers
++    emailHandler = new EmailChannelHandler(eventBus);
++    smsHandler = new SmsChannelHandler(eventBus);
++    webhookHandler = new WebhookChannelHandler(eventBus);
++
++    // Set up audit service (subscribes to notification:requested)
++    auditService = new AuditService(eventBus);
++
++    // Set up preferences service
++    preferencesService = new NotificationPreferencesService();
++
++    // Set up notification service with preferences
++    service = new NotificationService(eventBus);
++    service.setPreferencesService(preferencesService);
++  });
++
++  describe('priority routing → channel selection → audit log', () => {
++    it('should route urgent notification to SMS and create audit entry', async () => {
++      service.dispatchNotification({
++        priority: 'urgent',
++        recipient: '+1234567890',
++        subject: 'Server Down',
++        body: 'Production server is unresponsive',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      // Channel selection: urgent → sms
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(1);
++      expect(smsHandler.getDeliveredMessages()[0]?.subject).toBe('Server Down');
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(0);
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(0);
++
++      // Audit log entry created
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries).toHaveLength(1);
++      expect(auditEntries[0]?.channel).toBe('sms');
++      expect(auditEntries[0]?.priority).toBe('urgent');
++      expect(auditEntries[0]?.recipient).toBe('+1234567890');
++      expect(auditEntries[0]?.subject).toBe('Server Down');
++    });
++
++    it('should route normal notification to email and create audit entry', async () => {
++      service.dispatchNotification({
++        priority: 'normal',
++        recipient: 'alice@example.com',
++        subject: 'Order Shipped',
++        body: 'Your order has shipped',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(emailHandler.getDeliveredEmails()[0]?.subject).toBe('Order Shipped');
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(0);
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(0);
++
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries).toHaveLength(1);
++      expect(auditEntries[0]?.channel).toBe('email');
++      expect(auditEntries[0]?.priority).toBe('normal');
++    });
++
++    it('should route low notification to webhook and create audit entry', async () => {
++      service.dispatchNotification({
++        priority: 'low',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Daily Summary',
++        body: '{"summary":"all good"}',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(1);
++      expect(webhookHandler.getDeliveredPayloads()[0]?.subject).toBe('Daily Summary');
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(0);
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(0);
++
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries).toHaveLength(1);
++      expect(auditEntries[0]?.channel).toBe('webhook');
++      expect(auditEntries[0]?.priority).toBe('low');
++    });
++
++    it('should create audit entries for all notifications in mixed-priority batch', async () => {
++      service.dispatchNotification({
++        priority: 'urgent',
++        recipient: '+1234567890',
++        subject: 'Alert',
++        body: 'Urgent alert',
++      });
++      service.dispatchNotification({
++        priority: 'normal',
++        recipient: 'alice@example.com',
++        subject: 'Update',
++        body: 'Normal update',
++      });
++      service.dispatchNotification({
++        priority: 'low',
++        recipient: 'https://hooks.example.com/notify',
++        subject: 'Log',
++        body: 'Low priority log',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(auditService.getEntryCount()).toBe(3);
++      expect(auditService.getEntriesByChannel('sms')).toHaveLength(1);
++      expect(auditService.getEntriesByChannel('email')).toHaveLength(1);
++      expect(auditService.getEntriesByChannel('webhook')).toHaveLength(1);
++    });
++  });
++
++  describe('user preferences override priority routing', () => {
++    it('should override urgent→sms to email when user prefers email', async () => {
++      preferencesService.setPreference('user-1', 'email');
++
++      service.dispatchNotification({
++        priority: 'urgent',
++        userId: 'user-1',
++        recipient: 'alice@example.com',
++        subject: 'Alert',
++        body: 'Urgent alert for user who prefers email',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      // Should go to email instead of sms
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(0);
++
++      // Audit should reflect the overridden channel
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries).toHaveLength(1);
++      expect(auditEntries[0]?.channel).toBe('email');
++      expect(auditEntries[0]?.priority).toBe('urgent');
++    });
++
++    it('should override normal→email to sms when user prefers sms', async () => {
++      preferencesService.setPreference('user-2', 'sms');
++
++      service.dispatchNotification({
++        priority: 'normal',
++        userId: 'user-2',
++        recipient: '+9876543210',
++        subject: 'Order Update',
++        body: 'Your order has shipped',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(1);
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(0);
++
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries[0]?.channel).toBe('sms');
++    });
++
++    it('should override low→webhook to email when user prefers email', async () => {
++      preferencesService.setPreference('user-3', 'email');
++
++      service.dispatchNotification({
++        priority: 'low',
++        userId: 'user-3',
++        recipient: 'bob@example.com',
++        subject: 'Summary',
++        body: 'Weekly summary',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(0);
++
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries[0]?.channel).toBe('email');
++    });
++
++    it('should fall back to priority routing when user has no preference', async () => {
++      // user-99 has no preference set
++      service.dispatchNotification({
++        priority: 'urgent',
++        userId: 'user-99',
++        recipient: '+1234567890',
++        subject: 'Alert',
++        body: 'No preference set',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      // Falls back to default: urgent → sms
++      expect(smsHandler.getDeliveredMessages()).toHaveLength(1);
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(0);
++    });
++
++    it('should fall back to priority routing when no userId is provided', async () => {
++      preferencesService.setPreference('user-1', 'webhook');
++
++      service.dispatchNotification({
++        priority: 'normal',
++        recipient: 'alice@example.com',
++        subject: 'Update',
++        body: 'No userId means no preference lookup',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      // Falls back to default: normal → email
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(0);
++    });
++
++    it('should respect removed preferences and fall back to priority routing', async () => {
++      preferencesService.setPreference('user-1', 'webhook');
++      preferencesService.removePreference('user-1');
++
++      service.dispatchNotification({
++        priority: 'normal',
++        userId: 'user-1',
++        recipient: 'alice@example.com',
++        subject: 'Update',
++        body: 'Preference was removed',
++      });
++
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(webhookHandler.getDeliveredPayloads()).toHaveLength(0);
++    });
++  });
++
++  describe('end-to-end: order event → notification → channel → audit', () => {
++    it('should audit a notification triggered by order:created', async () => {
++      const orderEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 2, unitPrice: 10 }],
++          total: 20,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      await eventBus.emit(orderEvent);
++      // Allow fire-and-forget inner emit to complete
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      // order:created dispatches with normal priority → email
++      expect(emailHandler.getDeliveredEmails()).toHaveLength(1);
++      expect(emailHandler.getDeliveredEmails()[0]?.subject).toContain('Order Confirmation');
++
++      // Audit log should have recorded the notification
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries.length).toBeGreaterThanOrEqual(1);
++      const orderAudit = auditEntries.find((e) => e.subject.includes('Order Confirmation'));
++      expect(orderAudit).toBeDefined();
++      expect(orderAudit?.channel).toBe('email');
++      expect(orderAudit?.recipient).toBe('alice@example.com');
++    });
++
++    it('should audit a status-change notification', async () => {
++      statusChangeCallbacks.notify({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 20,
++          status: 'shipped',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'confirmed',
++        newStatus: 'shipped',
++        timestamp: new Date(),
++      });
++
++      // Allow fire-and-forget inner emit to complete
++      await new Promise((resolve) => setTimeout(resolve, 0));
++
++      const auditEntries = auditService.getEntries();
++      expect(auditEntries.length).toBeGreaterThanOrEqual(1);
++      const statusAudit = auditEntries.find((e) => e.subject.includes('Order Update'));
++      expect(statusAudit).toBeDefined();
++      expect(statusAudit?.channel).toBe('email');
++    });
++  });
++});
++
++describe('AuditService unit', () => {
++  let eventBus: EventBus;
++  let auditService: AuditService;
++
++  beforeEach(() => {
++    eventBus = new EventBus();
++    resetAuditIdCounter();
++    auditService = new AuditService(eventBus);
++  });
++
++  it('should generate sequential audit IDs', async () => {
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'email',
++      priority: 'normal',
++      recipient: 'a@example.com',
++      subject: 'First',
++      body: 'First',
++      timestamp: new Date(),
++    });
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'sms',
++      priority: 'urgent',
++      recipient: '+123',
++      subject: 'Second',
++      body: 'Second',
++      timestamp: new Date(),
++    });
++
++    const entries = auditService.getEntries();
++    expect(entries[0]?.id).toBe('audit-0001');
++    expect(entries[1]?.id).toBe('audit-0002');
++  });
++
++  it('should filter entries by recipient', async () => {
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'email',
++      priority: 'normal',
++      recipient: 'alice@example.com',
++      subject: 'For Alice',
++      body: 'Body',
++      timestamp: new Date(),
++    });
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'email',
++      priority: 'normal',
++      recipient: 'bob@example.com',
++      subject: 'For Bob',
++      body: 'Body',
++      timestamp: new Date(),
++    });
++
++    expect(auditService.getEntriesByRecipient('alice@example.com')).toHaveLength(1);
++    expect(auditService.getEntriesByRecipient('bob@example.com')).toHaveLength(1);
++    expect(auditService.getEntriesByRecipient('nobody@example.com')).toHaveLength(0);
++  });
++
++  it('should filter entries by channel', async () => {
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'email',
++      priority: 'normal',
++      recipient: 'a@example.com',
++      subject: 'Email',
++      body: 'Body',
++      timestamp: new Date(),
++    });
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'sms',
++      priority: 'urgent',
++      recipient: '+123',
++      subject: 'SMS',
++      body: 'Body',
++      timestamp: new Date(),
++    });
++
++    expect(auditService.getEntriesByChannel('email')).toHaveLength(1);
++    expect(auditService.getEntriesByChannel('sms')).toHaveLength(1);
++    expect(auditService.getEntriesByChannel('webhook')).toHaveLength(0);
++  });
++
++  it('should clear entries', async () => {
++    await eventBus.emit({
++      type: 'notification:requested',
++      channel: 'email',
++      priority: 'normal',
++      recipient: 'a@example.com',
++      subject: 'Test',
++      body: 'Body',
++      timestamp: new Date(),
++    });
++
++    auditService.clear();
++    expect(auditService.getEntryCount()).toBe(0);
++  });
++});
++
++describe('NotificationPreferencesService unit', () => {
++  let preferencesService: NotificationPreferencesService;
++
++  beforeEach(() => {
++    preferencesService = new NotificationPreferencesService();
++  });
++
++  it('should store and retrieve preferences', () => {
++    preferencesService.setPreference('user-1', 'sms');
++    expect(preferencesService.getPreference('user-1')).toBe('sms');
++  });
++
++  it('should return undefined for unknown users', () => {
++    expect(preferencesService.getPreference('unknown')).toBeUndefined();
++  });
++
++  it('should remove preferences', () => {
++    preferencesService.setPreference('user-1', 'email');
++    expect(preferencesService.removePreference('user-1')).toBe(true);
++    expect(preferencesService.getPreference('user-1')).toBeUndefined();
++  });
++
++  it('should return false when removing non-existent preference', () => {
++    expect(preferencesService.removePreference('unknown')).toBe(false);
++  });
++
++  it('should resolve to user preference when set', () => {
++    preferencesService.setPreference('user-1', 'webhook');
++    expect(preferencesService.resolveChannel('user-1', 'urgent')).toBe('webhook');
++  });
++
++  it('should fall back to priority routing when no preference', () => {
++    expect(preferencesService.resolveChannel('user-1', 'urgent')).toBe('sms');
++    expect(preferencesService.resolveChannel('user-1', 'normal')).toBe('email');
++    expect(preferencesService.resolveChannel('user-1', 'low')).toBe('webhook');
++  });
++
++  it('should update preferences', () => {
++    preferencesService.setPreference('user-1', 'email');
++    preferencesService.setPreference('user-1', 'sms');
++    expect(preferencesService.getPreference('user-1')).toBe('sms');
++  });
++
++  it('should clear all preferences', () => {
++    preferencesService.setPreference('user-1', 'email');
++    preferencesService.setPreference('user-2', 'sms');
++    preferencesService.clear();
++    expect(preferencesService.getPreference('user-1')).toBeUndefined();
++    expect(preferencesService.getPreference('user-2')).toBeUndefined();
++  });
++});

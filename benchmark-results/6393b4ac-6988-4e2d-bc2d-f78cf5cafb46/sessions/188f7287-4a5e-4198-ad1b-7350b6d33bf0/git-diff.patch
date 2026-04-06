@@ -1,0 +1,395 @@
+diff --git a/src/adapters/webhook.adapter.ts b/src/adapters/webhook.adapter.ts
+new file mode 100644
+index 0000000..fe63b89
+--- /dev/null
++++ b/src/adapters/webhook.adapter.ts
+@@ -0,0 +1,156 @@
++/**
++ * Webhook notification adapter — delivers notifications via HTTP POST.
++ *
++ * Features:
++ * - Posts JSON-formatted notification payloads to a configured URL
++ * - Configurable headers and retry behavior
++ * - In-memory request log for testing; swap internals for real HTTP in production
++ */
++
++import type { NotificationAdapter } from './notification.adapter.js';
++import type { NotificationPayload, NotificationResult } from '../models/notification.js';
++import { Logger } from '../utils/logger.js';
++
++export interface WebhookConfig {
++  /** The URL to POST notifications to. */
++  url: string;
++  /** Optional secret for signing payloads (included as X-Webhook-Secret header). */
++  secret?: string;
++  /** Additional headers to include in the request. */
++  headers?: Record<string, string>;
++  /** Maximum retry attempts for failed sends (default: 0). */
++  maxRetries?: number;
++}
++
++export interface WebhookDelivery {
++  url: string;
++  payload: WebhookPayload;
++  headers: Record<string, string>;
++  deliveredAt: Date;
++}
++
++export interface WebhookPayload {
++  event: string;
++  notificationId: string;
++  recipient: string;
++  subject: string;
++  body: string;
++  metadata?: Record<string, string>;
++  timestamp: string;
++}
++
++export class WebhookAdapter implements NotificationAdapter {
++  readonly channel = 'webhook' as const;
++  private logger = new Logger('WebhookAdapter');
++  private deliveries: WebhookDelivery[] = [];
++  private httpPoster: ((url: string, body: string, headers: Record<string, string>) => Promise<void>) | null = null;
++
++  constructor(private config: WebhookConfig) {}
++
++  /**
++   * Set a custom HTTP POST function.
++   * Allows injecting real HTTP calls or test stubs.
++   * When not set, deliveries are recorded in-memory (test mode).
++   */
++  setHttpPoster(poster: (url: string, body: string, headers: Record<string, string>) => Promise<void>): void {
++    this.httpPoster = poster;
++  }
++
++  /**
++   * Format a notification payload into the webhook JSON structure.
++   */
++  formatPayload(payload: NotificationPayload): WebhookPayload {
++    return {
++      event: payload.type,
++      notificationId: payload.id,
++      recipient: payload.recipient,
++      subject: payload.subject,
++      body: payload.body,
++      metadata: payload.metadata,
++      timestamp: new Date().toISOString(),
++    };
++  }
++
++  /**
++   * Build the headers for a webhook request.
++   */
++  buildHeaders(): Record<string, string> {
++    const headers: Record<string, string> = {
++      'Content-Type': 'application/json',
++      ...this.config.headers,
++    };
++
++    if (this.config.secret) {
++      headers['X-Webhook-Secret'] = this.config.secret;
++    }
++
++    return headers;
++  }
++
++  /**
++   * Send a notification via webhook POST.
++   */
++  async send(payload: NotificationPayload): Promise<NotificationResult> {
++    const webhookPayload = this.formatPayload(payload);
++    const headers = this.buildHeaders();
++    const body = JSON.stringify(webhookPayload);
++
++    let lastError: string | undefined;
++    const maxAttempts = (this.config.maxRetries ?? 0) + 1;
++
++    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
++      try {
++        if (this.httpPoster) {
++          await this.httpPoster(this.config.url, body, headers);
++        }
++
++        const delivery: WebhookDelivery = {
++          url: this.config.url,
++          payload: webhookPayload,
++          headers,
++          deliveredAt: new Date(),
++        };
++
++        this.deliveries.push(delivery);
++
++        this.logger.info(
++          `Webhook delivered to ${this.config.url} for notification ${payload.id}`,
++        );
++
++        return {
++          success: true,
++          notificationId: payload.id,
++          channel: this.channel,
++          timestamp: delivery.deliveredAt,
++        };
++      } catch (err) {
++        lastError = err instanceof Error ? err.message : String(err);
++        this.logger.warn(
++          `Webhook attempt ${attempt}/${maxAttempts} failed for ${payload.id}: ${lastError}`,
++        );
++      }
++    }
++
++    return {
++      success: false,
++      notificationId: payload.id,
++      channel: this.channel,
++      error: `Failed after ${maxAttempts} attempt(s): ${lastError}`,
++      timestamp: new Date(),
++    };
++  }
++
++  /**
++   * Get all recorded deliveries. Useful for testing.
++   */
++  getDeliveries(): WebhookDelivery[] {
++    return [...this.deliveries];
++  }
++
++  /**
++   * Clear recorded deliveries. Useful for testing.
++   */
++  clearDeliveries(): void {
++    this.deliveries = [];
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 01eb450..3e5f976 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -74,6 +74,8 @@ export type {
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+ export { EmailAdapter } from './adapters/email.adapter.js';
+ export type { EmailConfig, SentEmail } from './adapters/email.adapter.js';
++export { WebhookAdapter } from './adapters/webhook.adapter.js';
++export type { WebhookConfig, WebhookDelivery, WebhookPayload } from './adapters/webhook.adapter.js';
+ 
+ // Validators
+ export {
+diff --git a/tests/adapters/webhook.adapter.test.ts b/tests/adapters/webhook.adapter.test.ts
+new file mode 100644
+index 0000000..ab265b0
+--- /dev/null
++++ b/tests/adapters/webhook.adapter.test.ts
+@@ -0,0 +1,214 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import { WebhookAdapter } from '../../src/adapters/webhook.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides: Partial<NotificationPayload> = {}): NotificationPayload {
++  return {
++    id: 'notif-0001',
++    type: 'order-confirmation',
++    channel: 'webhook',
++    recipient: 'user-123',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    ...overrides,
++  };
++}
++
++describe('WebhookAdapter', () => {
++  let adapter: WebhookAdapter;
++
++  beforeEach(() => {
++    adapter = new WebhookAdapter({
++      url: 'https://hooks.example.com/notify',
++    });
++  });
++
++  describe('channel', () => {
++    it('should report webhook as the channel', () => {
++      expect(adapter.channel).toBe('webhook');
++    });
++  });
++
++  describe('send', () => {
++    it('should send a webhook successfully', async () => {
++      const result = await adapter.send(makePayload());
++
++      expect(result.success).toBe(true);
++      expect(result.notificationId).toBe('notif-0001');
++      expect(result.channel).toBe('webhook');
++      expect(result.timestamp).toBeInstanceOf(Date);
++    });
++
++    it('should record the delivery with correct fields', async () => {
++      await adapter.send(makePayload());
++
++      const deliveries = adapter.getDeliveries();
++      expect(deliveries).toHaveLength(1);
++      expect(deliveries[0]?.url).toBe('https://hooks.example.com/notify');
++      expect(deliveries[0]?.payload.event).toBe('order-confirmation');
++      expect(deliveries[0]?.payload.notificationId).toBe('notif-0001');
++      expect(deliveries[0]?.payload.recipient).toBe('user-123');
++      expect(deliveries[0]?.payload.subject).toBe('Order Confirmation: order-1');
++      expect(deliveries[0]?.payload.body).toContain('Widget x2');
++      expect(deliveries[0]?.deliveredAt).toBeInstanceOf(Date);
++    });
++
++    it('should preserve metadata in the webhook payload', async () => {
++      await adapter.send(makePayload({ metadata: { orderId: 'order-1' } }));
++
++      const deliveries = adapter.getDeliveries();
++      expect(deliveries[0]?.payload.metadata).toEqual({ orderId: 'order-1' });
++    });
++
++    it('should call the HTTP poster when set', async () => {
++      const posted: Array<{ url: string; body: string; headers: Record<string, string> }> = [];
++      adapter.setHttpPoster(async (url, body, headers) => {
++        posted.push({ url, body, headers });
++      });
++
++      await adapter.send(makePayload());
++
++      expect(posted).toHaveLength(1);
++      expect(posted[0]?.url).toBe('https://hooks.example.com/notify');
++      const parsed = JSON.parse(posted[0]!.body);
++      expect(parsed.event).toBe('order-confirmation');
++      expect(parsed.notificationId).toBe('notif-0001');
++    });
++
++    it('should fail when HTTP poster throws', async () => {
++      adapter.setHttpPoster(async () => {
++        throw new Error('Connection refused');
++      });
++
++      const result = await adapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Connection refused');
++      expect(adapter.getDeliveries()).toHaveLength(0);
++    });
++
++    it('should retry on failure up to maxRetries', async () => {
++      const retryAdapter = new WebhookAdapter({
++        url: 'https://hooks.example.com/notify',
++        maxRetries: 2,
++      });
++
++      let attempts = 0;
++      retryAdapter.setHttpPoster(async () => {
++        attempts++;
++        throw new Error('Timeout');
++      });
++
++      const result = await retryAdapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Failed after 3 attempt(s)');
++      expect(attempts).toBe(3);
++    });
++
++    it('should succeed on retry after initial failure', async () => {
++      const retryAdapter = new WebhookAdapter({
++        url: 'https://hooks.example.com/notify',
++        maxRetries: 1,
++      });
++
++      let attempts = 0;
++      retryAdapter.setHttpPoster(async () => {
++        attempts++;
++        if (attempts === 1) {
++          throw new Error('Temporary failure');
++        }
++      });
++
++      const result = await retryAdapter.send(makePayload());
++
++      expect(result.success).toBe(true);
++      expect(attempts).toBe(2);
++    });
++  });
++
++  describe('payload formatting', () => {
++    it('should format the notification payload as webhook JSON', () => {
++      const formatted = adapter.formatPayload(makePayload());
++
++      expect(formatted.event).toBe('order-confirmation');
++      expect(formatted.notificationId).toBe('notif-0001');
++      expect(formatted.recipient).toBe('user-123');
++      expect(formatted.subject).toBe('Order Confirmation: order-1');
++      expect(formatted.body).toContain('Widget x2');
++      expect(formatted.timestamp).toBeDefined();
++    });
++
++    it('should include metadata when present', () => {
++      const formatted = adapter.formatPayload(
++        makePayload({ metadata: { key: 'value' } }),
++      );
++      expect(formatted.metadata).toEqual({ key: 'value' });
++    });
++
++    it('should omit metadata when not present', () => {
++      const formatted = adapter.formatPayload(makePayload());
++      expect(formatted.metadata).toBeUndefined();
++    });
++  });
++
++  describe('headers', () => {
++    it('should include Content-Type by default', () => {
++      const headers = adapter.buildHeaders();
++      expect(headers['Content-Type']).toBe('application/json');
++    });
++
++    it('should include the webhook secret when configured', () => {
++      const secretAdapter = new WebhookAdapter({
++        url: 'https://hooks.example.com/notify',
++        secret: 'my-secret',
++      });
++
++      const headers = secretAdapter.buildHeaders();
++      expect(headers['X-Webhook-Secret']).toBe('my-secret');
++    });
++
++    it('should not include secret header when no secret is configured', () => {
++      const headers = adapter.buildHeaders();
++      expect(headers['X-Webhook-Secret']).toBeUndefined();
++    });
++
++    it('should include custom headers from config', () => {
++      const customAdapter = new WebhookAdapter({
++        url: 'https://hooks.example.com/notify',
++        headers: { 'X-Custom': 'value' },
++      });
++
++      const headers = customAdapter.buildHeaders();
++      expect(headers['X-Custom']).toBe('value');
++      expect(headers['Content-Type']).toBe('application/json');
++    });
++  });
++
++  describe('delivery management', () => {
++    it('should return a copy of deliveries', async () => {
++      await adapter.send(makePayload());
++      const deliveries = adapter.getDeliveries();
++      deliveries.pop();
++      expect(adapter.getDeliveries()).toHaveLength(1);
++    });
++
++    it('should clear deliveries', async () => {
++      await adapter.send(makePayload());
++      expect(adapter.getDeliveries()).toHaveLength(1);
++
++      adapter.clearDeliveries();
++      expect(adapter.getDeliveries()).toHaveLength(0);
++    });
++
++    it('should accumulate multiple deliveries', async () => {
++      await adapter.send(makePayload({ id: 'notif-0001' }));
++      await adapter.send(makePayload({ id: 'notif-0002' }));
++
++      const deliveries = adapter.getDeliveries();
++      expect(deliveries).toHaveLength(2);
++      expect(deliveries[0]?.payload.notificationId).toBe('notif-0001');
++      expect(deliveries[1]?.payload.notificationId).toBe('notif-0002');
++    });
++  });
++});

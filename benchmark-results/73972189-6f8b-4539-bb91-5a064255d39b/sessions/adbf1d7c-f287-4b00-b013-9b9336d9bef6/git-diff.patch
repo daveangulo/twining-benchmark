@@ -1,0 +1,493 @@
+diff --git a/src/index.ts b/src/index.ts
+index d33c404..5dd6957 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -32,10 +32,13 @@ export type {
+ export type {
+   UserNotificationPreferences,
+   UpdatePreferencesInput,
++  ChannelNotificationSettings,
+   EmailNotificationSettings,
++  SmsNotificationSettings,
++  WebhookNotificationSettings,
+   EmailFrequency,
+ } from './models/user-preferences.js';
+-export { getDefaultPreferences } from './models/user-preferences.js';
++export { getDefaultPreferences, getChannelSettings } from './models/user-preferences.js';
+ export type {
+   NotificationLogEntry,
+   NotificationHistoryQuery,
+diff --git a/src/models/user-preferences.ts b/src/models/user-preferences.ts
+index 6703c2a..cceb67d 100644
+--- a/src/models/user-preferences.ts
++++ b/src/models/user-preferences.ts
+@@ -1,12 +1,14 @@
+ /**
+  * User notification preferences model.
+  *
+- * Controls how and when a user receives email notifications.
+- * Designed around email as the current notification channel,
+- * with per-category subscription control and frequency settings.
++ * Controls how and when a user receives notifications across multiple channels:
++ * email, SMS, and webhook. Each channel has independent enable/subscribe settings.
++ *
++ * Originally email-only (Session 3), extended to multi-channel after SMS support
++ * was added (Session 8) and webhook support was already present.
+  */
+ 
+-import type { NotificationType } from './notification.js';
++import type { NotificationType, NotificationChannel } from './notification.js';
+ 
+ /**
+  * How frequently a user wants to receive email notifications.
+@@ -17,28 +19,45 @@ import type { NotificationType } from './notification.js';
+ export type EmailFrequency = 'instant' | 'daily' | 'weekly';
+ 
+ /**
+- * Email-specific notification settings.
++ * Base notification settings shared by all channels.
+  */
+-export interface EmailNotificationSettings {
+-  /** Whether email notifications are enabled at all. */
++export interface ChannelNotificationSettings {
++  /** Whether this channel is enabled at all. */
+   enabled: boolean;
+ 
+-  /** Delivery frequency for non-urgent notifications. */
+-  frequency: EmailFrequency;
+-
+   /**
+-   * Notification categories the user is subscribed to.
+-   * If a NotificationType is not in this set, the user won't receive it.
++   * Notification categories the user is subscribed to on this channel.
++   * If a NotificationType is not in this set, the user won't receive it on this channel.
+    */
+   subscribedCategories: NotificationType[];
+ }
+ 
+ /**
+- * Full user notification preferences.
++ * Email-specific notification settings.
++ */
++export interface EmailNotificationSettings extends ChannelNotificationSettings {
++  /** Delivery frequency for non-urgent notifications. */
++  frequency: EmailFrequency;
++}
++
++/**
++ * SMS-specific notification settings.
++ */
++export interface SmsNotificationSettings extends ChannelNotificationSettings {}
++
++/**
++ * Webhook-specific notification settings.
++ */
++export interface WebhookNotificationSettings extends ChannelNotificationSettings {}
++
++/**
++ * Full user notification preferences across all channels.
+  */
+ export interface UserNotificationPreferences {
+   userId: string;
+   email: EmailNotificationSettings;
++  sms: SmsNotificationSettings;
++  webhook: WebhookNotificationSettings;
+   updatedAt: Date;
+ }
+ 
+@@ -52,11 +71,29 @@ export interface UpdatePreferencesInput {
+     frequency?: EmailFrequency;
+     subscribedCategories?: NotificationType[];
+   };
++  sms?: {
++    enabled?: boolean;
++    subscribedCategories?: NotificationType[];
++  };
++  webhook?: {
++    enabled?: boolean;
++    subscribedCategories?: NotificationType[];
++  };
+ }
+ 
++/**
++ * All notification categories.
++ */
++const ALL_CATEGORIES: NotificationType[] = [
++  'order_confirmation',
++  'order_status_update',
++  'welcome',
++  'account_update',
++];
++
+ /**
+  * Returns default notification preferences for a new user.
+- * All categories enabled, instant frequency, email on.
++ * All categories enabled on all channels, instant email frequency.
+  */
+ export function getDefaultPreferences(userId: string): UserNotificationPreferences {
+   return {
+@@ -64,13 +101,35 @@ export function getDefaultPreferences(userId: string): UserNotificationPreferenc
+     email: {
+       enabled: true,
+       frequency: 'instant',
+-      subscribedCategories: [
+-        'order_confirmation',
+-        'order_status_update',
+-        'welcome',
+-        'account_update',
+-      ],
++      subscribedCategories: [...ALL_CATEGORIES],
++    },
++    sms: {
++      enabled: true,
++      subscribedCategories: [...ALL_CATEGORIES],
++    },
++    webhook: {
++      enabled: true,
++      subscribedCategories: [...ALL_CATEGORIES],
+     },
+     updatedAt: new Date(),
+   };
+ }
++
++/**
++ * Get the channel settings from a preferences object for a given channel.
++ */
++export function getChannelSettings(
++  prefs: UserNotificationPreferences,
++  channel: NotificationChannel,
++): ChannelNotificationSettings | undefined {
++  switch (channel) {
++    case 'email':
++      return prefs.email;
++    case 'sms':
++      return prefs.sms;
++    case 'webhook':
++      return prefs.webhook;
++    default:
++      return undefined;
++  }
++}
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index 5f87944..53b22f2 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -145,10 +145,10 @@ export class NotificationService {
+     priority: NotificationPayload['priority'];
+     metadata?: Record<string, string>;
+   }): Promise<void> {
+-    // Check user preferences before sending
+-    if (this.preferencesService && params.channel === 'email') {
+-      if (!this.preferencesService.shouldSendEmail(params.userId, params.type)) {
+-        this.logger.info(`Notification suppressed by preferences: ${params.type} for user ${params.userId}`);
++    // Check user preferences before sending (all channels)
++    if (this.preferencesService) {
++      if (!this.preferencesService.shouldSend(params.userId, params.type, params.channel)) {
++        this.logger.info(`Notification suppressed by preferences: ${params.type} for user ${params.userId} on ${params.channel}`);
+         this.historyService?.log({
+           notificationId: generateNotificationId(),
+           recipient: params.recipient,
+diff --git a/src/services/preferences.service.ts b/src/services/preferences.service.ts
+index 53776ff..74e8004 100644
+--- a/src/services/preferences.service.ts
++++ b/src/services/preferences.service.ts
+@@ -2,20 +2,29 @@
+  * Preferences service — manages user notification preferences.
+  *
+  * Provides CRUD operations for user notification preferences and
+- * a method to check whether a specific notification should be sent
+- * to a user based on their current settings.
++ * methods to check whether a specific notification should be sent
++ * to a user on any channel based on their current settings.
+  *
+  * Storage is in-memory, consistent with other services in this codebase.
+  */
+ 
+-import type { NotificationType } from '../models/notification.js';
++import type { NotificationType, NotificationChannel } from '../models/notification.js';
+ import type {
+   UserNotificationPreferences,
+   UpdatePreferencesInput,
+ } from '../models/user-preferences.js';
+-import { getDefaultPreferences } from '../models/user-preferences.js';
++import { getDefaultPreferences, getChannelSettings } from '../models/user-preferences.js';
+ import { Logger } from '../utils/logger.js';
+ 
++function clonePreferences(prefs: UserNotificationPreferences): UserNotificationPreferences {
++  return {
++    ...prefs,
++    email: { ...prefs.email, subscribedCategories: [...prefs.email.subscribedCategories] },
++    sms: { ...prefs.sms, subscribedCategories: [...prefs.sms.subscribedCategories] },
++    webhook: { ...prefs.webhook, subscribedCategories: [...prefs.webhook.subscribedCategories] },
++  };
++}
++
+ export class PreferencesService {
+   private logger = new Logger('PreferencesService');
+   private preferences: Map<string, UserNotificationPreferences> = new Map();
+@@ -27,11 +36,11 @@ export class PreferencesService {
+   getPreferences(userId: string): UserNotificationPreferences {
+     const existing = this.preferences.get(userId);
+     if (existing) {
+-      return { ...existing, email: { ...existing.email, subscribedCategories: [...existing.email.subscribedCategories] } };
++      return clonePreferences(existing);
+     }
+     const defaults = getDefaultPreferences(userId);
+     this.preferences.set(userId, defaults);
+-    return { ...defaults, email: { ...defaults.email, subscribedCategories: [...defaults.email.subscribedCategories] } };
++    return clonePreferences(defaults);
+   }
+ 
+   /**
+@@ -53,37 +62,71 @@ export class PreferencesService {
+       }
+     }
+ 
++    if (input.sms) {
++      if (input.sms.enabled !== undefined) {
++        current.sms.enabled = input.sms.enabled;
++      }
++      if (input.sms.subscribedCategories !== undefined) {
++        current.sms.subscribedCategories = [...input.sms.subscribedCategories];
++      }
++    }
++
++    if (input.webhook) {
++      if (input.webhook.enabled !== undefined) {
++        current.webhook.enabled = input.webhook.enabled;
++      }
++      if (input.webhook.subscribedCategories !== undefined) {
++        current.webhook.subscribedCategories = [...input.webhook.subscribedCategories];
++      }
++    }
++
+     current.updatedAt = new Date();
+     this.preferences.set(userId, current);
+     this.logger.info(`Updated preferences for user ${userId}`);
+ 
+-    return { ...current, email: { ...current.email, subscribedCategories: [...current.email.subscribedCategories] } };
++    return clonePreferences(current);
+   }
+ 
+   /**
+    * Check whether a notification of the given type should be sent to a user
+-   * via the email channel based on their preferences.
++   * on the specified channel based on their preferences.
+    *
+    * Returns true if:
+-   * - Email notifications are enabled AND
+-   * - The notification type is in the user's subscribed categories
++   * - The channel is enabled AND
++   * - The notification type is in the user's subscribed categories for that channel
++   *
++   * For channels without explicit preference support (e.g., in-app), returns true.
+    */
+-  shouldSendEmail(userId: string, notificationType: NotificationType): boolean {
++  shouldSend(userId: string, notificationType: NotificationType, channel: NotificationChannel): boolean {
+     const prefs = this.getPreferences(userId);
++    const channelSettings = getChannelSettings(prefs, channel);
+ 
+-    if (!prefs.email.enabled) {
+-      this.logger.info(`Email disabled for user ${userId}, suppressing ${notificationType}`);
++    if (!channelSettings) {
++      // Channel not managed by preferences (e.g., in-app) — allow by default
++      return true;
++    }
++
++    if (!channelSettings.enabled) {
++      this.logger.info(`${channel} disabled for user ${userId}, suppressing ${notificationType}`);
+       return false;
+     }
+ 
+-    if (!prefs.email.subscribedCategories.includes(notificationType)) {
+-      this.logger.info(`User ${userId} not subscribed to ${notificationType}, suppressing`);
++    if (!channelSettings.subscribedCategories.includes(notificationType)) {
++      this.logger.info(`User ${userId} not subscribed to ${notificationType} on ${channel}, suppressing`);
+       return false;
+     }
+ 
+     return true;
+   }
+ 
++  /**
++   * Check whether a notification should be sent via email.
++   * Backward-compatible convenience method — delegates to shouldSend().
++   */
++  shouldSendEmail(userId: string, notificationType: NotificationType): boolean {
++    return this.shouldSend(userId, notificationType, 'email');
++  }
++
+   /**
+    * Remove a user's custom preferences (revert to defaults on next access).
+    */
+diff --git a/tests/services/preferences.service.test.ts b/tests/services/preferences.service.test.ts
+index 39bc019..00ef6d9 100644
+--- a/tests/services/preferences.service.test.ts
++++ b/tests/services/preferences.service.test.ts
+@@ -29,13 +29,39 @@ describe('PreferencesService', () => {
+       ]);
+     });
+ 
++    it('should return default SMS preferences for a new user', () => {
++      const prefs = service.getPreferences('user-1');
++
++      expect(prefs.sms.enabled).toBe(true);
++      expect(prefs.sms.subscribedCategories).toEqual([
++        'order_confirmation',
++        'order_status_update',
++        'welcome',
++        'account_update',
++      ]);
++    });
++
++    it('should return default webhook preferences for a new user', () => {
++      const prefs = service.getPreferences('user-1');
++
++      expect(prefs.webhook.enabled).toBe(true);
++      expect(prefs.webhook.subscribedCategories).toEqual([
++        'order_confirmation',
++        'order_status_update',
++        'welcome',
++        'account_update',
++      ]);
++    });
++
+     it('should return a defensive copy', () => {
+       const prefs1 = service.getPreferences('user-1');
+       prefs1.email.enabled = false;
+       prefs1.email.subscribedCategories.push('order_confirmation');
++      prefs1.sms.enabled = false;
+ 
+       const prefs2 = service.getPreferences('user-1');
+       expect(prefs2.email.enabled).toBe(true);
++      expect(prefs2.sms.enabled).toBe(true);
+     });
+   });
+ 
+@@ -66,6 +92,53 @@ describe('PreferencesService', () => {
+       expect(updated.email.subscribedCategories).toEqual(['order_confirmation']);
+     });
+ 
++    it('should update SMS preferences', () => {
++      const updated = service.updatePreferences('user-1', {
++        sms: { enabled: false },
++      });
++
++      expect(updated.sms.enabled).toBe(false);
++      expect(updated.email.enabled).toBe(true); // other channels unaffected
++    });
++
++    it('should update SMS subscribed categories', () => {
++      const updated = service.updatePreferences('user-1', {
++        sms: { subscribedCategories: ['order_confirmation'] },
++      });
++
++      expect(updated.sms.subscribedCategories).toEqual(['order_confirmation']);
++    });
++
++    it('should update webhook preferences', () => {
++      const updated = service.updatePreferences('user-1', {
++        webhook: { enabled: false },
++      });
++
++      expect(updated.webhook.enabled).toBe(false);
++      expect(updated.email.enabled).toBe(true); // other channels unaffected
++      expect(updated.sms.enabled).toBe(true);
++    });
++
++    it('should update webhook subscribed categories', () => {
++      const updated = service.updatePreferences('user-1', {
++        webhook: { subscribedCategories: ['welcome'] },
++      });
++
++      expect(updated.webhook.subscribedCategories).toEqual(['welcome']);
++    });
++
++    it('should update multiple channels at once', () => {
++      const updated = service.updatePreferences('user-1', {
++        email: { enabled: false },
++        sms: { subscribedCategories: ['order_confirmation'] },
++        webhook: { enabled: false },
++      });
++
++      expect(updated.email.enabled).toBe(false);
++      expect(updated.sms.subscribedCategories).toEqual(['order_confirmation']);
++      expect(updated.webhook.enabled).toBe(false);
++    });
++
+     it('should persist updates across calls', () => {
+       service.updatePreferences('user-1', {
+         email: { enabled: false, frequency: 'weekly' },
+@@ -124,10 +197,63 @@ describe('PreferencesService', () => {
+     });
+   });
+ 
++  describe('shouldSend (multi-channel)', () => {
++    it('should check SMS preferences', () => {
++      expect(service.shouldSend('user-1', 'order_confirmation', 'sms')).toBe(true);
++
++      service.updatePreferences('user-1', { sms: { enabled: false } });
++      expect(service.shouldSend('user-1', 'order_confirmation', 'sms')).toBe(false);
++    });
++
++    it('should check SMS subscribed categories', () => {
++      service.updatePreferences('user-1', {
++        sms: { subscribedCategories: ['welcome'] },
++      });
++
++      expect(service.shouldSend('user-1', 'order_confirmation', 'sms')).toBe(false);
++      expect(service.shouldSend('user-1', 'welcome', 'sms')).toBe(true);
++    });
++
++    it('should check webhook preferences', () => {
++      expect(service.shouldSend('user-1', 'order_confirmation', 'webhook')).toBe(true);
++
++      service.updatePreferences('user-1', { webhook: { enabled: false } });
++      expect(service.shouldSend('user-1', 'order_confirmation', 'webhook')).toBe(false);
++    });
++
++    it('should check webhook subscribed categories', () => {
++      service.updatePreferences('user-1', {
++        webhook: { subscribedCategories: ['account_update'] },
++      });
++
++      expect(service.shouldSend('user-1', 'order_confirmation', 'webhook')).toBe(false);
++      expect(service.shouldSend('user-1', 'account_update', 'webhook')).toBe(true);
++    });
++
++    it('should allow in-app channel (no preferences defined)', () => {
++      expect(service.shouldSend('user-1', 'order_confirmation', 'in-app')).toBe(true);
++    });
++
++    it('should handle channels independently', () => {
++      service.updatePreferences('user-1', {
++        email: { enabled: false },
++        sms: { enabled: true },
++        webhook: { subscribedCategories: ['welcome'] },
++      });
++
++      expect(service.shouldSend('user-1', 'order_confirmation', 'email')).toBe(false);
++      expect(service.shouldSend('user-1', 'order_confirmation', 'sms')).toBe(true);
++      expect(service.shouldSend('user-1', 'order_confirmation', 'webhook')).toBe(false);
++      expect(service.shouldSend('user-1', 'welcome', 'webhook')).toBe(true);
++    });
++  });
++
+   describe('resetPreferences', () => {
+     it('should revert to defaults after reset', () => {
+       service.updatePreferences('user-1', {
+         email: { enabled: false, frequency: 'weekly' },
++        sms: { enabled: false },
++        webhook: { enabled: false },
+       });
+ 
+       service.resetPreferences('user-1');
+@@ -135,6 +261,8 @@ describe('PreferencesService', () => {
+ 
+       expect(prefs.email.enabled).toBe(true);
+       expect(prefs.email.frequency).toBe('instant');
++      expect(prefs.sms.enabled).toBe(true);
++      expect(prefs.webhook.enabled).toBe(true);
+     });
+   });
+ 

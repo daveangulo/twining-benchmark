@@ -1,0 +1,192 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index f832357..7ee7f19 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -50,6 +50,8 @@ export class NotificationService {
+   private records: NotificationRecord[] = [];
+   private preferencesService: PreferencesService | null = null;
+   private historyService: NotificationHistoryService | null = null;
++  /** Per-recipient delivery queues to guarantee notification ordering. */
++  private deliveryQueues: Map<string, Promise<void>> = new Map();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerHandlers();
+@@ -146,6 +148,7 @@ export class NotificationService {
+   /**
+    * Build a payload and deliver it through all specified channels.
+    * Checks user preferences before sending (if PreferencesService is set).
++   * Delivery is serialized per recipient to guarantee ordering.
+    */
+   private async sendNotification(params: {
+     type: NotificationType;
+@@ -185,6 +188,20 @@ export class NotificationService {
+       createdAt: new Date(),
+     };
+ 
++    // Chain delivery onto a per-user queue to preserve ordering.
++    // Use userId as queue key when available (different handlers may use
++    // different recipient formats for the same user), fall back to recipient.
++    const queueKey = params.userId ?? payload.recipient;
++    const previous = this.deliveryQueues.get(queueKey) ?? Promise.resolve();
++    const current = previous.then(() => this.deliverPayload(payload));
++    this.deliveryQueues.set(queueKey, current.catch(() => {}));
++    await current;
++  }
++
++  /**
++   * Deliver a payload through all its channels. Called from the per-recipient queue.
++   */
++  private async deliverPayload(payload: NotificationPayload): Promise<void> {
+     for (const channel of payload.channels) {
+       const adapter = this.adapters.get(channel);
+       let result: DeliveryResult;
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index 1d68f99..2838595 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -5,6 +5,8 @@ import {
+   resetNotificationIdCounter,
+ } from '../../src/services/notification.service.js';
+ import { EmailNotificationAdapter } from '../../src/adapters/email.adapter.js';
++import type { NotificationAdapter, DeliveryResult } from '../../src/adapters/notification.adapter.js';
++import type { NotificationPayload, NotificationChannel } from '../../src/models/notification.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ 
+ describe('NotificationService', () => {
+@@ -314,4 +316,136 @@ describe('NotificationService', () => {
+       expect(notifications[1]?.id).toBe('notif-0002');
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications in order when events fire concurrently for the same recipient', async () => {
++      // Use a slow adapter that introduces variable delays to expose ordering issues.
++      // Without a per-recipient queue, the second (faster) notification would
++      // arrive before the first (slower) one.
++      const deliveryOrder: string[] = [];
++      let callIndex = 0;
++
++      const slowAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<DeliveryResult> {
++          const myIndex = callIndex++;
++          // First call is slow, second is fast — would reorder without a queue
++          const delay = myIndex === 0 ? 50 : 5;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(payload.type);
++          return { success: true };
++        },
++      };
++
++      // Create a fresh service with the slow adapter
++      const bus = new EventBus();
++      const svc = new NotificationService(bus);
++      svc.registerAdapter(slowAdapter);
++
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++
++      const statusChangedEvent: OrderStatusChangedEvent = {
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      };
++
++      // Fire both events concurrently (no await between them)
++      const p1 = bus.emit(orderCreatedEvent);
++      const p2 = bus.emit(statusChangedEvent);
++      await Promise.all([p1, p2]);
++
++      // Order confirmation must arrive before status update
++      expect(deliveryOrder).toEqual(['order-confirmation', 'order-status-update']);
++
++      // Records in the service should also be in order
++      const notifications = svc.getNotifications();
++      expect(notifications).toHaveLength(2);
++      expect(notifications[0]?.type).toBe('order-confirmation');
++      expect(notifications[1]?.type).toBe('order-status-update');
++    });
++
++    it('should not block notifications for different recipients', async () => {
++      const deliveryOrder: string[] = [];
++      let callIndex = 0;
++
++      const trackingAdapter: NotificationAdapter = {
++        channel: 'email' as NotificationChannel,
++        async send(payload: NotificationPayload): Promise<DeliveryResult> {
++          const myIndex = callIndex++;
++          // First recipient is slow, second is fast
++          const delay = myIndex === 0 ? 50 : 5;
++          await new Promise((resolve) => setTimeout(resolve, delay));
++          deliveryOrder.push(`${payload.recipient}:${payload.type}`);
++          return { success: true };
++        },
++      };
++
++      const bus = new EventBus();
++      const svc = new NotificationService(bus);
++      svc.registerAdapter(trackingAdapter);
++
++      // Two different recipients — should not block each other
++      const event1: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1', userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10, status: 'pending', createdAt: new Date(), updatedAt: new Date(),
++        },
++        user: { id: 'user-1', name: 'Alice', email: 'alice@example.com', role: 'member', createdAt: new Date(), updatedAt: new Date() },
++        timestamp: new Date(),
++      };
++
++      const event2: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-2', userId: 'user-2',
++          items: [{ productId: 'p2', name: 'Gadget', quantity: 1, unitPrice: 20 }],
++          total: 20, status: 'pending', createdAt: new Date(), updatedAt: new Date(),
++        },
++        user: { id: 'user-2', name: 'Bob', email: 'bob@example.com', role: 'member', createdAt: new Date(), updatedAt: new Date() },
++        timestamp: new Date(),
++      };
++
++      const p1 = bus.emit(event1);
++      const p2 = bus.emit(event2);
++      await Promise.all([p1, p2]);
++
++      // Bob's notification (fast) should arrive before Alice's (slow)
++      // because they are different recipients and don't block each other
++      expect(deliveryOrder[0]).toBe('bob@example.com:order-confirmation');
++      expect(deliveryOrder[1]).toBe('alice@example.com:order-confirmation');
++    });
++  });
+ });

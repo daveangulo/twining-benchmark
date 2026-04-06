@@ -1,0 +1,226 @@
+diff --git a/src/services/notification.service.ts b/src/services/notification.service.ts
+index fa15464..c22e5fb 100644
+--- a/src/services/notification.service.ts
++++ b/src/services/notification.service.ts
+@@ -57,6 +57,7 @@ export class NotificationService {
+   private notifications: Notification[] = [];
+   private adapters: NotificationAdapter[] = [];
+   private historyService?: NotificationHistoryService;
++  private deliveryQueue: Promise<void> = Promise.resolve();
+ 
+   constructor(private eventBus: EventBus) {
+     this.registerHandlers();
+@@ -204,39 +205,53 @@ export class NotificationService {
+       (adapter) => this.isAdapterEnabled(adapter, params.preferences),
+     );
+ 
+-    for (const adapter of enabledAdapters) {
+-      const adapterRecipient = params.channelRecipients?.[adapter.name] ?? params.recipient;
+-      const adapterPayload = { ...notification, recipient: adapterRecipient };
++    // Queue adapter deliveries to preserve notification ordering.
++    // Each notification's adapters must complete before the next notification's
++    // adapters start, preventing out-of-order delivery (e.g., "payment confirmed"
++    // arriving before "order placed").
++    this.deliveryQueue = this.deliveryQueue.then(async () => {
++      for (const adapter of enabledAdapters) {
++        const adapterRecipient = params.channelRecipients?.[adapter.name] ?? params.recipient;
++        const adapterPayload = { ...notification, recipient: adapterRecipient };
+ 
+-      adapter.send(adapterPayload).then(() => {
+-        if (this.historyService) {
+-          this.historyService.log({
+-            notificationId: notification.id,
+-            recipient: adapterRecipient,
+-            channel: adapter.name as NotificationChannel,
+-            type: params.type,
+-            subject: params.subject,
+-            body: params.body,
+-            status: 'sent',
+-            sentAt: notification.sentAt,
+-          });
++        try {
++          await adapter.send(adapterPayload);
++          if (this.historyService) {
++            this.historyService.log({
++              notificationId: notification.id,
++              recipient: adapterRecipient,
++              channel: adapter.name as NotificationChannel,
++              type: params.type,
++              subject: params.subject,
++              body: params.body,
++              status: 'sent',
++              sentAt: notification.sentAt,
++            });
++          }
++        } catch (error) {
++          this.logger.error(`Adapter ${adapter.name} failed: ${error}`);
++          if (this.historyService) {
++            this.historyService.log({
++              notificationId: notification.id,
++              recipient: adapterRecipient,
++              channel: adapter.name as NotificationChannel,
++              type: params.type,
++              subject: params.subject,
++              body: params.body,
++              status: 'failed',
++              sentAt: notification.sentAt,
++            });
++          }
+         }
+-      }).catch((error) => {
+-        this.logger.error(`Adapter ${adapter.name} failed: ${error}`);
+-        if (this.historyService) {
+-          this.historyService.log({
+-            notificationId: notification.id,
+-            recipient: adapterRecipient,
+-            channel: adapter.name as NotificationChannel,
+-            type: params.type,
+-            subject: params.subject,
+-            body: params.body,
+-            status: 'failed',
+-            sentAt: notification.sentAt,
+-          });
+-        }
+-      });
+-    }
++      }
++    });
++  }
++
++  /**
++   * Wait for all queued adapter deliveries to complete.
++   */
++  async flush(): Promise<void> {
++    await this.deliveryQueue;
+   }
+ 
+   /**
+diff --git a/tests/services/notification.service.test.ts b/tests/services/notification.service.test.ts
+index b24e42e..f3537c4 100644
+--- a/tests/services/notification.service.test.ts
++++ b/tests/services/notification.service.test.ts
+@@ -7,6 +7,7 @@ import {
+ import { statusChangeCallbacks } from '../../src/utils/callback-registry.js';
+ import { EmailAdapter } from '../../src/adapters/email.adapter.js';
+ import { SmsAdapter } from '../../src/adapters/sms.adapter.js';
++import type { NotificationAdapter } from '../../src/adapters/notification.adapter.js';
+ import { defaultNotificationPreferences } from '../../src/models/user.js';
+ import type { OrderCreatedEvent, OrderStatusChangedEvent } from '../../src/events/event-types.js';
+ import type { User } from '../../src/models/user.js';
+@@ -274,7 +275,7 @@ describe('NotificationService', () => {
+       await eventBus.emit(makeOrderCreatedEvent(user));
+ 
+       // Wait for adapter promises to resolve
+-      await new Promise((r) => setTimeout(r, 10));
++      await service.flush();
+ 
+       expect(emailAdapter.getSentEmails()).toHaveLength(1);
+       expect(smsAdapter.getSentMessages()).toHaveLength(0);
+@@ -296,7 +297,7 @@ describe('NotificationService', () => {
+       });
+       await eventBus.emit(makeOrderCreatedEvent(user));
+ 
+-      await new Promise((r) => setTimeout(r, 10));
++      await service.flush();
+ 
+       expect(emailAdapter.getSentEmails()).toHaveLength(1);
+       expect(emailAdapter.getSentEmails()[0]?.to).toBe('alice@example.com');
+@@ -319,7 +320,7 @@ describe('NotificationService', () => {
+       });
+       await eventBus.emit(makeOrderCreatedEvent(user));
+ 
+-      await new Promise((r) => setTimeout(r, 10));
++      await service.flush();
+ 
+       expect(emailAdapter.getSentEmails()).toHaveLength(0);
+       expect(smsAdapter.getSentMessages()).toHaveLength(0);
+@@ -359,7 +360,7 @@ describe('NotificationService', () => {
+       });
+       await eventBus.emit(makeOrderCreatedEvent(user));
+ 
+-      await new Promise((r) => setTimeout(r, 10));
++      await service.flush();
+ 
+       expect(emailAdapter.getSentEmails()).toHaveLength(0);
+       expect(smsAdapter.getSentMessages()).toHaveLength(1);
+@@ -389,10 +390,79 @@ describe('NotificationService', () => {
+         timestamp: new Date(),
+       });
+ 
+-      await new Promise((r) => setTimeout(r, 10));
++      await service.flush();
+ 
+       expect(emailAdapter.getSentEmails()).toHaveLength(1);
+       expect(smsAdapter.getSentMessages()).toHaveLength(1);
+     });
+   });
++
++  describe('notification ordering', () => {
++    it('should deliver notifications to adapters in the order they were sent', async () => {
++      const deliveryOrder: string[] = [];
++
++      // Create an adapter that records delivery order with a variable delay
++      // to simulate real-world async behavior where later calls could resolve first
++      const trackingAdapter: NotificationAdapter = {
++        name: 'tracking',
++        async send(notification) {
++          // Second notification gets a shorter delay — without ordering,
++          // it would arrive first
++          const delay = notification.subject.includes('Order Confirmation') ? 50 : 10;
++          await new Promise((r) => setTimeout(r, delay));
++          deliveryOrder.push(notification.subject);
++        },
++      };
++      service.registerAdapter(trackingAdapter);
++
++      // Send "order placed" notification
++      const orderCreatedEvent: OrderCreatedEvent = {
++        type: 'order:created',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [{ productId: 'p1', name: 'Widget', quantity: 1, unitPrice: 10 }],
++          total: 10,
++          status: 'pending',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        user: {
++          id: 'user-1',
++          name: 'Alice',
++          email: 'alice@example.com',
++          role: 'member',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        timestamp: new Date(),
++      };
++      await eventBus.emit(orderCreatedEvent);
++
++      // Send "status changed" notification immediately after
++      statusChangeCallbacks.notify({
++        type: 'order:status-changed',
++        order: {
++          id: 'order-1',
++          userId: 'user-1',
++          items: [],
++          total: 10,
++          status: 'confirmed',
++          createdAt: new Date(),
++          updatedAt: new Date(),
++        },
++        previousStatus: 'pending',
++        newStatus: 'confirmed',
++        timestamp: new Date(),
++      });
++
++      await service.flush();
++
++      // Despite the first notification having a longer delay,
++      // it should still be delivered first
++      expect(deliveryOrder).toHaveLength(2);
++      expect(deliveryOrder[0]).toContain('Order Confirmation');
++      expect(deliveryOrder[1]).toContain('Order Update');
++    });
++  });
+ });

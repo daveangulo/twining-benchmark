@@ -1,0 +1,154 @@
+diff --git a/ARCHITECTURE.md b/ARCHITECTURE.md
+index 1aa4586..e3f33d9 100644
+--- a/ARCHITECTURE.md
++++ b/ARCHITECTURE.md
+@@ -101,3 +101,76 @@
+ - **Adapter pattern for delivery.** Previously, `NotificationService` stored notifications in-memory directly. Now it dispatches to registered adapters, with `EmailAdapter` as the first implementation.
+ - **Richer notification model.** The old `Notification` interface had 5 fields. The new `NotificationRecord` has 12 fields including type, channel, status, priority, and metadata.
+ - **Lifecycle events.** `notification:sent` and `notification:failed` events are now emitted, enabling observability and downstream reactions.
++
++---
++
++## System Architecture Summary (Final Review)
++
++### Complete System Overview
++
++TaskFlow Pro is a task and order management system with a multi-channel, event-driven
++notification subsystem. The system is built across four layers:
++
++```
++┌───────────────────────────────────────────────────────────┐
++│  Domain Services (UserService, OrderService)              │
++│  - Business logic, validation, domain event emission      │
++├──────────────────────┬────────────────────────────────────┤
++│  EventBus            │  Notification Services             │
++│  - Typed events      │  - NotificationService (dispatch)  │
++│  - Event log         │  - PreferencesService (opt-out)    │
++│  - Async handlers    │  - NotificationHistoryService      │
++├──────────────────────┴────────────────────────────────────┤
++│  Adapters (EmailAdapter, SmsAdapter, WebhookAdapter)      │
++│  - Channel-specific delivery, validation, formatting      │
++│  - Stub mode for dev/test, production mode for real I/O   │
++│  - Retry with exponential backoff                         │
++├───────────────────────────────────────────────────────────┤
++│  Repositories & Database                                  │
++│  - In-memory storage with defensive copies                │
++│  - Repository pattern for all data access                 │
++└───────────────────────────────────────────────────────────┘
++```
++
++### Notification Channels
++
++| Channel | Adapter         | Validation          | Formatting              | Preferences         |
++|---------|-----------------|---------------------|-------------------------|----------------------|
++| Email   | `EmailAdapter`  | RFC email regex     | HTML + plain-text templates per notification type | enabled, frequency, per-category |
++| SMS     | `SmsAdapter`    | E.164 + domestic    | 160-char truncation     | enabled, per-category |
++| Webhook | `WebhookAdapter`| http/https URL      | Structured JSON payload | enabled, url, per-category |
++| In-App  | Not implemented | N/A                 | N/A                     | N/A                  |
++
++### Preferences Model (Opt-Out)
++
++- Users without stored preferences receive all notifications on all channels.
++- Each channel has a master `enabled` switch and per-category overrides.
++- Suppressed notifications are recorded with `suppressedByPreferences` metadata but do NOT emit lifecycle events (no history entry for suppressed notifications).
++
++### History & Audit Trail
++
++- `NotificationHistoryService` passively observes `notification:sent` and `notification:failed` events.
++- Log entries are persisted in `NotificationLogRepository`, separate from in-memory notification records.
++- Supports queries by recipient, type, channel, date range, delivery status, and combined filters with pagination.
++
++### Known Limitations
++
++1. **In-app channel not implemented.** `NotificationChannel` includes `'in_app'` but no adapter exists. Adding one follows the standard adapter registration pattern.
++
++2. **Event handlers default to email channel.** All domain event handlers (`handleOrderCreated`, `handleUserCreated`, etc.) hardcode `channel: 'email'`. Multi-channel dispatch (e.g., sending both email and SMS for an order) requires calling `send()` directly with the desired channel or extending event handlers to dispatch to multiple channels.
++
++3. **Adapter delivery is stubbed.** All three adapters throw in production mode (`stubMode: false`). Real integrations (SMTP, Twilio, HTTP POST) are marked as TODOs and must be implemented before production deployment.
++
++4. **In-memory storage only.** The `Database` utility is an in-memory store with no persistence to disk or external databases. All data is lost on process restart.
++
++5. **No transaction support.** If a notification fails after a user or order is created, there is no compensation or rollback mechanism. The domain operation succeeds independently of notification delivery.
++
++6. **Sequential dispatch queue.** Notifications are dispatched sequentially (one at a time) to preserve ordering. This ensures correct delivery order but may become a bottleneck under high volume.
++
++7. **No multi-channel fan-out from events.** Domain events trigger a single notification (email by default). To notify a user on multiple channels for the same event, the event handler must issue separate `send()` calls per channel.
++
++8. **CallbackRegistry is deprecated but present.** `src/utils/callback-registry.ts` and its `statusChangeCallbacks` singleton exist for backward compatibility but are unused. All cross-service communication uses EventBus.
++
++9. **Module-level ID counters.** Notification, log, user, order, and preferences IDs use module-level counters (`nextId`). These reset functions are exported for testing but the counters are not safe for concurrent multi-instance deployment.
++
++10. **No webhook signature verification.** The `WebhookAdapter` config includes an optional `secret` field, but payload signing is not implemented. Webhook consumers cannot verify payload authenticity.
+diff --git a/src/index.ts b/src/index.ts
+index e61d820..a3d9da1 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -136,10 +136,16 @@ export {
+ } from './validators/preferences.validator.js';
+ 
+ // Services
+-export { UserService } from './services/user.service.js';
+-export { OrderService } from './services/order.service.js';
+-export { NotificationService } from './services/notification.service.js';
+-export { PreferencesService } from './services/preferences.service.js';
++export { UserService, resetUserIdCounter } from './services/user.service.js';
++export { OrderService, resetOrderIdCounter } from './services/order.service.js';
++export {
++  NotificationService,
++  resetNotificationIdCounter,
++} from './services/notification.service.js';
++export {
++  PreferencesService,
++  resetPreferencesIdCounter,
++} from './services/preferences.service.js';
+ export {
+   NotificationHistoryService,
+   resetNotificationLogIdCounter,
+diff --git a/src/utils/callback-registry.ts b/src/utils/callback-registry.ts
+index 5dbb72d..cd4d1d6 100644
+--- a/src/utils/callback-registry.ts
++++ b/src/utils/callback-registry.ts
+@@ -1,14 +1,18 @@
+ /**
+  * Callback registry for direct service-to-service notification.
+  *
+- * Alternative approach to EventBus: register callbacks directly on services
+- * for lightweight, synchronous notification without an intermediary.
++ * @deprecated This module is DEPRECATED and retained only for backward
++ * compatibility. All new cross-service communication MUST use the EventBus
++ * (see src/events/event-bus.ts). See ARCHITECTURE.md for the rationale.
+  *
+- * Trade-offs vs EventBus:
+- * - Simpler (no event types, no serialization)
+- * - Synchronous by default (predictable ordering)
+- * - Tighter coupling (caller knows about callbacks)
+- * - No event log / replay capability
++ * The application unified on EventBus as the sole inter-service communication
++ * mechanism. Using CallbackRegistry creates tight coupling and bypasses the
++ * event log / observability layer that the notification system relies on.
++ *
++ * Historical context:
++ * - Originally created as an alternative to EventBus for lightweight callbacks.
++ * - Superseded by EventBus during the notification system unification (Sessions 3-4).
++ * - The pre-configured `statusChangeCallbacks` singleton below is unused.
+  */
+ 
+ export class CallbackRegistry<T = unknown> {
+@@ -53,13 +57,13 @@ export class CallbackRegistry<T = unknown> {
+ }
+ 
+ // --- Pre-configured registries ---
+-// These are shared instances used across services.
++// DEPRECATED: These singletons are unused. All order status change
++// notifications now flow through EventBus (see OrderService.updateOrderStatus).
+ 
+ import type { OrderStatusChangedEvent } from '../events/event-types.js';
+ 
+ /**
+- * Registry for order status change callbacks.
+- * Services register here to be notified of status changes
+- * via the direct callback pattern (as opposed to EventBus).
++ * @deprecated Unused. Order status changes are now communicated via EventBus
++ * events ('order:status-changed'). Retained for backward compatibility only.
+  */
+ export const statusChangeCallbacks = new CallbackRegistry<OrderStatusChangedEvent>();

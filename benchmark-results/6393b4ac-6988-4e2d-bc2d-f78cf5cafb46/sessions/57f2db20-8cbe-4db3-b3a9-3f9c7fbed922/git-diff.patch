@@ -1,0 +1,595 @@
+diff --git a/src/adapters/email.adapter.ts b/src/adapters/email.adapter.ts
+index 5f65842..009f16c 100644
+--- a/src/adapters/email.adapter.ts
++++ b/src/adapters/email.adapter.ts
+@@ -1,41 +1,215 @@
+ /**
+  * Email notification adapter — delivers notifications via email.
+  *
+- * This is a stub implementation that logs emails in-memory rather than
+- * sending them through an actual SMTP server. The interface is real and
+- * production-ready; swap the send() internals for real delivery.
++ * Features:
++ * - Template rendering: maps notification types to HTML email templates
++ * - Recipient resolution: resolves user IDs to email addresses via a pluggable resolver
++ * - Retry-aware result reporting
++ *
++ * The adapter conforms to the NotificationAdapter interface and never throws —
++ * all errors are captured in the NotificationResult.
+  */
+ 
+ import type { NotificationAdapter } from './notification.adapter.js';
+-import type { NotificationPayload, NotificationResult } from '../models/notification.js';
++import type { NotificationPayload, NotificationResult, NotificationType } from '../models/notification.js';
+ import { Logger } from '../utils/logger.js';
+ 
++// ---------------------------------------------------------------------------
++// Email template types
++// ---------------------------------------------------------------------------
++
++export interface EmailTemplate {
++  /** Render an HTML email body from a notification payload */
++  render(payload: NotificationPayload): string;
++}
++
++/**
++ * Built-in email templates keyed by notification type.
++ * Each template produces a simple HTML email body.
++ */
++const defaultTemplates: Record<NotificationType, EmailTemplate> = {
++  'order-confirmation': {
++    render(payload) {
++      const items = payload.metadata?.['items'] as string | undefined;
++      const total = payload.metadata?.['total'] as string | undefined;
++      return [
++        '<html><body>',
++        `<h1>Order Confirmation</h1>`,
++        `<p>Hello,</p>`,
++        `<p>${escapeHtml(payload.body)}</p>`,
++        items ? `<p><strong>Items:</strong> ${escapeHtml(items)}</p>` : '',
++        total ? `<p><strong>Total:</strong> ${escapeHtml(total)}</p>` : '',
++        `<p>Thank you for your order!</p>`,
++        '</body></html>',
++      ].join('\n');
++    },
++  },
++
++  'order-status-update': {
++    render(payload) {
++      const previousStatus = payload.metadata?.['previousStatus'] as string | undefined;
++      const newStatus = payload.metadata?.['newStatus'] as string | undefined;
++      return [
++        '<html><body>',
++        `<h1>Order Status Update</h1>`,
++        `<p>${escapeHtml(payload.body)}</p>`,
++        previousStatus && newStatus
++          ? `<p>Status changed from <strong>${escapeHtml(previousStatus)}</strong> to <strong>${escapeHtml(newStatus)}</strong>.</p>`
++          : '',
++        '</body></html>',
++      ].join('\n');
++    },
++  },
++
++  welcome: {
++    render(payload) {
++      const name = payload.metadata?.['userName'] as string | undefined;
++      return [
++        '<html><body>',
++        `<h1>Welcome to TaskFlow Pro!</h1>`,
++        name ? `<p>Hi ${escapeHtml(name)},</p>` : '<p>Hi,</p>',
++        `<p>${escapeHtml(payload.body)}</p>`,
++        `<p>We're glad to have you on board.</p>`,
++        '</body></html>',
++      ].join('\n');
++    },
++  },
++
++  'user-updated': {
++    render(payload) {
++      return [
++        '<html><body>',
++        `<h1>Account Updated</h1>`,
++        `<p>${escapeHtml(payload.body)}</p>`,
++        '</body></html>',
++      ].join('\n');
++    },
++  },
++};
++
++// ---------------------------------------------------------------------------
++// Recipient resolver
++// ---------------------------------------------------------------------------
++
++/**
++ * Resolves a recipient identifier to an email address.
++ * If the recipient is already an email, it is returned as-is.
++ * Implement this interface to look up emails from user IDs, etc.
++ */
++export interface RecipientResolver {
++  resolve(recipient: string): Promise<string | null>;
++}
++
++/**
++ * Default resolver: treats the recipient as an email address if it contains '@',
++ * otherwise returns null (unresolvable).
++ */
++export class DefaultRecipientResolver implements RecipientResolver {
++  async resolve(recipient: string): Promise<string | null> {
++    if (recipient.includes('@')) {
++      return recipient;
++    }
++    return null;
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Email transport
++// ---------------------------------------------------------------------------
++
++/**
++ * Represents a rendered email ready for delivery.
++ */
+ export interface EmailMessage {
+   to: string;
+   subject: string;
+   body: string;
++  htmlBody: string;
+   sentAt: Date;
+ }
+ 
++/**
++ * Transport interface — abstracts the actual email sending mechanism.
++ * Swap implementations for SMTP, SES, SendGrid, etc.
++ */
++export interface EmailTransport {
++  sendMail(message: EmailMessage): Promise<void>;
++}
++
++/**
++ * In-memory transport that stores sent emails for inspection (testing / dev).
++ */
++export class InMemoryEmailTransport implements EmailTransport {
++  private sent: EmailMessage[] = [];
++
++  async sendMail(message: EmailMessage): Promise<void> {
++    this.sent.push(message);
++  }
++
++  getSentEmails(): EmailMessage[] {
++    return [...this.sent];
++  }
++
++  clear(): void {
++    this.sent = [];
++  }
++}
++
++// ---------------------------------------------------------------------------
++// EmailAdapter
++// ---------------------------------------------------------------------------
++
++export interface EmailAdapterOptions {
++  transport?: EmailTransport;
++  recipientResolver?: RecipientResolver;
++  templates?: Partial<Record<NotificationType, EmailTemplate>>;
++}
++
+ export class EmailAdapter implements NotificationAdapter {
+   readonly channel = 'email' as const;
+   private logger = new Logger('EmailAdapter');
+-  private sentEmails: EmailMessage[] = [];
++  private transport: EmailTransport;
++  private recipientResolver: RecipientResolver;
++  private templates: Record<NotificationType, EmailTemplate>;
++
++  constructor(options: EmailAdapterOptions = {}) {
++    this.transport = options.transport ?? new InMemoryEmailTransport();
++    this.recipientResolver = options.recipientResolver ?? new DefaultRecipientResolver();
++    this.templates = { ...defaultTemplates, ...options.templates };
++  }
+ 
+   async send(payload: NotificationPayload): Promise<NotificationResult> {
+     try {
+-      this.logger.info(`Sending email to ${payload.recipient}: ${payload.subject}`);
++      // 1. Resolve recipient to an email address
++      const resolvedEmail = await this.recipientResolver.resolve(payload.recipient);
++      if (!resolvedEmail) {
++        this.logger.warn(`Could not resolve recipient: ${payload.recipient}`);
++        return {
++          notificationId: payload.id,
++          channel: 'email',
++          success: false,
++          error: `Could not resolve recipient "${payload.recipient}" to an email address`,
++          deliveredAt: new Date(),
++        };
++      }
++
++      // 2. Render the email body using the template for this notification type
++      const template = this.templates[payload.type];
++      const htmlBody = template.render(payload);
+ 
++      // 3. Build the email message
+       const email: EmailMessage = {
+-        to: payload.recipient,
++        to: resolvedEmail,
+         subject: payload.subject,
+         body: payload.body,
++        htmlBody,
+         sentAt: new Date(),
+       };
+ 
+-      // In production, this would call an SMTP service or email API.
+-      // For now, store in memory.
+-      this.sentEmails.push(email);
++      // 4. Send through the transport
++      await this.transport.sendMail(email);
++
++      this.logger.info(`Email sent to ${resolvedEmail}: ${payload.subject}`);
+ 
+       return {
+         notificationId: payload.id,
+@@ -57,13 +231,30 @@ export class EmailAdapter implements NotificationAdapter {
+     }
+   }
+ 
+-  /** Get all sent emails (for testing). */
++  /** Get all sent emails (delegates to transport if it supports inspection). */
+   getSentEmails(): EmailMessage[] {
+-    return [...this.sentEmails];
++    if (this.transport instanceof InMemoryEmailTransport) {
++      return this.transport.getSentEmails();
++    }
++    return [];
+   }
+ 
+-  /** Clear sent emails (for testing). */
++  /** Clear sent emails (delegates to transport if it supports it). */
+   clearSentEmails(): void {
+-    this.sentEmails = [];
++    if (this.transport instanceof InMemoryEmailTransport) {
++      this.transport.clear();
++    }
+   }
+ }
++
++// ---------------------------------------------------------------------------
++// Utility
++// ---------------------------------------------------------------------------
++
++function escapeHtml(text: string): string {
++  return text
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++    .replace(/"/g, '&quot;');
++}
+diff --git a/src/index.ts b/src/index.ts
+index 8503107..4072277 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -63,7 +63,18 @@ export type {
+ 
+ // Adapters
+ export type { NotificationAdapter } from './adapters/notification.adapter.js';
+-export { EmailAdapter } from './adapters/email.adapter.js';
++export {
++  EmailAdapter,
++  InMemoryEmailTransport,
++  DefaultRecipientResolver,
++} from './adapters/email.adapter.js';
++export type {
++  EmailMessage,
++  EmailTemplate,
++  EmailTransport,
++  RecipientResolver,
++  EmailAdapterOptions,
++} from './adapters/email.adapter.js';
+ 
+ // Config
+ export { createConfig, defaultConfig } from './config/app.config.js';
+diff --git a/tests/adapters/email.adapter.test.ts b/tests/adapters/email.adapter.test.ts
+new file mode 100644
+index 0000000..5fa5abc
+--- /dev/null
++++ b/tests/adapters/email.adapter.test.ts
+@@ -0,0 +1,300 @@
++import { describe, it, expect, beforeEach } from 'vitest';
++import {
++  EmailAdapter,
++  InMemoryEmailTransport,
++  DefaultRecipientResolver,
++} from '../../src/adapters/email.adapter.js';
++import type {
++  RecipientResolver,
++  EmailTransport,
++  EmailTemplate,
++  EmailMessage,
++} from '../../src/adapters/email.adapter.js';
++import type { NotificationPayload } from '../../src/models/notification.js';
++
++function makePayload(overrides: Partial<NotificationPayload> = {}): NotificationPayload {
++  return {
++    id: 'notif-0001',
++    type: 'order-confirmation',
++    channel: 'email',
++    recipient: 'alice@example.com',
++    subject: 'Order Confirmation: order-1',
++    body: 'Your order has been placed. Items: Widget x2. Total: $20.00',
++    priority: 'normal',
++    createdAt: new Date('2026-01-01'),
++    ...overrides,
++  };
++}
++
++describe('EmailAdapter', () => {
++  let transport: InMemoryEmailTransport;
++  let adapter: EmailAdapter;
++
++  beforeEach(() => {
++    transport = new InMemoryEmailTransport();
++    adapter = new EmailAdapter({ transport });
++  });
++
++  describe('channel', () => {
++    it('should report channel as email', () => {
++      expect(adapter.channel).toBe('email');
++    });
++  });
++
++  describe('send()', () => {
++    it('should send an email and return a successful result', async () => {
++      const payload = makePayload();
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(result.notificationId).toBe('notif-0001');
++      expect(result.channel).toBe('email');
++      expect(result.deliveredAt).toBeInstanceOf(Date);
++      expect(result.error).toBeUndefined();
++    });
++
++    it('should deliver the email through the transport', async () => {
++      const payload = makePayload();
++      await adapter.send(payload);
++
++      const emails = transport.getSentEmails();
++      expect(emails).toHaveLength(1);
++      expect(emails[0]?.to).toBe('alice@example.com');
++      expect(emails[0]?.subject).toBe('Order Confirmation: order-1');
++      expect(emails[0]?.body).toContain('Widget x2');
++    });
++
++    it('should render an HTML body using the template', async () => {
++      const payload = makePayload();
++      await adapter.send(payload);
++
++      const emails = transport.getSentEmails();
++      expect(emails[0]?.htmlBody).toContain('<html>');
++      expect(emails[0]?.htmlBody).toContain('<h1>Order Confirmation</h1>');
++      expect(emails[0]?.htmlBody).toContain('Widget x2');
++    });
++
++    it('should include metadata items and total in order-confirmation template', async () => {
++      const payload = makePayload({
++        metadata: { items: 'Widget x2, Gadget x1', total: '$45.00' },
++      });
++      await adapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).toContain('Widget x2, Gadget x1');
++      expect(html).toContain('$45.00');
++    });
++
++    it('should render order-status-update template', async () => {
++      const payload = makePayload({
++        type: 'order-status-update',
++        subject: 'Order Update: order-1',
++        body: 'Your order status has changed from pending to confirmed.',
++        metadata: { previousStatus: 'pending', newStatus: 'confirmed' },
++      });
++      await adapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).toContain('<h1>Order Status Update</h1>');
++      expect(html).toContain('pending');
++      expect(html).toContain('confirmed');
++    });
++
++    it('should render welcome template', async () => {
++      const payload = makePayload({
++        type: 'welcome',
++        subject: 'Welcome to TaskFlow Pro',
++        body: 'Welcome, Alice! Your account has been created.',
++        metadata: { userName: 'Alice' },
++      });
++      await adapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).toContain('<h1>Welcome to TaskFlow Pro!</h1>');
++      expect(html).toContain('Hi Alice,');
++    });
++
++    it('should render user-updated template', async () => {
++      const payload = makePayload({
++        type: 'user-updated',
++        subject: 'Account Updated',
++        body: 'Your profile has been updated.',
++      });
++      await adapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).toContain('<h1>Account Updated</h1>');
++      expect(html).toContain('Your profile has been updated.');
++    });
++
++    it('should escape HTML in payload body', async () => {
++      const payload = makePayload({
++        body: 'Order for <script>alert("xss")</script>',
++      });
++      await adapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).not.toContain('<script>');
++      expect(html).toContain('&lt;script&gt;');
++    });
++  });
++
++  describe('recipient resolution', () => {
++    it('should resolve email addresses (containing @)', async () => {
++      const payload = makePayload({ recipient: 'bob@example.com' });
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(transport.getSentEmails()[0]?.to).toBe('bob@example.com');
++    });
++
++    it('should fail when recipient cannot be resolved', async () => {
++      // DefaultRecipientResolver returns null for non-email strings
++      const payload = makePayload({ recipient: 'user-123' });
++      const result = await adapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.error).toContain('Could not resolve recipient');
++      expect(transport.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should use a custom recipient resolver', async () => {
++      const customResolver: RecipientResolver = {
++        async resolve(recipient: string) {
++          if (recipient === 'user-42') return 'resolved@example.com';
++          return null;
++        },
++      };
++
++      const customAdapter = new EmailAdapter({ transport, recipientResolver: customResolver });
++      const payload = makePayload({ recipient: 'user-42' });
++      const result = await customAdapter.send(payload);
++
++      expect(result.success).toBe(true);
++      expect(transport.getSentEmails()[0]?.to).toBe('resolved@example.com');
++    });
++  });
++
++  describe('custom templates', () => {
++    it('should allow overriding templates per notification type', async () => {
++      const customTemplate: EmailTemplate = {
++        render() {
++          return '<html><body><p>Custom template!</p></body></html>';
++        },
++      };
++
++      const customAdapter = new EmailAdapter({
++        transport,
++        templates: { 'order-confirmation': customTemplate },
++      });
++
++      const payload = makePayload();
++      await customAdapter.send(payload);
++
++      const html = transport.getSentEmails()[0]?.htmlBody ?? '';
++      expect(html).toContain('Custom template!');
++      expect(html).not.toContain('<h1>Order Confirmation</h1>');
++    });
++  });
++
++  describe('error handling', () => {
++    it('should return a failed result when transport throws', async () => {
++      const failingTransport: EmailTransport = {
++        async sendMail() {
++          throw new Error('SMTP connection refused');
++        },
++      };
++
++      const failAdapter = new EmailAdapter({ transport: failingTransport });
++      const payload = makePayload();
++      const result = await failAdapter.send(payload);
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('SMTP connection refused');
++      expect(result.notificationId).toBe('notif-0001');
++    });
++
++    it('should handle non-Error thrown values', async () => {
++      const failingTransport: EmailTransport = {
++        async sendMail() {
++          throw 'string error';
++        },
++      };
++
++      const failAdapter = new EmailAdapter({ transport: failingTransport });
++      const result = await failAdapter.send(makePayload());
++
++      expect(result.success).toBe(false);
++      expect(result.error).toBe('string error');
++    });
++  });
++
++  describe('getSentEmails / clearSentEmails', () => {
++    it('should return sent emails from the in-memory transport', async () => {
++      await adapter.send(makePayload());
++      await adapter.send(makePayload({ id: 'notif-0002', recipient: 'bob@example.com' }));
++
++      expect(adapter.getSentEmails()).toHaveLength(2);
++    });
++
++    it('should clear sent emails', async () => {
++      await adapter.send(makePayload());
++      adapter.clearSentEmails();
++
++      expect(adapter.getSentEmails()).toHaveLength(0);
++    });
++
++    it('should return empty array when transport is not InMemoryEmailTransport', () => {
++      const customTransport: EmailTransport = { async sendMail() {} };
++      const customAdapter = new EmailAdapter({ transport: customTransport });
++
++      expect(customAdapter.getSentEmails()).toEqual([]);
++    });
++  });
++});
++
++describe('DefaultRecipientResolver', () => {
++  const resolver = new DefaultRecipientResolver();
++
++  it('should resolve strings containing @', async () => {
++    expect(await resolver.resolve('test@example.com')).toBe('test@example.com');
++  });
++
++  it('should return null for strings without @', async () => {
++    expect(await resolver.resolve('user-123')).toBeNull();
++  });
++});
++
++describe('InMemoryEmailTransport', () => {
++  let transport: InMemoryEmailTransport;
++
++  beforeEach(() => {
++    transport = new InMemoryEmailTransport();
++  });
++
++  it('should store sent emails', async () => {
++    const msg: EmailMessage = {
++      to: 'test@example.com',
++      subject: 'Test',
++      body: 'plain body',
++      htmlBody: '<p>html body</p>',
++      sentAt: new Date(),
++    };
++    await transport.sendMail(msg);
++
++    expect(transport.getSentEmails()).toHaveLength(1);
++    expect(transport.getSentEmails()[0]?.to).toBe('test@example.com');
++  });
++
++  it('should clear stored emails', async () => {
++    await transport.sendMail({
++      to: 'a@b.com',
++      subject: 's',
++      body: 'b',
++      htmlBody: '<p>b</p>',
++      sentAt: new Date(),
++    });
++    transport.clear();
++    expect(transport.getSentEmails()).toHaveLength(0);
++  });
++});
