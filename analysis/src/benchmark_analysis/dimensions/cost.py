@@ -41,6 +41,10 @@ def analyze_cost(scores: list[ScoredResult], baseline: str = "baseline") -> dict
             "mean_composite": round(mean_composite, 2),
             "cost_per_composite_point": round(mean_cost / max(mean_composite, 0.01), 4),
             "total_tokens_mean": int(np.mean([s.metrics.totalTokens for s in items])),
+            "input_tokens_mean": int(np.mean([s.metrics.inputTokens for s in items])),
+            "output_tokens_mean": int(np.mean([s.metrics.outputTokens for s in items])),
+            "cache_read_tokens_mean": int(np.mean([s.metrics.cacheReadTokens for s in items])),
+            "cache_creation_tokens_mean": int(np.mean([s.metrics.cacheCreationTokens for s in items])),
         })
 
     # Cost vs baseline

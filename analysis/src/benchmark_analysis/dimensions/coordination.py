@@ -30,6 +30,41 @@ from ._constants import (
 # Keep legacy names as module-level aliases so existing tests still import them.
 GRAPH_BUILDING_OPS = GRAPH_OPS
 
+# File path patterns that indicate coordination I/O (shared-markdown, file-reload,
+# persistent-history conditions that coordinate via files rather than MCP tools).
+_COORDINATION_FILE_PATTERNS = (
+    "COORDINATION.md",
+    "CONTEXT.md",
+    "HANDOFF.md",
+    ".twining/",
+)
+
+
+def _targets_coordination_file(tc) -> bool:
+    """Return True if the tool call reads/writes a coordination file.
+
+    Checks common file-path parameters (file_path, path, notebook_path) plus
+    Bash command strings for references to known coordination file patterns.
+    This lets us count file-based coordination I/O (e.g., COORDINATION.md reads
+    in the shared-markdown condition) as coordination bytes, on par with MCP
+    tool calls in Twining conditions.
+    """
+    params = tc.parameters or {}
+    candidate = (
+        params.get("file_path", "")
+        or params.get("path", "")
+        or params.get("notebook_path", "")
+        or ""
+    )
+    if candidate and any(p in candidate for p in _COORDINATION_FILE_PATTERNS):
+        return True
+    # Bash commands may reference coordination files inline (cat, grep, sed, etc.)
+    if tc.toolName == "Bash":
+        cmd = params.get("command", "") or ""
+        if any(p in cmd for p in _COORDINATION_FILE_PATTERNS):
+            return True
+    return False
+
 
 def _twining_subcategory(tool_name: str) -> str:
     """Return 'graph_building', 'orientation', 'recording', or 'other'."""
@@ -62,11 +97,18 @@ def categorize_tool_calls(tool_calls: list) -> dict[str, Any]:
     orientation = 0
     recording = 0
     coordination_other = 0
+    coordination_bytes = 0
+    coordination_file_bytes = 0
+    total_response_bytes = 0
 
     for tc in tool_calls:
         name = tc.toolName
-        if _is_twining(name):
+        rb = tc.responseBytes if hasattr(tc, 'responseBytes') else 0
+        total_response_bytes += rb
+        is_twining_call = _is_twining(name)
+        if is_twining_call:
             coordination += 1
+            coordination_bytes += rb
             sub = _twining_subcategory(name)
             if sub == "graph_building":
                 graph_building += 1
@@ -82,6 +124,14 @@ def categorize_tool_calls(tool_calls: list) -> dict[str, Any]:
             # Unknown tools counted as productive (non-coordination)
             productive += 1
 
+        # File-based coordination: reads/writes of COORDINATION.md, .twining/, etc.
+        # These count as coordination_bytes even for productive tools (Read/Edit/Bash)
+        # so that conditions like shared-markdown pay an honest coordination cost.
+        # Twining tool calls are excluded here to avoid double-counting.
+        if not is_twining_call and _targets_coordination_file(tc):
+            coordination_file_bytes += rb
+            coordination_bytes += rb
+
     return {
         "total": total,
         "productive": productive,
@@ -92,6 +142,10 @@ def categorize_tool_calls(tool_calls: list) -> dict[str, Any]:
         "coordination_other": coordination_other,
         "overhead_ratio": coordination / total if total > 0 else 0.0,
         "graph_building_pct": graph_building / coordination * 100 if coordination > 0 else 0.0,
+        "coordination_bytes": coordination_bytes,
+        "coordination_file_bytes": coordination_file_bytes,
+        "total_response_bytes": total_response_bytes,
+        "overhead_bytes_ratio": coordination_bytes / total_response_bytes if total_response_bytes > 0 else 0.0,
     }
 
 
@@ -115,6 +169,9 @@ class SessionCoordination:
     overhead_ratio: float           # coordination / total
     graph_building_pct: float       # graph_building / coordination * 100
     engaged: bool                   # has ≥1 twining call
+    coordination_bytes: int = 0
+    total_response_bytes: int = 0
+    overhead_bytes_ratio: float = 0.0
     # Artifact-derived (optional)
     entities_added: int = 0
     decisions_added: int = 0
@@ -136,9 +193,12 @@ class ConditionCoordination:
     avg_twining_pct: float          # avg(coordination / total * 100)
     avg_overhead_ratio: float
     avg_graph_building_pct: float   # avg graph-building % of twining calls
-    avg_entities_added: float
-    avg_decisions_added: float
-    avg_state_growth: float
+    avg_coordination_bytes: float = 0.0
+    avg_total_response_bytes: float = 0.0
+    avg_overhead_bytes_ratio: float = 0.0
+    avg_entities_added: float = 0.0
+    avg_decisions_added: float = 0.0
+    avg_state_growth: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +271,9 @@ def analyze_coordination(
             coordination_other_calls=cats["coordination_other"],
             overhead_ratio=cats["overhead_ratio"],
             graph_building_pct=cats["graph_building_pct"],
+            coordination_bytes=cats["coordination_bytes"],
+            total_response_bytes=cats["total_response_bytes"],
+            overhead_bytes_ratio=cats["overhead_bytes_ratio"],
             engaged=cats["coordination"] > 0,
             entities_added=entities_added,
             decisions_added=decisions_added,
@@ -236,6 +299,9 @@ def analyze_coordination(
         )
         avg_overhead = sum(s.overhead_ratio for s in sessions) / n if n > 0 else 0.0
         avg_gb_pct = sum(s.graph_building_pct for s in sessions) / n if n > 0 else 0.0
+        avg_coord_bytes = sum(s.coordination_bytes for s in sessions) / n if n > 0 else 0.0
+        avg_total_bytes = sum(s.total_response_bytes for s in sessions) / n if n > 0 else 0.0
+        avg_ob_ratio = sum(s.overhead_bytes_ratio for s in sessions) / n if n > 0 else 0.0
         avg_entities = sum(s.entities_added for s in sessions) / n if n > 0 else 0.0
         avg_decisions = sum(s.decisions_added for s in sessions) / n if n > 0 else 0.0
         avg_growth = sum(s.state_growth for s in sessions) / n if n > 0 else 0.0
@@ -250,6 +316,9 @@ def analyze_coordination(
             avg_twining_pct=avg_twining_pct,
             avg_overhead_ratio=avg_overhead,
             avg_graph_building_pct=avg_gb_pct,
+            avg_coordination_bytes=avg_coord_bytes,
+            avg_total_response_bytes=avg_total_bytes,
+            avg_overhead_bytes_ratio=avg_ob_ratio,
             avg_entities_added=avg_entities,
             avg_decisions_added=avg_decisions,
             avg_state_growth=avg_growth,

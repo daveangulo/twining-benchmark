@@ -2,7 +2,7 @@
 import json
 import pytest
 from pathlib import Path
-from benchmark_analysis.loader import load_run, load_scores, load_sessions
+from benchmark_analysis.loader import load_run, load_scores, load_sessions, pool_runs
 
 
 @pytest.fixture
@@ -103,6 +103,81 @@ def test_load_scores_missing_dir(tmp_path):
 def test_load_sessions_missing_dir(tmp_path):
     sessions = load_sessions(tmp_path / "nonexistent")
     assert sessions == []
+
+
+def _make_run_dir(base: Path, name: str, condition: str, composite: float) -> Path:
+    """Create a minimal run dir with one score + one transcript."""
+    run_dir = base / name
+    scores_dir = run_dir / "scores"
+    sessions_dir = run_dir / "sessions" / f"session-{name}"
+    scores_dir.mkdir(parents=True)
+    sessions_dir.mkdir(parents=True)
+
+    (run_dir / "metadata.json").write_text(json.dumps({
+        "id": name, "timestamp": f"2026-03-0{name[-1]}T00:00:00Z",
+        "status": "completed", "scenarios": ["refactoring-handoff"],
+        "conditions": [condition], "runsPerPair": 1,
+        "duration": 1000, "seed": name,
+        "environment": {}, "config": {},
+    }))
+    (scores_dir / f"refactoring-handoff_{condition}_0.json").write_text(json.dumps({
+        "runId": name, "scenario": "refactoring-handoff",
+        "condition": condition, "iteration": 0, "composite": composite,
+        "scores": {
+            "completion": {"value": composite, "confidence": "high", "method": "automated", "justification": "done"},
+        },
+        "metrics": {
+            "agentSessions": 2, "totalTokens": 1000000, "inputTokens": 50,
+            "outputTokens": 20000, "cacheReadTokens": 900000, "cacheCreationTokens": 50000,
+            "costUsd": 1.5, "wallTimeMs": 300000, "numTurns": 40,
+            "compactionCount": 0, "contextUtilization": 0,
+            "gitChurn": {"filesChanged": 5, "linesAdded": 200, "linesRemoved": 10, "reverts": 0},
+            "testsPass": 95, "testsFail": 0, "compiles": True,
+        },
+    }))
+    (sessions_dir / "transcript.json").write_text(json.dumps({
+        "sessionId": f"session-{name}", "runId": name,
+        "scenario": "refactoring-handoff", "condition": condition,
+        "taskIndex": 0, "prompt": "test", "toolCalls": [],
+        "fileChanges": [], "numTurns": 20,
+        "tokenUsage": {"input": 50, "output": 10000, "cacheRead": 500000,
+                       "cacheCreation": 25000, "total": 535050, "costUsd": 1.0},
+        "timing": {"startTime": "2026-03-01T00:00:00Z", "endTime": "2026-03-01T00:05:00Z",
+                   "durationMs": 300000, "timeToFirstActionMs": 10000},
+        "exitReason": "completed",
+    }))
+    return run_dir
+
+
+def test_pool_runs_concatenates_data(tmp_path):
+    """pool_runs should concatenate scores/transcripts/session_data across runs."""
+    run_a = _make_run_dir(tmp_path, "run1", "baseline", 80)
+    run_b = _make_run_dir(tmp_path, "run2", "twining-default", 90)
+    run_c = _make_run_dir(tmp_path, "run3", "twining-default", 92)
+
+    pooled = pool_runs([run_a, run_b, run_c])
+
+    assert len(pooled.scores) == 3
+    assert len(pooled.transcripts) == 3
+    assert len(pooled.session_data) == 3
+    # Synthetic metadata
+    assert pooled.metadata.id == "pooled-3-runs"
+    assert sorted(pooled.metadata.conditions) == ["baseline", "twining-default"]
+    assert pooled.metadata.runsPerPair == 3
+    assert "run1" in pooled.metadata.seed and "run3" in pooled.metadata.seed
+
+
+def test_pool_runs_single_returns_original(tmp_path):
+    """pool_runs with a single directory should return the run as-is."""
+    run = _make_run_dir(tmp_path, "run1", "baseline", 80)
+    pooled = pool_runs([run])
+    assert pooled.metadata.id == "run1"
+    assert len(pooled.scores) == 1
+
+
+def test_pool_runs_empty_raises(tmp_path):
+    with pytest.raises(ValueError):
+        pool_runs([])
 
 
 def test_load_sessions_no_artifacts(tmp_path):

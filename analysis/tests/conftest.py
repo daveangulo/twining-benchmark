@@ -58,10 +58,12 @@ def make_tool_call(
     name: str = "Read",
     params: dict | None = None,
     timestamp: str = "2026-03-01T00:00:00Z",
+    response_bytes: int = 0,
 ) -> ToolCall:
     return ToolCall(
         toolName=name, parameters=params or {},
         timestamp=timestamp, durationMs=50,
+        responseBytes=response_bytes,
     )
 
 

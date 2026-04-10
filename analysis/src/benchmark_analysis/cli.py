@@ -10,14 +10,24 @@ def main():
     parser = argparse.ArgumentParser(description="Analyze Twining benchmark results")
     subparsers = parser.add_subparsers(dest="command")
 
-    # analyze <run-dir>
-    analyze_parser = subparsers.add_parser("analyze", help="Analyze a single run")
-    analyze_parser.add_argument("run_dir", type=Path, help="Path to benchmark run directory")
+    # analyze <run-dir> [<run-dir>...]
+    analyze_parser = subparsers.add_parser(
+        "analyze",
+        help="Analyze one or more benchmark runs (pooled if multiple)",
+    )
+    analyze_parser.add_argument(
+        "run_dirs", nargs="+", type=Path,
+        help="Path(s) to benchmark run directories. If multiple, data is pooled.",
+    )
     analyze_parser.add_argument(
         "--format", choices=["markdown", "html", "json", "all"], default="all",
         dest="output_format",
     )
-    analyze_parser.add_argument("--output", type=Path, help="Output directory (default: run_dir/analysis/)")
+    analyze_parser.add_argument(
+        "--output", type=Path,
+        help="Output directory (default: run_dir/analysis/ for single run, "
+             "required for pooled analysis)",
+    )
     analyze_parser.add_argument(
         "--min-tokens", type=int, default=0,
         help="Exclude scores/transcripts with totalTokens below this threshold (filters failed runs)",
@@ -57,8 +67,8 @@ def main():
 
 
 def run_analyze(args):
-    """Run full analysis on a single benchmark run."""
-    from .loader import load_run
+    """Run full analysis on one or more benchmark runs (pooled if multiple)."""
+    from .loader import load_run, pool_runs
     from .dimensions import (
         scoring, conditions, scenarios, coordination, coordination_lift,
         cost, reliability, scorer_diagnostics, sessions,
@@ -69,7 +79,13 @@ def run_analyze(args):
     )
     from .reports import markdown, html, json_report
 
-    run = load_run(args.run_dir)
+    is_pooled = len(args.run_dirs) > 1
+    if is_pooled:
+        run = pool_runs(args.run_dirs)
+        print(f"Pooled {len(args.run_dirs)} runs: {', '.join(str(d) for d in args.run_dirs)}")
+    else:
+        run = load_run(args.run_dirs[0])
+
     total_scores = len(run.scores)
     total_transcripts = len(run.transcripts)
 
@@ -134,7 +150,14 @@ def run_analyze(args):
     _run_safe(results, "recommendations", lambda: recommendations.synthesize_recommendations(results))
 
     # Write reports
-    output_dir = args.output or (args.run_dir / "analysis")
+    if args.output:
+        output_dir = args.output
+    elif is_pooled:
+        # Default pooled output: sibling of first run dir
+        output_dir = args.run_dirs[0].parent / f"pooled-analysis-{len(args.run_dirs)}-runs"
+        print(f"  Pooled output directory: {output_dir}")
+    else:
+        output_dir = args.run_dirs[0] / "analysis"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     fmt = args.output_format

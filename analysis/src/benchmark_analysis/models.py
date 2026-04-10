@@ -54,6 +54,9 @@ class ToolCall(BaseModel):
     timestamp: str = ""
     durationMs: int = 0
     tokenUsage: dict[str, Any] | None = None  # Per-tool-call token usage (result omitted intentionally — can be very large)
+    id: str = ""
+    responseBytes: int = 0
+    isError: bool = False
 
 
 class TokenUsage(BaseModel):

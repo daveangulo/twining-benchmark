@@ -20,6 +20,12 @@ def analyze_sessions(transcripts: list[SessionTranscript]) -> dict:
     for t in transcripts:
         twining_calls = [tc for tc in t.toolCalls if is_twining_tool(tc.toolName)]
         productive_calls = [tc for tc in t.toolCalls if tc.toolName in PRODUCTIVE_TOOLS]
+        # Byte-level overhead
+        total_rb = sum(tc.responseBytes for tc in t.toolCalls)
+        coordination_rb = sum(
+            tc.responseBytes for tc in t.toolCalls if is_twining_tool(tc.toolName)
+        )
+
         entry = {
             "session_id": t.sessionId,
             "scenario": t.scenario,
@@ -30,6 +36,14 @@ def analyze_sessions(transcripts: list[SessionTranscript]) -> dict:
             "productive_tool_calls": len(productive_calls),
             "twining_tool_calls": len(twining_calls),
             "cost_usd": t.tokenUsage.costUsd,
+            "input_tokens": t.tokenUsage.input,
+            "output_tokens": t.tokenUsage.output,
+            "cache_read_tokens": t.tokenUsage.cacheRead,
+            "cache_creation_tokens": t.tokenUsage.cacheCreation,
+            "total_tokens": t.tokenUsage.total,
+            "context_window_size": t.contextWindowSize,
+            "total_response_bytes": total_rb,
+            "coordination_response_bytes": coordination_rb,
             "duration_ms": t.timing.durationMs,
             "exit_reason": t.exitReason,
             "compaction_count": t.compactionCount,

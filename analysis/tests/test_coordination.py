@@ -119,6 +119,66 @@ class TestCategorizeCalls:
         result = categorize_tool_calls(calls)
         assert result["graph_building_pct"] == 0.0
 
+    def test_coordination_file_reads_count_as_coordination_bytes(self):
+        """Reads of COORDINATION.md should count as coordination bytes for
+        file-based conditions like shared-markdown."""
+        calls = [
+            # File-based coordination (shared-markdown pattern)
+            make_tool_call("Read", params={"file_path": "/tmp/proj/COORDINATION.md"},
+                           response_bytes=5000),
+            make_tool_call("Edit", params={"file_path": "/tmp/proj/COORDINATION.md"},
+                           response_bytes=200),
+            # Actual productive work
+            make_tool_call("Read", params={"file_path": "/tmp/proj/src/index.ts"},
+                           response_bytes=3000),
+            make_tool_call("Edit", params={"file_path": "/tmp/proj/src/index.ts"},
+                           response_bytes=150),
+        ]
+        result = categorize_tool_calls(calls)
+        # Call counts are unchanged — classification still by tool name
+        assert result["coordination"] == 0
+        assert result["productive"] == 4
+        # But bytes accounting includes the coordination file ops
+        assert result["coordination_file_bytes"] == 5200
+        assert result["coordination_bytes"] == 5200
+        assert result["total_response_bytes"] == 8350
+        assert result["overhead_bytes_ratio"] == pytest.approx(5200 / 8350)
+
+    def test_bash_command_referencing_coordination_file(self):
+        """Bash commands that cat/grep COORDINATION.md should count as coord bytes."""
+        calls = [
+            make_tool_call("Bash", params={"command": "cat COORDINATION.md"},
+                           response_bytes=4000),
+            make_tool_call("Bash", params={"command": "ls src/"},
+                           response_bytes=500),
+        ]
+        result = categorize_tool_calls(calls)
+        assert result["coordination_file_bytes"] == 4000
+        assert result["coordination_bytes"] == 4000
+
+    def test_twining_tools_not_double_counted_with_file_paths(self):
+        """A twining call should not have its bytes double-counted even if
+        its params happened to reference a coordination path."""
+        calls = [
+            make_tool_call("twining_assemble",
+                           params={"path": ".twining/blackboard.jsonl"},
+                           response_bytes=1000),
+        ]
+        result = categorize_tool_calls(calls)
+        assert result["coordination"] == 1
+        assert result["coordination_bytes"] == 1000  # Once, not 2000
+        assert result["coordination_file_bytes"] == 0
+
+    def test_twining_dir_file_ops_count(self):
+        """Direct file ops inside .twining/ should count as coord bytes."""
+        calls = [
+            make_tool_call("Read", params={"file_path": "/tmp/proj/.twining/blackboard.jsonl"},
+                           response_bytes=2500),
+        ]
+        result = categorize_tool_calls(calls)
+        assert result["coordination_file_bytes"] == 2500
+        assert result["coordination_bytes"] == 2500
+
 
 # ---------------------------------------------------------------------------
 # Integration tests: analyze_coordination

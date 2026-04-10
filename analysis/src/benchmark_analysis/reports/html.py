@@ -30,8 +30,15 @@ def generate_html_report(results: dict, metadata: RunMetadata, output_path: Path
     matrix_html = _build_matrix_table(results)
     recommendations_html = _build_recommendations(results)
 
+    # Pooled runs: show individual run IDs (stored in seed) instead of synthetic id
+    if metadata.id.startswith("pooled-") and metadata.seed:
+        run_ids = [r.strip() for r in metadata.seed.split(",") if r.strip()]
+        run_id_display = f"Pooled from {len(run_ids)} runs: " + ", ".join(run_ids)
+    else:
+        run_id_display = metadata.id
+
     html = _TEMPLATE.format(
-        run_id=metadata.id,
+        run_id=run_id_display,
         timestamp=metadata.timestamp,
         status=metadata.status,
         scenarios=", ".join(metadata.scenarios),

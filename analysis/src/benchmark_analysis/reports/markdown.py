@@ -30,7 +30,16 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
     # --- Header ---
     add(f"# Benchmark Analysis Report")
     add()
-    add(f"**Run ID:** {metadata.id}  ")
+    # Pooled runs: show the individual run IDs (stored in seed) instead of the synthetic id
+    is_pooled = metadata.id.startswith("pooled-") and metadata.seed
+    if is_pooled:
+        run_ids = [r.strip() for r in metadata.seed.split(",") if r.strip()]
+        add(f"**Pooled from {len(run_ids)} runs:**  ")
+        for rid in run_ids:
+            add(f"- `{rid}`")
+        add()
+    else:
+        add(f"**Run ID:** {metadata.id}  ")
     add(f"**Timestamp:** {metadata.timestamp}  ")
     add(f"**Status:** {metadata.status}  ")
     add(f"**Scenarios:** {', '.join(metadata.scenarios)}  ")
@@ -270,6 +279,66 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
                 str(c.get("session_count", c.get("total_tool_calls", 0))),
             ])
         add_table(headers, rows)
+
+        # Exploration Efficiency: task vs coordination bytes decomposition
+        items_for_bytes = per_condition.values() if isinstance(per_condition, dict) else per_condition
+        sample = next((c for c in items_for_bytes if isinstance(c, dict)), None)
+        if sample and "avg_coordination_bytes" in sample:
+            # Build composite score lookup from cost data
+            cost_data_for_eff = results.get("cost", {}).get("per_condition", [])
+            composite_by_cond: dict[str, float] = {}
+            for c in cost_data_for_eff:
+                composite_by_cond[c.get("condition", "")] = c.get("mean_composite", 0)
+
+            # Collect per-condition task/coord bytes
+            eff_rows: list[dict] = []
+            items_eff = per_condition.values() if isinstance(per_condition, dict) else per_condition
+            for c in items_eff:
+                if not isinstance(c, dict):
+                    continue
+                cond = c.get("condition", "")
+                total_b = c.get("avg_total_response_bytes", 0)
+                coord_b = c.get("avg_coordination_bytes", 0)
+                task_b = total_b - coord_b
+                eff_rows.append({
+                    "condition": cond,
+                    "task_bytes": task_b,
+                    "coord_bytes": coord_b,
+                    "composite": composite_by_cond.get(cond, 0),
+                })
+
+            # Find baseline task_bytes as reference
+            baseline_task = next((r["task_bytes"] for r in eff_rows if r["condition"] == "baseline"), None)
+
+            if baseline_task is not None and baseline_task > 0:
+                add()
+                add("### Exploration Efficiency")
+                add()
+                headers_e = ["Condition", "Task Bytes", "Coord Bytes", "Exploration Savings", "Savings %", "Coord ROI", "Effectiveness"]
+                rows_e = []
+                for r in eff_rows:
+                    savings = baseline_task - r["task_bytes"]
+                    savings_pct = savings / baseline_task * 100
+                    if r["coord_bytes"] > 0:
+                        roi = f"{savings / r['coord_bytes']:.1f}x"
+                    else:
+                        roi = "\u2014"
+                    task_10kb = r["task_bytes"] / 10000
+                    effectiveness = f"{r['composite'] / task_10kb:.1f}" if task_10kb > 0 else "\u2014"
+                    is_baseline = r["condition"] == "baseline"
+                    rows_e.append([
+                        r["condition"],
+                        f"{r['task_bytes']:,.0f}",
+                        f"{r['coord_bytes']:,.0f}" if r["coord_bytes"] > 0 else "0",
+                        f"{savings:,.0f}" if not is_baseline else "\u2014",
+                        f"{savings_pct:.1f}%" if not is_baseline else "\u2014",
+                        roi if not is_baseline else "\u2014",
+                        effectiveness,
+                    ])
+                add_table(headers_e, rows_e)
+                add()
+                add("_Exploration savings measures reduction in non-coordination tool work vs baseline. Higher effectiveness = more score per unit of task work._")
+                add()
     else:
         add("_No coordination behavior data available._")
         add()
@@ -291,6 +360,33 @@ def generate_markdown_report(results: dict, metadata: RunMetadata) -> str:
         add_table(headers, rows)
     else:
         add("_No cost data available._")
+        add()
+
+    # --- Token Usage Breakdown ---
+    add("## Token Usage Breakdown")
+    add()
+    if cost_per_condition and any("input_tokens_mean" in c for c in cost_per_condition):
+        headers = ["Condition", "Input", "Output", "Cache Read", "Cache Create", "Total", "Cache Hit %"]
+        rows = []
+        for c in cost_per_condition:
+            total = c.get("total_tokens_mean", 0)
+            cache_read = c.get("cache_read_tokens_mean", 0)
+            cache_ratio = cache_read / max(total, 1) * 100
+            rows.append([
+                c.get("condition", ""),
+                f"{c.get('input_tokens_mean', 0):,}",
+                f"{c.get('output_tokens_mean', 0):,}",
+                f"{cache_read:,}",
+                f"{c.get('cache_creation_tokens_mean', 0):,}",
+                f"{total:,}",
+                f"{cache_ratio:.1f}%",
+            ])
+        add_table(headers, rows)
+        add()
+        add("_Session-level totals from CLI result message (billing-correct). Per-turn values are per-API-call snapshots and are not summable._")
+        add()
+    else:
+        add("_Token breakdown not available (pre-token-tracking data)._")
         add()
 
     # --- Construct Validity ---

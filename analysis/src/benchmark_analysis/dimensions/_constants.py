@@ -25,7 +25,7 @@ ORIENTATION_OPS: frozenset[str] = frozenset({
 })
 
 RECORDING_OPS: frozenset[str] = frozenset({
-    "decide", "post", "handoff", "register", "promote",
+    "decide", "post", "record", "handoff", "register", "promote",
     "acknowledge", "verify", "link_commit",
 })
 
@@ -44,7 +44,7 @@ SEARCH_OPS: frozenset[str] = frozenset({
 })
 
 LIFECYCLE_OPS: frozenset[str] = frozenset({
-    "archive", "export", "summarize",
+    "archive", "export", "summarize", "housekeeping",
 })
 
 DECISION_MGMT_OPS: frozenset[str] = frozenset({

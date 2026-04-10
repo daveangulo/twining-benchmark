@@ -80,6 +80,16 @@ def analyze_cost_efficiency(
         total_tool_calls = sum(len(t.toolCalls) for t in cond_transcripts)
         tool_calls_per_dollar = total_tool_calls / max(total_cost, 0.001)
 
+        # Token breakdown from transcripts (session-level billing-correct totals)
+        n_t = max(len(cond_transcripts), 1)
+        input_tokens_mean = sum(t.tokenUsage.input for t in cond_transcripts) / n_t
+        output_tokens_mean = sum(t.tokenUsage.output for t in cond_transcripts) / n_t
+        cache_read_mean = sum(t.tokenUsage.cacheRead for t in cond_transcripts) / n_t
+        cache_creation_mean = sum(t.tokenUsage.cacheCreation for t in cond_transcripts) / n_t
+        total_tokens_mean = sum(t.tokenUsage.total for t in cond_transcripts) / n_t
+        ctx_windows = [t.contextWindowSize for t in cond_transcripts if t.contextWindowSize > 0]
+        ctx_window_mean = sum(ctx_windows) / len(ctx_windows) if ctx_windows else 0
+
         per_condition.append({
             "condition": condition,
             "total_cost_usd": round(total_cost, 4),
@@ -94,6 +104,12 @@ def analyze_cost_efficiency(
             "lines_per_dollar": round(lines_per_dollar, 1),
             "total_tool_calls": total_tool_calls,
             "tool_calls_per_dollar": round(tool_calls_per_dollar, 1),
+            "input_tokens_mean": round(input_tokens_mean),
+            "output_tokens_mean": round(output_tokens_mean),
+            "cache_read_tokens_mean": round(cache_read_mean),
+            "cache_creation_tokens_mean": round(cache_creation_mean),
+            "total_tokens_mean": round(total_tokens_mean),
+            "context_window_size_mean": round(ctx_window_mean),
         })
 
     return {

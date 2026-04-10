@@ -33,16 +33,23 @@ def analyze_effect_decomposition(
     tool_counts = defaultdict(lambda: defaultdict(int))
     tools_ever_called = set()
 
+    # Bytes per mechanism per condition (for bytes-weighted attribution)
+    mechanism_bytes: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
     for t in transcripts:
         tool_names = [tc.toolName for tc in t.toolCalls]
         short_names = [normalize_tool_name(tn) for tn in tool_names]
         for mechanism, tool_set in MECHANISM_CATEGORIES.items():
             count = sum(1 for sn in short_names if sn in tool_set)
             mechanism_usage[t.condition][mechanism].append(count)
-        for sn in short_names:
+        for tc in t.toolCalls:
+            sn = normalize_tool_name(tc.toolName)
             if sn in ALL_TWINING_OPS:
                 tool_counts[t.condition][sn] += 1
                 tools_ever_called.add(sn)
+                for mechanism, tool_set in MECHANISM_CATEGORIES.items():
+                    if sn in tool_set:
+                        mechanism_bytes[t.condition][mechanism] += tc.responseBytes
 
     # Compute mean composite per condition
     condition_composites = defaultdict(list)
@@ -107,8 +114,20 @@ def analyze_effect_decomposition(
                           else "marginal difference observed",
         }
 
+    # Bytes-weighted mechanism attribution
+    mechanism_bytes_summary = []
+    for mechanism in MECHANISM_CATEGORIES:
+        bytes_by_cond = {c: mechanism_bytes[c].get(mechanism, 0)
+                         for c in mechanism_bytes if mechanism_bytes[c].get(mechanism, 0) > 0}
+        mechanism_bytes_summary.append({
+            "mechanism": mechanism,
+            "total_bytes": sum(bytes_by_cond.values()),
+            "bytes_by_condition": dict(sorted(bytes_by_cond.items())),
+        })
+
     return {
         "mechanism_attribution": sorted(mechanism_attribution, key=lambda x: -abs(x["associated_difference"])),
+        "mechanism_attribution_bytes": sorted(mechanism_bytes_summary, key=lambda x: -x["total_bytes"]),
         "tool_utilization": {
             "tools_ever_called": sorted(tools_ever_called),
             "never_called": never_called,
