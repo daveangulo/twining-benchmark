@@ -22,6 +22,12 @@ export interface ToolCall {
     input: number;
     output: number;
   };
+  /** Claude API tool_use block ID (for linking to tool_result) */
+  id?: string;
+  /** Size of the tool result in bytes */
+  responseBytes?: number;
+  /** Whether the tool call resulted in an error */
+  isError?: boolean;
 }
 
 /**

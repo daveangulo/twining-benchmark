@@ -224,6 +224,15 @@ export class AgentSessionManager {
     let costUsd = 0;
     let exitSubtype = '';
     let compactionCount = 0;
+    let turnIndex = 0;
+    const turnUsageEntries: TurnUsage[] = [];
+    let pendingTurnUsage: TurnUsage | null = null;
+    let totalInput = 0;
+    let totalOutput = 0;
+    let totalCacheRead = 0;
+    let totalCacheCreation = 0;
+    let contextWindowSize = 0;
+    const toolUseIdToIndex = new Map<string, number>();
 
     const effectiveTimeoutMs = task.timeoutMs || this.timeoutMs;
 
@@ -318,11 +327,60 @@ export class AgentSessionManager {
                       parameters: (block.input ?? {}) as Record<string, unknown>,
                       timestamp: now.toISOString(),
                       durationMs: 0,
+                      id: block.id,
                     };
+                    if (block.id) toolUseIdToIndex.set(block.id, toolCalls.length);
                     toolCalls.push(tc);
 
                     if (timeToFirstActionMs < 0 && isFileChangingToolCall(tc)) {
                       timeToFirstActionMs = now.getTime() - startTime.getTime();
+                    }
+                  }
+                }
+              }
+
+              // Buffer per-turn usage — overwrite on each assistant event.
+              // The CLI emits multiple assistant events per logical turn (streaming partials);
+              // we only commit when a turn boundary is reached (user/system/result event).
+              const usage = msg.message?.usage;
+              if (usage) {
+                pendingTurnUsage = {
+                  turnIndex,
+                  type: 'message',
+                  inputTokens: usage.input_tokens ?? 0,
+                  outputTokens: usage.output_tokens ?? 0,
+                  cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+                  cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
+                };
+              }
+            }
+
+            // Flush pending turn usage on turn boundary (user message = tool results returned)
+            if ((msg.type === 'user' || msg.type === 'system' || msg.type === 'result') && pendingTurnUsage) {
+              turnUsageEntries.push(pendingTurnUsage);
+              turnIndex++;
+              pendingTurnUsage = null;
+            }
+
+            if (msg.type === 'user') {
+              const content = msg.message?.content;
+              if (Array.isArray(content)) {
+                for (const block of content) {
+                  if (block.type === 'tool_result' && block.tool_use_id) {
+                    const tcIndex = toolUseIdToIndex.get(block.tool_use_id);
+                    if (tcIndex !== undefined && tcIndex < toolCalls.length) {
+                      const tc = toolCalls[tcIndex]!;
+                      let resultText = '';
+                      if (typeof block.content === 'string') {
+                        resultText = block.content;
+                      } else if (Array.isArray(block.content)) {
+                        resultText = block.content
+                          .filter((c: Record<string, unknown>) => c.type === 'text')
+                          .map((c: Record<string, unknown>) => c.text as string)
+                          .join('\n');
+                      }
+                      tc.responseBytes = Buffer.byteLength(resultText, 'utf-8');
+                      tc.isError = block.is_error === true;
                     }
                   }
                 }
@@ -337,6 +395,24 @@ export class AgentSessionManager {
               numTurns = msg.num_turns ?? 0;
               costUsd = msg.total_cost_usd ?? 0;
               exitSubtype = msg.subtype ?? '';
+
+              // Extract total token usage from result.usage
+              const usage = msg.usage;
+              if (usage) {
+                totalInput = usage.input_tokens ?? 0;
+                totalOutput = usage.output_tokens ?? 0;
+                totalCacheRead = usage.cache_read_input_tokens ?? 0;
+                totalCacheCreation = usage.cache_creation_input_tokens ?? 0;
+              }
+
+              // Extract context window size from result.modelUsage (keyed by model name)
+              const modelUsage = msg.modelUsage;
+              if (modelUsage && typeof modelUsage === 'object') {
+                const firstModel = Object.values(modelUsage)[0] as Record<string, unknown> | undefined;
+                if (firstModel?.contextWindow) {
+                  contextWindowSize = firstModel.contextWindow as number;
+                }
+              }
             }
           } catch {
             // Skip unparseable lines
@@ -360,7 +436,11 @@ export class AgentSessionManager {
         : toolCalls.length > 0 ? 'completed' : 'error';
 
     const tokenUsage: TokenUsage = {
-      input: 0, output: 0, cacheRead: 0, cacheCreation: 0, total: 0,
+      input: totalInput,
+      output: totalOutput,
+      cacheRead: totalCacheRead,
+      cacheCreation: totalCacheCreation,
+      total: totalInput + totalOutput + totalCacheRead + totalCacheCreation,
       costUsd,
     };
 
@@ -382,9 +462,9 @@ export class AgentSessionManager {
       tokenUsage,
       numTurns,
       stopReason: exitSubtype || null,
-      contextWindowSize: 0,
+      contextWindowSize,
       compactionCount,
-      turnUsage: [],
+      turnUsage: turnUsageEntries,
     });
   }
 
