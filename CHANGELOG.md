@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Per-turn token usage and tool response bytes** captured from the Claude CLI stream-json output. The CLI path in `executeTask()` previously zeroed all token fields except `costUsd`; now extracts full token breakdown from `result.usage`, `contextWindowSize` from `result.modelUsage`, and per-turn usage from buffered assistant events (flushed on turn boundaries to dedupe streaming partials).
+- `ToolCall.responseBytes` and `ToolCall.isError` populated by linking `tool_result` blocks to `tool_use` via `tool_use_id`.
+- **Pooled multi-run analysis** — `benchmark-analysis analyze` accepts multiple run directories and runs the full 20-dimension pipeline on concatenated data. Synthetic metadata preserves component run IDs in the report header.
+- `loader.pool_runs()` helper for programmatic multi-run aggregation.
+- **Exploration Efficiency** section in the analysis report (replaces the misleading bytes-overhead ratio table). Decomposes per-condition bytes into `task_bytes` vs `coord_bytes`, computes exploration savings vs baseline, coord ROI, and effectiveness (score per 10KB of task work).
+- File-based coordination detection: reads/writes of `COORDINATION.md`, `CONTEXT.md`, `HANDOFF.md`, and `.twining/` now count as coordination bytes for non-Twining tools. Makes conditions like `shared-markdown` pay an honest coordination cost in the efficiency metrics.
+- **Token Usage Breakdown** section with per-condition input/output/cache breakdown and cache-hit ratio.
+- Full token breakdown and `context_window_size` exposed through `loader.transcripts_to_dataframe`, `cost.py`, `cost_efficiency.py`, `sessions.py`.
+- Bytes-weighted mechanism attribution in `effect_decomposition.py` alongside the existing count-based attribution.
+
+### Fixed
+
+- `record` and `housekeeping` were missing from `ALL_TWINING_OPS`, causing tool utilization tables to report 0 calls for `twining_record` and `twining_housekeeping`.
+
 ## [0.1.0] - 2026-04-05
 
 ### Added

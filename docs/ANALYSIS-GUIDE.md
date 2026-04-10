@@ -123,12 +123,19 @@ for f in sorted(glob.glob('benchmark-results/<RUN_ID>/scores/*.json')):
 benchmark-analysis analyze benchmark-results/<RUN_ID> --min-tokens 1000
 ```
 
-### Step 4: Cross-Run Comparison (when pooling data)
+### Step 4: Cross-Run Analysis (when pooling data for more statistical power)
 ```bash
+# Full 20-dimension report on pooled data (preferred)
+benchmark-analysis analyze \
+  benchmark-results/<ID1> benchmark-results/<ID2> benchmark-results/<ID3>
+
+# Lightweight alternative: effect-size table only, no full report
 benchmark-analysis compare-conditions \
   --runs benchmark-results/<ID1> benchmark-results/<ID2> \
   --conditions baseline,shared-markdown,full-twining,twining-lite
 ```
+
+The pooled `analyze` form runs every dimension analyzer on the concatenated scores/transcripts and writes a full report including Exploration Efficiency, Token Usage Breakdown, and all statistical comparisons. The report header lists the component run IDs.
 
 ## Known Issues and Fixes (as of April 2, 2026)
 

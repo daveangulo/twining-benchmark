@@ -71,6 +71,10 @@ uv venv && uv pip install -e .
 # Full analysis of a benchmark run (JSON, Markdown, HTML reports)
 python -m benchmark_analysis analyze ../benchmark-results/<run-id>
 
+# Pooled analysis across multiple runs (more statistical power)
+python -m benchmark_analysis analyze \
+  ../benchmark-results/<id1> ../benchmark-results/<id2> ../benchmark-results/<id3>
+
 # Compare two runs for regressions/improvements
 python -m benchmark_analysis compare ../benchmark-results/<run-id-1> ../benchmark-results/<run-id-2>
 ```

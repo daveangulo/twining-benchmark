@@ -24,7 +24,11 @@ benchmark-analysis analyze ../benchmark-results/<run-id>
 # Filter failed sessions (rate-limited, crashed)
 benchmark-analysis analyze ../benchmark-results/<run-id> --min-tokens 1000
 
-# Compare conditions across multiple runs
+# Pooled analysis across multiple runs (full 20-dimension report on aggregated data)
+benchmark-analysis analyze \
+  ../benchmark-results/<id1> ../benchmark-results/<id2> ../benchmark-results/<id3>
+
+# Lightweight cross-run condition comparison (effect sizes only)
 benchmark-analysis compare-conditions \
   --runs ../benchmark-results/<id1> ../benchmark-results/<id2> \
   --conditions baseline,shared-markdown,full-twining
@@ -32,19 +36,21 @@ benchmark-analysis compare-conditions \
 
 ## Commands
 
-### `analyze` — Single run analysis
+### `analyze` — Single or pooled run analysis
 
 ```bash
-benchmark-analysis analyze <run-dir> [options]
+benchmark-analysis analyze <run-dir> [<run-dir>...] [options]
 ```
 
 | Option | Description |
 |--------|------------|
 | `--format` | Output format: `json`, `markdown`, `html`, or `all` (default: `all`) |
-| `--output` | Output directory (default: `<run-dir>/analysis/`) |
+| `--output` | Output directory (default: `<run-dir>/analysis/` for single run, `<parent>/pooled-analysis-N-runs/` for multi-run) |
 | `--min-tokens` | Exclude sessions with fewer total tokens (filters crashed sessions) |
 
 Produces `analysis.json`, `analysis.md`, and `analysis.html` in the output directory.
+
+**Pooled analysis:** Passing multiple run directories concatenates their scores, transcripts, and session data, then runs the full 20-dimension pipeline on the combined dataset. Synthetic metadata lists the component run IDs in the report header. This is the preferred way to get more statistical power from repeated runs — it runs everything `analyze` does, just with more samples. Use `compare-conditions` instead only when you want a quick effect-size table without the full report.
 
 ### `compare` — Two-run comparison
 
@@ -130,6 +136,10 @@ Terminal output:
 ### Cost & Efficiency
 
 **Cost** — Cost per composite point. Marginal cost per point gained vs baseline. Token efficiency and cache hit ratios.
+
+**Token Usage Breakdown** — Per-condition input / output / cache-read / cache-creation token means, plus cache-hit %. Session-level totals are billing-correct (extracted from the CLI result message); per-turn values in raw transcripts are per-API-call snapshots that should not be summed.
+
+**Exploration Efficiency** — Decomposes per-condition response bytes into `task_bytes` (productive tool work: file reads, greps, edits) and `coord_bytes` (coordination overhead). Computes exploration savings vs baseline, coord ROI (bytes of exploration eliminated per byte of coordination), and effectiveness (score per 10KB of task work). Coordination detection is apples-to-apples across mechanisms: Twining tool calls AND reads/writes of COORDINATION.md / CONTEXT.md / HANDOFF.md / .twining/ all count as coord_bytes, so file-based conditions like `shared-markdown` pay an honest coordination cost.
 
 ### Benchmark Validity
 
@@ -229,7 +239,7 @@ Terminal output:
 
 ```bash
 cd analysis
-python -m pytest tests/ -v          # 219 tests
+python -m pytest tests/ -v          # 226 tests
 python -m pytest tests/ -x -q       # Quick: stop on first failure
 ```
 
@@ -254,7 +264,7 @@ The package reads from `benchmark-results/<run-id>/`:
 src/benchmark_analysis/
   __init__.py, __main__.py
   models.py          # Pydantic models matching benchmark JSON schemas
-  loader.py          # Load runs into BenchmarkRun (scores + transcripts + artifacts)
+  loader.py          # Load single run or pool_runs() for multi-run aggregates
   stats.py           # Core statistics (Hedges' g, bootstrap CI, ROPE, MDES, power)
   cli.py             # CLI entry point (analyze, compare, compare-conditions)
   dimensions/
