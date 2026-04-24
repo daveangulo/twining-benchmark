@@ -22,6 +22,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `record` and `housekeeping` were missing from `ALL_TWINING_OPS`, causing tool utilization tables to report 0 calls for `twining_record` and `twining_housekeeping`.
 
+### Documentation
+
+- **`STATE.md`** — top-level human-and-LLM-readable snapshot of harness reality: decision index health, condition set, current pooled results with caveats, key findings with evidence status, committed macro-loop research direction, known scorer issues, parked work, methodology version. Update when results, methodology, or open questions change materially.
+
+### Internal
+
+- `.twining/` housekeeping pass: 2 stale provisionals promoted (scorer fixes, analysis bugs) after verifying against code; 1 superseded (`npm list` workaround reverted in `69818b8` after `twining-mcp` v1.16.0 added clean `--version` exit). Macro-loop research direction and Phase 2 gates recorded under new `research/direction` scope. 70 archived blackboard entries, 218 metrics rotated. State: 0 provisionals, 0 unresolved warnings.
+
 ## [0.1.0] - 2026-04-05
 
 ### Added
